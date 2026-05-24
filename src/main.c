@@ -226,7 +226,61 @@ int http_server_start(http_server_t *server);
 int http_server_stop(http_server_t *server);
 int http_server_cleanup(http_server_t *server);
 
-// GLobal server instance
+// SSL functions
+int init_ssl(http_server_t *server, const char *cert_file, const char *key_file);
+void cleanup_ssl(http_server_t *server);
+
+// Worker thread functions
+void *worker_thread_function(void *arg);
+int handle_new_connection(worker_thread_t *worker, int client_fd);
+int handle_client_data(worker_thread_t *worker, connection_t *conn);
+int handle_client_write(worker_thread_t *worker, connection_t *conn);
+
+// HTTP protocol functions
+int parse_http_request(connection_t *conn, http_request_t *request);
+int generate_http_response(connection_t *conn, http_response_t *response);
+int send_http_response(connection_t *conn, http_response_t *response);
+int send_file_response(connection_t *conn, const char *file_path);
+int send_error_response(connection_t *conn, http_status_t status, const char *message);
+
+// WebSocket functions
+int handle_websocket_upgrade(connection_t *conn, http_request_t *request);
+int handle_websocket_frame(connection_t *conn, const char *data, size_t length);
+void generate_websocket_accept_key(const char *key, char *accept_key);
+
+// Route handling functions
+int add_route(http_server_t *server, const char pattern, http_method_t method, route_handler_t handler);
+route_t *find_route(http_server_t *server, const char *uri, http_method_t method);
+int default_file_handler(connection_t *conn, http_request_t *request, http_response_t *response);
+
+// Connection management
+connection_t *allocate_connection(http_server_t *server);
+void free_connection(http_server_t *server, connection_t *conn);
+void cleanup_connection(connection_t* conn);
+int set_socket_nonblocking(int fd);
+int set_socket_options(int fd);
+
+// Compression functions
+int init_gzip_compression(connection_t *conn);
+void compress_response_body(connection_t *conn, const char *input, size_t input_size);
+void cleanup_gzip_compression(connection_t *conn);
+
+// Utility functions
+const char *http_method_to_string(http_method_t method);
+const char *http_status_to_string(http_status_t status);
+http_method_t string_to_http_method(const char *method);
+char *get_mime_type(const char *file_path);
+char *url_decode(const char *url);
+void parse_query_string(const char *query, http_header_t *params, int *params_count);
+bool is_valid_uri(const char *uri);
+
+// Example route handlers
+int api_hello_handler(connection_t *conn, http_request_t *request, http_response_t *response);
+int api_echo_handler(connection_t *conn, http_request_t *request, http_response_t *response);
+int api_status_handler(connection_t *conn, http_request_t *request, http_response_t *response);
+int websocket_chat_handler(connection_t *conn, http_request_t *request, http_response_t *response);
+
+// Global server instance
 static http_server_t g_server;
 static volatile bool g_running = true;
 
