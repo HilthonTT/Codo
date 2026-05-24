@@ -5,12 +5,14 @@
 #include <sys/stat.h>
 #include <sys/sendfile.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <zlib.h>
 #include <pthread.h>
 #include <string.h>
 #include <signal.h>
+#include <fcntl.h>
 
 #define MAX_EVENTS 10000
 #define MAX_CONNECTIONS 100000
@@ -196,7 +198,7 @@ typedef struct {
   int worker_count;
 
   // Route handling
-  route_t *route;
+  route_t *routes;
   route_handler_t default_handler;
 
   // Connection pool
@@ -346,10 +348,11 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   server->enable_compression = true;
   server->max_request_size = MAX_REQUEST_SIZE;
   server->worker_count = WORKER_THREADS;
-  // server->default_handler = default_file_handler;
+  server->default_handler = default_file_handler;
   server->running = true;
 
-  // TODO: Initialize statistics mutex
+  // Initialize statistics mutex
+  pthread_mutex_init(&server->stats_mutex, NULL);
 
   // Create listening socket
   server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -358,7 +361,9 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
     return -1;
   }
 
-  // TODO: set socket options
+  // Set socket options
+  set_socket_options(server->listen_fd);
+  set_socket_nonblocking(server->listen_fd);
 
   // Bind to port
   struct sockaddr_in server_addr;
@@ -383,28 +388,108 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   return 0;
 }
 
+int set_socket_nonblocking(int fd) {
+  int flags = fcntl(fd, F_GETFL, 0);
+  if (flags < 0) {
+    return -1;
+  }
+  return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+int set_socket_options(int fd) {
+  int optval = 1;
+
+  // Reuse address
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0) {
+    return -1;
+  }
+
+  // Disable Nagle's algorithm
+  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+void cleanup_ssl(http_server_t *server) {
+  // TODO: actually cleanup ssl
+  return;
+}
+
+int default_file_handler(connection_t *conn, http_request_t *request, http_response_t *response) {
+  if (request->method != HTTP_GET && request->method != HTTP_HEAD) {
+    return send_error_response(conn, HTTP_METHOD_NOT_ALLOWED, "Method not allowed");
+  }
+
+  // Construct file path
+  char file_path[2048];
+  snprintf(file_path, sizeof(file_path), "%s%s", g_server.document_root, request->uri);
+
+  // Check if path is safe
+  if (!is_valid_uri(request->uri)) {
+    return send_error_response(conn, HTTP_FORBIDDEN, "Access denied");
+  }
+
+  // Check if file exists
+  struct stat file_stat;
+  if (stat(file_path, &file_stat) < 0) {
+    return send_error_response(conn, HTTP_FORBIDDEN, "File not found");
+  }
+
+  // Send file
+  return send_file_response(conn, file_path);
+}
+
+int send_file_response(connection_t *conn, const char *file_path) {
+  // TODO: Implement this later
+  return 0;
+}
+
+int send_error_response(connection_t *conn, http_status_t status, const char *message) {
+  // TODO: Implement this later
+  return 0;
+}
+
+bool is_valid_uri(const char *uri) {
+  // TODO: Implement this laters
+  return false;
+}
+
 int http_server_cleanup(http_server_t *server) {
   if (!server) {
     return -1;
   }
 
-  // TODO: Stop worker threads
-  // for (int i = 0; i < server->worker_count; i++) {
-
-  // }
+  for (int i = 0; i < server->worker_count; i++) {
+    server->workers[i].running = false;
+    pthread_join(server->workers[i].thread, NULL);
+    close(server->workers[i].epoll_fd);
+  }
 
   // Close listening port
   if (server->listen_fd > 0) {
     close(server->listen_fd);
   }
 
-  // TODO: Cleanup SSL
+  // Cleanup SSL
+  if (server->ssl_enabled) {
+    cleanup_ssl(server);
+  }
 
   // Free resources
   free(server->document_root);
   free(server->server_name);
 
-  // TODO: Cleanup routes
+  // Cleanup routes
+  route_t *route = server->routes;
+  while (route) {
+    route_t *next = route->next;
+    free(route);
+    route = next;
+  }
+
+  pthread_mutex_destroy(&server->stats_mutex);
 
   printf("HTTP server cleanup completed\n");
   return 0;
