@@ -657,6 +657,75 @@ int send_http_response(connection_t *conn, http_response_t *response) {
   return 0;
 }
 
+int parse_http_request(connection_t *conn, http_request_t *request) {
+  if (!conn || !request) {
+    return -1;
+  }
+
+  memset(request, 0, sizeof(http_request_t));
+
+  char *line = strtok(conn->read_buffer, "\n");
+  if (!line) {
+    return -1;
+  }
+
+  char method_str[16], uri[2048], version[16];
+  if (sscanf(line, "%15s, %2047s, %15s", method_str, uri, version) != 3) {
+    return -1;
+  }
+
+  request->method = string_to_http_method(method_str);
+  strncpy(request->uri, uri, sizeof(request->uri) - 1);
+  strncpy(request->version, version, sizeof(request->version) - 1);
+
+  // Parse query string
+  char *query_start = strchr(request->uri, '?');
+  if (query_start) {
+    *query_start = '\0';
+    strncpy(request->query_string, query_start + 1, sizeof(request->query_string) - 1);
+  }
+
+  // Parse headers
+  while ((line = strtok(NULL, "\r\n")) != NULL && *line != '\0') {
+    char *colon = strchr(line, ':');
+    if (!colon) {
+      continue;
+    }
+
+    *colon = '\0';
+    char *name = line;
+    char *value = colon + 1;
+
+    // Skip whitespace
+    while (*value == ' ' || *value == '\t') {
+      value++;
+    }
+
+    if (request->header_count < MAX_HEADERS) {
+      strncpy(request->headers[request->header_count].name, name, 255);
+      strncpy(request->headers[request->header_count].value, value, 2047);
+      request->header_count++;
+    }  
+
+    // Check for special headers
+    if (strcasecmp(name, "Connection") == 0) {
+      request->keep_alive = (strcasecmp(value, "keep-alive") == 0);
+    } else if (strcasecmp(name, "Content-Length") == 0) {
+      request->content_length = atol(value);
+    } else if (strcasecmp(name, "Expect") == 0) {
+      request->expect_continue = (strcasecmp(value, "100-continue") == 0);
+    } else if (strcasecmp(name, "Upgrade") == 0) {
+      request->is_websocket_upgrade = (strcasecmp(value, "websocket") == 0);
+    } else if (strcasecmp(name, "Sec-WebSocket-Key") == 0) {
+      strncpy(request->websocket_key, value, sizeof(request->websocket_key) - 1);
+    } else if (strcasecmp(name, "Sec-WebSocket-Protocol") == 0) {
+       strncpy(request->websocket_protocol, value, sizeof(request->websocket_protocol) - 1);
+    }
+  }
+
+  return 0;
+}
+
 const char *http_status_to_string(http_status_t status) {
   switch (status)
   {
@@ -699,7 +768,137 @@ void *worker_thread_function(void *arg) {
   snprintf(thread_name, sizeof(thread_name), "http_worker_%d", worker->thread_id);
   pthread_setname_np(pthread_self(), thread_name);
 
+  printf("Worker thread %d started\n", worker->thread_id);
+
+  while (worker->running) {
+    int event_count = epoll_wait(worker->epoll_fd, events, MAX_EVENTS, 1000);
+
+    if (event_count < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+
+      perror("epoll_wait");
+      break;
+    }
+
+    for (int i = 0; i < event_count; i++) {
+      struct epoll_event event = events[i];
+      connection_t *conn = (connection_t *)event.data.ptr;
+
+      if (event.events & EPOLLERR || event.events & EPOLLHUP) {
+        // Connection error or hangup
+        cleanup_connection(conn);
+        free_connection(&g_server, conn);
+        continue;
+      }
+
+      if (event.events & EPOLLIN) {
+        // Data available for reading
+        if (handle_client_data(worker, conn) != 0) {
+          cleanup_connection(conn);
+          free_connection(&g_server, conn);
+          continue;
+        }
+      }
+
+      if (event.events & EPOLLOUT) {
+        if (handle_client_write(worker, conn) != 0) {
+          cleanup_connection(conn);
+          free_connection(&g_server, conn);
+          continue;
+        }
+      }
+    }
+
+    // Check for connection timeouts
+    time_t current_time = time(NULL);
+    connection_t *conn = worker->connections;
+
+    while (conn) {
+      connection_t *next = conn->next;
+
+      if (current_time - conn ->last_activity > g_server.keepalive_timeout) {
+        cleanup_connection(conn);
+        free_connection(&g_server, conn);
+      }
+
+      conn = next;
+    }
+  }
+
+  printf("Worker thread  %d stopping\n", worker->thread_id);
+
   return NULL;
+}
+
+int handle_client_write(worker_thread_t *worker, connection_t *conn) {
+  if (!conn || conn->state != CONN_STATE_WRITNG_RESPONSE) {
+    return -1;
+  }
+
+  ssize_t bytes_written;
+
+  if (conn->ssl_enabled && conn->ssl) {
+    // SSL write
+    bytes_written = SSL_write(conn->ssl, conn->write_buffer + conn->write_buffer_pos, conn->write_buffer_size - conn->write_buffer_pos);
+
+    if (bytes_written <= 0) {
+      int ssl_error = SSL_get_error(conn->ssl, bytes_written);
+      if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+        return 0; // Would block
+      }
+      return -1; // Error
+    }
+  } else {
+    // Regular write
+    bytes_written = write(
+      conn->socket_fd,
+      conn->write_buffer + conn->write_buffer_pos, 
+      conn->write_buffer_size - conn->write_buffer_pos);
+
+    if (bytes_written <= 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        return 0; // Would block
+      }
+      return -1; // Error
+    }
+  }
+
+  conn->write_buffer_pos += bytes_written;
+  worker->bytes_sent += bytes_written;
+
+  // Check if response is completely sent
+  if (conn->write_buffer_pos >= conn->write_buffer_size) {
+    if (conn->request.keep_alive && g_server.enable_keepalive) {
+      // Reset for next request
+      conn->state = CONN_STATE_READING_REQUEST;
+      conn->read_buffer_pos = 0;
+      conn->write_buffer_pos = 0;
+      conn->write_buffer_size = 0;
+      memset(&conn->request, 0, sizeof(http_request_t));
+      memset(&conn->response, 0, sizeof(http_response_t));
+
+      // Disable EPOLLOUT
+      struct epoll_event event;
+      event.events = EPOLLIN | EPOLLET;
+      event.data.ptr = conn;
+      epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &event);
+    } else {
+      // Close connection
+      return -1;
+    }
+  }
+
+  return 0;
+}
+
+void free_connection(http_server_t *server, connection_t *conn) {
+  // TODO: implement this
+}
+
+void cleanup_connection(connection_t* conn) {
+  // TODO: implement this
 }
 
 int http_server_cleanup(http_server_t *server) {
