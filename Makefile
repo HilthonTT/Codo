@@ -2,7 +2,7 @@
 CC       := gcc
 CFLAGS   := -Wall -Wextra -Wpedantic -std=c11 -Iinclude
 LDFLAGS  :=
-LDLIBS   :=
+LDLIBS   := -lssl -lcrypto -lz -lpthread
 
 # ---- Layout ----
 SRC_DIR   := src
