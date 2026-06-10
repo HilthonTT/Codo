@@ -9,7 +9,7 @@ SRC_DIR   := src
 INC_DIR   := include
 BUILD_DIR := build
 BIN_DIR   := bin
-TARGET    := $(BIN_DIR)/ota
+TARGET    := $(BIN_DIR)/codo
 
 # ---- Sources / objects / deps ----
 SRCS := $(wildcard $(SRC_DIR)/*.c)
