@@ -1,5 +1,5 @@
-#ifndef OTA_SERVER_H
-#define OTA_SERVER_H
+#ifndef SERVER_H
+#define SERVER_H
 
 #include <openssl/ssl.h>
 #include <pthread.h>

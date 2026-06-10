@@ -1,5 +1,5 @@
-#ifndef OTA_SSL_UTIL_H
-#define OTA_SSL_UTIL_H
+#ifndef SSL_UTIL_H
+#define SSL_UTIL_H
 
 struct http_server;
 

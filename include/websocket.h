@@ -1,5 +1,5 @@
-#ifndef OTA_WEBSOCKET_H
-#define OTA_WEBSOCKET_H
+#ifndef WEBSOCKET_H
+#define WEBSOCKET_H
 
 #include <stddef.h>
 

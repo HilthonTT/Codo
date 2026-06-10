@@ -1,5 +1,5 @@
-#ifndef OTA_CONNECTION_H
-#define OTA_CONNECTION_H
+#ifndef CONNECTION_H
+#define CONNECTION_H
 
 #include <netinet/in.h>
 #include <openssl/ssl.h>

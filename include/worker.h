@@ -1,5 +1,5 @@
-#ifndef OTA_WORKER_H
-#define OTA_WORKER_H
+#ifndef WORKER_H
+#define WORKER_H
 
 #include <pthread.h>
 #include <stdbool.h>

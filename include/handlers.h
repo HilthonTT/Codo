@@ -1,5 +1,5 @@
-#ifndef OTA_HANDLERS_H
-#define OTA_HANDLERS_H
+#ifndef HANDLERS_H
+#define HANDLERS_H
 
 #include "connection.h"
 #include "http_types.h"

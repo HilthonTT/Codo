@@ -1,5 +1,5 @@
-#ifndef OTA_HTTP_TYPES_H
-#define OTA_HTTP_TYPES_H
+#ifndef HTTP_TYPES_H
+#define HTTP_TYPES_H
 
 #include <stdbool.h>
 #include <stddef.h>

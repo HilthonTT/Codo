@@ -1,0 +1,206 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/compression.o",
+      "src/compression.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/compression.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/compression.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/connection.o",
+      "src/connection.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/connection.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/connection.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/handlers.o",
+      "src/handlers.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/handlers.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/handlers.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/http_protocol.o",
+      "src/http_protocol.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/http_protocol.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/http_protocol.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/main.o",
+      "src/main.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/main.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/main.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/mime.o",
+      "src/mime.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/mime.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/mime.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/route.o",
+      "src/route.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/route.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/route.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/server.o",
+      "src/server.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/server.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/server.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/ssl.o",
+      "src/ssl.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/ssl.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/ssl.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/util.o",
+      "src/util.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/util.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/util.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/websocket.o",
+      "src/websocket.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/websocket.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/websocket.o"
+  },
+  {
+    "arguments": [
+      "/usr/bin/gcc",
+      "-Wall",
+      "-Wextra",
+      "-Wpedantic",
+      "-std=c11",
+      "-Iinclude",
+      "-c",
+      "-o",
+      "build/worker.o",
+      "src/worker.c"
+    ],
+    "directory": "/home/nobody_home/Documents/Repos/OTA",
+    "file": "/home/nobody_home/Documents/Repos/OTA/src/worker.c",
+    "output": "/home/nobody_home/Documents/Repos/OTA/build/worker.o"
+  }
+]

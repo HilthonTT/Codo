@@ -1,5 +1,5 @@
-#ifndef OTA_COMPRESSION_H
-#define OTA_COMPRESSION_H
+#ifndef COMPRESSION_H
+#define COMPRESSION_H
 
 #include <stddef.h>
 

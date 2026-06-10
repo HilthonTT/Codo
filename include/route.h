@@ -1,5 +1,5 @@
-#ifndef OTA_ROUTE_H
-#define OTA_ROUTE_H
+#ifndef ROUTE_H
+#define ROUTE_H
 
 #include "connection.h"
 #include "http_types.h"

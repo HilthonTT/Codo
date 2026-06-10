@@ -1,5 +1,5 @@
-#ifndef OTA_CONFIG_H
-#define OTA_CONFIG_H
+#ifndef CONFIG_H
+#define CONFIG_H
 
 #define MAX_EVENTS 10000
 #define MAX_CONNECTIONS 100000

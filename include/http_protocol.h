@@ -1,5 +1,5 @@
-#ifndef OTA_HTTP_PROTOCOL_H
-#define OTA_HTTP_PROTOCOL_H
+#ifndef HTTP_PROTOCOL_H
+#define HTTP_PROTOCOL_H
 
 #include "connection.h"
 #include "http_types.h"

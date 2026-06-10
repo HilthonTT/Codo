@@ -1,5 +1,5 @@
-#ifndef OTA_UTIL_H
-#define OTA_UTIL_H
+#ifndef UTIL_H
+#define UTIL_H
 
 #include <stdbool.h>
 #include <stddef.h>
