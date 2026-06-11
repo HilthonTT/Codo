@@ -9,6 +9,7 @@
 #include "route.h"
 #include "server.h"
 #include "ssl_util.h"
+#include "env.h"
 
 // Global server instance and shutdown flag, shared across translation units
 // (workers reach into g_server directly via these externs).
@@ -22,15 +23,28 @@ static void signal_handler(int signum) {
 }
 
 int main(int argc, char *argv[]) {
-  int port = 8080;
-  char *document_root = "/var/www/html";
+  const char *env_file = getenv("ENV_FILE");
+  if (load_env(env_file ? env_file : ".env") != 0) {
+    perror("load_env");
+  }
 
-  // Parse command line arguments
+  int port = env_int("PORT", 8080);
+  const char *document_root = env_str("DOCUMENT_ROOT", "/var/www/html");
+  const char *ssl_cert = env_str("SSL_CERT_FILE", "server.crt");
+  const char *ssl_key = env_str("SSL_KEY_FILE", "server.key");
+  bool ssl_enabled = env_bool("SSL_ENABLED", true);
+
+  // Command line arguments still override everything
   if (argc > 1) {
     port = atoi(argv[1]);
   }
   if (argc > 2) {
     document_root = argv[2];
+  }
+
+  if (port <= 0 || port > 65535) {
+    fprintf(stderr, "Invalid port: %d\n", port);
+    return 1;
   }
 
   // Setup signal handlers
@@ -50,10 +64,13 @@ int main(int argc, char *argv[]) {
   add_route(&g_server, "/api/status", HTTP_GET, api_status_handler);
   add_route(&g_server, "/ws/chat", HTTP_GET, websocket_chat_handler);
 
-  // Enable SSL if certificates are available
-  if (access("server.crt", F_OK) == 0 && access("server.key", F_OK) == 0) {
-    if (init_ssl(&g_server, "server.crt", "server.key") == 0) {
-      printf("SSL enabled\n");
+  // Enable SSL if requested and certificates are available
+  if (ssl_enabled &&
+      access(ssl_cert, F_OK) == 0 && access(ssl_key, F_OK) == 0) {
+    if (init_ssl(&g_server, ssl_cert, ssl_key) == 0) {
+      printf("SSL enabled (%s / %s)\n", ssl_cert, ssl_key);
+    } else {
+      fprintf(stderr, "SSL init failed, continuing without SSL\n");
     }
   }
 
