@@ -216,4 +216,10 @@ typedef struct {
 
 } storage_engine_t;
 
+// Utility functions
+uint64_t hash_key(const char *key, size_t length);
+uint32_t hash_page_id(uint32_t page_id);
+uint32_t calculate_checksum(const void* data, size_t length);
+uint64_t allocate_lsn(void);
+
 #endif
