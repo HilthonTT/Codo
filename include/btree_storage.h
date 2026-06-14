@@ -222,4 +222,7 @@ uint32_t hash_page_id(uint32_t page_id);
 uint32_t calculate_checksum(const void* data, size_t length);
 uint64_t allocate_lsn(void);
 
+int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, const void* data, size_t data_length);
+int flush_wal_buffer(void);
+
 #endif
