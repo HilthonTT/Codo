@@ -3,6 +3,7 @@
 #include <sys/types.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 #include "btree_storage.h"
 
@@ -98,4 +99,161 @@ int flush_wal_buffer(void) {
 
   thread_mutex_unlock(&storage_engine.wal_mutex);
   return 0;
+}
+
+
+buffer_entry_t* find_buffer_entry(uint32_t page_id) {
+  uint32_t hash = hash_page_id(page_id);
+  uint32_t entry_idx = storage_engine.hash_table[hash];
+
+  while (entry_idx != UINT32_MAX) {
+    buffer_entry_t* entry = &storage_engine.buffer_pool[entry_idx];
+    if (entry->page_id == page_id) {
+      return entry;
+    }
+
+    entry_idx = entry->hash_next;
+  }
+  
+  return NULL;
+}
+
+buffer_entry_t* allocate_buffer_entry(uint32_t page_id) {
+  pthread_mutex_lock(&storage_engine.buffer_mutex);
+
+  // Find least recently used unpinned page
+  buffer_entry_t* victim = NULL;
+  struct timespec oldest_time = {0};
+
+  for (size_t i = 0; i < BUFFER_POOL_SIZE; i++) {
+    buffer_entry_t* entry = &storage_engine.buffer_pool[i];
+
+    if (!entry->pinned && atomic_load(&entry->ref_count) == 0) {
+      if (!victim || entry->last_access.tv_sec < oldest_time.tv_sec ||
+          (entry->last_access.tv_sec == oldest_time.tv_sec && 
+            entry->last_access.tv_nsec < oldest_time.tv_nsec)) {
+        victim = entry;
+        oldest_time = entry->last_access;
+      }
+    }
+  }
+
+  if (!victim) {
+    pthread_mutex_unlock(&storage_engine.buffer_mutex);
+    return NULL; // Buffer pool full
+  }
+
+  // Evict victim if dirty
+  if (victim->dirty && victim->page) {
+    // Write page to disk
+    off_t offset = victim->page_id * PAGE_SIZE;
+    if (pwrite(storage_engine.data_fd, victim->page, PAGE_SIZE, offset) != 0) {
+      pthread_mutex_unlock(&storage_engine.buffer_mutex);
+      return NULL;
+    }
+    atomic_fetch_add(&storage_engine.stats.pages_written, 1);
+    victim->dirty = false;
+  }
+
+  // Remove from hash table
+  if (victim->page_id != 0) {
+    uint32_t hash = hash_page_id(page_id);
+    uint32_t* current = &storage_engine.hash_table[hash];
+
+    while (*current != UINT32_MAX) {
+      if (*current == (victim - storage_engine.buffer_pool)) {
+        *current = victim->hash_next;
+        break;
+      }
+      current = &storage_engine.buffer_pool[*current].hash_next;
+    }
+  }
+
+  // Initialize new entry
+  victim->page_id = page_id;
+  victim->dirty = false;
+  victim->pinned = false;
+  atomic_store(&victim->ref_count, 1);
+  clock_gettime(CLOCK_MONOTONIC, &victim->last_access);
+
+  // Add to hash table
+  uint32_t hash = hash_page_id(page_id);
+  victim->hash_next = storage_engine.hash_table[hash];
+  storage_engine.hash_table[hash] = victim - storage_engine.buffer_pool;
+
+  pthread_mutex_unlock(&storage_engine.buffer_mutex);
+
+  return victim;
+}
+
+btree_page_t* get_page(uint32_t page_id, lock_type_t lock_type) {
+  // Check buffer pool first
+  buffer_entry_t* entry = find_buffer_entry(page_id);
+
+  if (entry) {
+    atomic_fetch_add(&entry->ref_count, 1);
+    clock_gettime(CLOCK_MONOTONIC, &entry->last_access);
+    atomic_fetch_add(&storage_engine.stats.cache_hits, 1);
+
+    // Acquire page lock
+    if (lock_type == LOCK_SHARED) {
+      pthread_rwlock_rdlock(&entry->page_lock);
+    } else if (lock_type == LOCK_EXCLUSIVE) {
+      pthread_rwlock_wrlock(&entry->page_lock);
+    }
+
+    return entry->page;
+  }
+
+  // Page not in buffer pool - allocate new entry
+  entry = allocate_buffer_entry(page_id);
+  if (!entry) {
+    return NULL;
+  }
+
+  atomic_fetch_add(&storage_engine.stats.cache_misses, 1);
+
+  if (!entry->page) {
+    entry->page = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
+    if (!entry->page) {
+      atomic_fetch_sub(&entry->ref_count, 1);
+      return NULL;
+    }
+  }
+
+  // Read page from disk
+  off_t offset = page_id * PAGE_SIZE;
+  if (pread(storage_engine.data_fd, entry->page, PAGE_SIZE, offset) != PAGE_SIZE) {
+    // Page doesn´t exist - initialize new page
+    memset(entry->page, 0, PAGE_SIZE);
+    entry->page->header.page_id = page_id;
+    entry->page->header.page_type = PAGE_TYPE_LEAF;
+    entry->page->header.free_space = PAGE_SIZE - sizeof(page_header_t);
+    entry->dirty = true;
+  }
+
+  atomic_fetch_add(&storage_engine.stats.pages_read, 1);
+
+  // Verify checksum if enabled
+  if (storage_engine.config.enable_checksums) {
+    uint32_t stored_checksum = entry->page->header.checksum;
+    entry->page->header.checksum = 0;
+    uint32_t calculated_checksum = calculate_checksum(entry->page, PAGE_SIZE);
+    entry->page->header.checksum = stored_checksum;
+
+    if (stored_checksum != 0 && stored_checksum != calculated_checksum) {
+      printf("Checksum mismatch for page %u\n", page_id);
+      atomic_fetch_sub(&entry->ref_count, 1);
+      return NULL;
+    }
+  }
+
+  // Acquire page lock
+  if (lock_type == LOCK_SHARED) {
+    pthread_rwlock_rdlock(&entry->page_lock);
+  } else if (lock_type == LOCK_EXCLUSIVE) {
+    pthread_rwlock_wrlock(&entry->page_lock);
+  }
+ 
+  return entry->page;
 }

@@ -224,5 +224,8 @@ uint64_t allocate_lsn(void);
 
 int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, const void* data, size_t data_length);
 int flush_wal_buffer(void);
+buffer_entry_t* find_buffer_entry(uint32_t page_id);
+buffer_entry_t* allocate_buffer_entry(uint32_t page_id);
+btree_page_t* get_page(uint32_t page_id, lock_type_t lock_type);
 
 #endif
