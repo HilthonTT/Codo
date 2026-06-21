@@ -257,3 +257,90 @@ btree_page_t* get_page(uint32_t page_id, lock_type_t lock_type) {
  
   return entry->page;
 }
+
+void release_page(uint32_t page_id, lock_type_t lock_type) {
+  buffer_entry_t* entry = find_buffer_entry(page_id);
+  if (!entry) {
+    return;
+  }
+
+  if (lock_type == LOCK_SHARED || lock_type == LOCK_EXCLUSIVE) {
+    pthread_rwlock_unlock(&entry->page_lock);
+  }
+
+  atomic_fetch_sub(&entry->ref_count, 1);
+}
+
+void mark_page_dirty(uint32_t page_id) {
+  buffer_entry_t* entry = find_buffer_entry(page_id);
+  if (entry) {
+    entry->dirty = true;
+
+    // Update LSN
+    if (storage_engine.config.enable_wal) {
+      entry->page->header.lsn = storage_engine.next_lsn - 1;
+    }
+
+    // Update checksum
+    if (storage_engine.config.enable_checksums) {
+      entry->page->header.checksum = 0;
+      entry->page->header.checksum = calculate_checksum(entry->page, PAGE_SIZE);
+    }
+  }
+}
+
+
+uint32_t allocate_page(void) {
+  pthread_mutex_lock(&storage_engine.free_page_mutex);
+
+  uint32_t page_id;
+
+  if (storage_engine.free_page_count > 0) {
+    // Reuse a free page
+    page_id = storage_engine.free_pages[--storage_engine.free_page_count];
+  } else {
+    page_id = storage_engine.next_page_id++;
+  }
+
+  pthread_mutex_unlock(&storage_engine.free_page_mutex);
+
+  return page_id;
+}
+
+
+void deallocate_page(uint32_t page_id) {
+  pthread_mutex_lock(&storage_engine.free_page_mutex);
+
+  // Grow free page array if necessary
+  if (storage_engine.free_page_count >= storage_engine.free_page_capacity) {
+    size_t new_capacity = storage_engine.free_page_capacity * 2;
+    if (new_capacity == 0) {
+      new_capacity = 1024;
+    }
+
+    uint32_t* new_array = realloc(storage_engine.free_pages, new_capacity * sizeof(uint32_t));
+    if (new_array) {
+      storage_engine.free_pages = new_array;
+      storage_engine.free_page_capacity = new_capacity;
+    }
+  }
+
+  if (storage_engine.free_page_count < storage_engine.free_page_capacity) {
+    storage_engine.free_pages[storage_engine.free_page_count++] = page_id;
+  }
+
+  pthread_mutex_unlock(&storage_engine.free_page_mutex);
+}
+
+int compare_keys(const char* key1, size_t len1, const char* key2, size_t len2) {
+  size_t min_len = len1 < len2 ? len1 : len2;
+  int result = memcmp(key1, key2, min_len);
+
+  if (result == 0) {
+    if (len1 < len2) return -1;
+    if (len1 > len2) return 1;
+    return 0;
+  }
+
+  return result;
+}

@@ -227,5 +227,12 @@ int flush_wal_buffer(void);
 buffer_entry_t* find_buffer_entry(uint32_t page_id);
 buffer_entry_t* allocate_buffer_entry(uint32_t page_id);
 btree_page_t* get_page(uint32_t page_id, lock_type_t lock_type);
+void release_page(uint32_t page_id, lock_type_t lock_type);
+void mark_page_dirty(uint32_t page_id);
+uint32_t allocate_page(void);
+void deallocate_page(uint32_t page_id);
+
+// B-tree operations
+int compare_keys(const char* key1, size_t len1, const char* key2, size_t len2);
 
 #endif
