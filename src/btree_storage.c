@@ -4,6 +4,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdio.h>
 
 #include "btree_storage.h"
 
@@ -400,4 +401,63 @@ int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2)
   }
 
   return result;
+}
+
+kv_pair_t *get_kv_pair(btree_page_t *page, int index)
+{
+  if (index < 0 || index >= page->header.key_count)
+  {
+    return NULL;
+  }
+
+  // Find the key-value pair at the given index
+  char *data_ptr = page->data;
+
+  for (int i = 0; i <= index; i++)
+  {
+    if (i == index)
+    {
+      return (kv_pair_t *)data_ptr;
+    }
+
+    kv_pair_t *kv = (kv_pair_t *)data_ptr;
+    data_ptr += sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+  }
+
+  return NULL;
+}
+
+int find_key_position(btree_page_t *page, const char *key, size_t key_length)
+{
+  int left = 0;
+  int right = page->header.key_count - 1;
+
+  while (left <= right)
+  {
+    int mid = (left + right) / 2;
+    kv_pair_t *kv = get_kv_pair(page, mid);
+
+    if (!kv)
+    {
+      break;
+    }
+
+    const char *kv_key = kv->data;
+    int cmp = compare_keys(key, key_length, kv_key, kv->key_length);
+
+    if (cmp == 0)
+    {
+      return mid; // Exact match
+    }
+    else if (cmp < 0)
+    {
+      right = mid - 1;
+    }
+    else
+    {
+      left = mid + 1;
+    }
+  }
+
+  return left;
 }

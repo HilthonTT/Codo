@@ -250,5 +250,7 @@ void deallocate_page(uint32_t page_id);
 
 // B-tree operations
 int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2);
+kv_pair_t *get_kv_pair(btree_page_t *page, int index);
+int find_key_position(btree_page_t *page, const char *key, size_t key_length);
 
 #endif
