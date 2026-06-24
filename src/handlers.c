@@ -10,7 +10,8 @@
 #include "server.h"
 #include "websocket.h"
 
-int api_hello_handler(connection_t *conn, http_request_t *request, http_response_t *response) {
+int api_hello_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
   const char *hello_msg = "{\"message\": \"Hello, World!\", \"timestamp\": \"2026-01-01T00:00:00Z\"}";
 
   response->status = HTTP_OK;
@@ -26,8 +27,10 @@ int api_hello_handler(connection_t *conn, http_request_t *request, http_response
   return send_http_response(conn, response);
 }
 
-int api_echo_handler(connection_t *conn, http_request_t *request, http_response_t *response) {
-  if (request->method != HTTP_POST) {
+int api_echo_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  if (request->method != HTTP_POST)
+  {
     return send_error_response(conn, HTTP_METHOD_NOT_ALLOWED, "Method not allowed");
   }
 
@@ -35,7 +38,8 @@ int api_echo_handler(connection_t *conn, http_request_t *request, http_response_
   const char *src = request->body ? request->body : "";
 
   response->body = malloc(body_len + 1);
-  if (!response->body) {
+  if (!response->body)
+  {
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
   }
   memcpy(response->body, src, body_len);
@@ -53,7 +57,8 @@ int api_echo_handler(connection_t *conn, http_request_t *request, http_response_
   return send_http_response(conn, response);
 }
 
-int api_status_handler(connection_t *conn, http_request_t *request, http_response_t *response) {
+int api_status_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
   char status_json[1024];
   snprintf(status_json, sizeof(status_json),
            "{"
@@ -80,9 +85,11 @@ int api_status_handler(connection_t *conn, http_request_t *request, http_respons
   return send_http_response(conn, response);
 }
 
-int websocket_chat_handler(connection_t *conn, http_request_t *request, http_response_t *response) {
+int websocket_chat_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
   (void)response;
-  if (request->is_websocket_upgrade) {
+  if (request->is_websocket_upgrade)
+  {
     return handle_websocket_upgrade(conn, request);
   }
   return send_error_response(conn, HTTP_BAD_REQUEST, "WebSocket upgrade required");

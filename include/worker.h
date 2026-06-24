@@ -7,7 +7,8 @@
 
 #include "connection.h"
 
-typedef struct {
+typedef struct
+{
   int thread_id;
   pthread_t thread;
   int epoll_fd;

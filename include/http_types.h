@@ -8,7 +8,8 @@
 #include "config.h"
 
 // HTTP methods
-typedef enum {
+typedef enum
+{
   HTTP_GET,
   HTTP_POST,
   HTTP_PUT,
@@ -22,7 +23,8 @@ typedef enum {
 } http_method_t;
 
 // HTTP status codes
-typedef enum {
+typedef enum
+{
   HTTP_OK = 200,
   HTTP_CREATED = 201,
   HTTP_ACCEPTED = 202,
@@ -45,13 +47,15 @@ typedef enum {
 } http_status_t;
 
 // Single HTTP header (name/value pair)
-typedef struct {
+typedef struct
+{
   char name[256];
   char value[2048];
 } http_header_t;
 
 // Parsed HTTP request
-typedef struct {
+typedef struct
+{
   http_method_t method;
   char uri[2048];
   char version[16];
@@ -69,7 +73,8 @@ typedef struct {
 } http_request_t;
 
 // Outgoing HTTP response
-typedef struct {
+typedef struct
+{
   http_status_t status;
   char version[16];
   http_header_t headers[MAX_HEADERS];

@@ -16,15 +16,18 @@
 http_server_t g_server;
 volatile bool g_running = true;
 
-static void signal_handler(int signum) {
+static void signal_handler(int signum)
+{
   (void)signum;
   g_running = false;
   g_server.running = false;
 }
 
-int main(int argc, char *argv[]) {
+int main(int argc, char *argv[])
+{
   const char *env_file = getenv("ENV_FILE");
-  if (load_env(env_file ? env_file : ".env") != 0) {
+  if (load_env(env_file ? env_file : ".env") != 0)
+  {
     perror("load_env");
   }
 
@@ -35,14 +38,17 @@ int main(int argc, char *argv[]) {
   bool ssl_enabled = env_bool("SSL_ENABLED", true);
 
   // Command line arguments still override everything
-  if (argc > 1) {
+  if (argc > 1)
+  {
     port = atoi(argv[1]);
   }
-  if (argc > 2) {
+  if (argc > 2)
+  {
     document_root = argv[2];
   }
 
-  if (port <= 0 || port > 65535) {
+  if (port <= 0 || port > 65535)
+  {
     fprintf(stderr, "Invalid port: %d\n", port);
     return 1;
   }
@@ -53,7 +59,8 @@ int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
 
   // Initialize HTTP server
-  if (http_server_init(&g_server, port, document_root) != 0) {
+  if (http_server_init(&g_server, port, document_root) != 0)
+  {
     fprintf(stderr, "Failed to initialize HTTP server\n");
     return 1;
   }
@@ -66,10 +73,14 @@ int main(int argc, char *argv[]) {
 
   // Enable SSL if requested and certificates are available
   if (ssl_enabled &&
-      access(ssl_cert, F_OK) == 0 && access(ssl_key, F_OK) == 0) {
-    if (init_ssl(&g_server, ssl_cert, ssl_key) == 0) {
+      access(ssl_cert, F_OK) == 0 && access(ssl_key, F_OK) == 0)
+  {
+    if (init_ssl(&g_server, ssl_cert, ssl_key) == 0)
+    {
       printf("SSL enabled (%s / %s)\n", ssl_cert, ssl_key);
-    } else {
+    }
+    else
+    {
       fprintf(stderr, "SSL init failed, continuing without SSL\n");
     }
   }
@@ -77,7 +88,8 @@ int main(int argc, char *argv[]) {
   printf("HTTP server starting on port %d\n", port);
   printf("Document root: %s\n", document_root);
 
-  if (http_server_start(&g_server) != 0) {
+  if (http_server_start(&g_server) != 0)
+  {
     fprintf(stderr, "Failed to start HTTP server\n");
     http_server_cleanup(&g_server);
     return 1;

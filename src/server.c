@@ -17,8 +17,10 @@
 #include "ssl_util.h"
 #include "worker.h"
 
-int http_server_init(http_server_t *server, int port, const char *document_root) {
-  if (!server) {
+int http_server_init(http_server_t *server, int port, const char *document_root)
+{
+  if (!server)
+  {
     return -1;
   }
 
@@ -41,7 +43,8 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
 
   // Create listening socket
   server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server->listen_fd < 0) {
+  if (server->listen_fd < 0)
+  {
     perror("socket");
     return -1;
   }
@@ -57,14 +60,16 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   server_addr.sin_addr.s_addr = INADDR_ANY;
   server_addr.sin_port = htons(port);
 
-  if (bind(server->listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+  if (bind(server->listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+  {
     perror("bind");
     close(server->listen_fd);
     return -1;
   }
 
   // Listen for connections
-  if (listen(server->listen_fd, BACKLOG) < 0) {
+  if (listen(server->listen_fd, BACKLOG) < 0)
+  {
     perror("listen");
     close(server->listen_fd);
     return -1;
@@ -73,25 +78,30 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   return 0;
 }
 
-int http_server_start(http_server_t *server) {
-  if (!server) {
+int http_server_start(http_server_t *server)
+{
+  if (!server)
+  {
     return -1;
   }
 
-  for (int i = 0; i < server->worker_count; i++) {
+  for (int i = 0; i < server->worker_count; i++)
+  {
     worker_thread_t *worker = &server->workers[i];
     worker->thread_id = i;
     worker->running = true;
 
     // Create epoll instance for this worker
     worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
-    if (worker->epoll_fd < 0) {
+    if (worker->epoll_fd < 0)
+    {
       perror("epoll_create1");
       return -1;
     }
 
     // Create worker thread
-    if (pthread_create(&worker->thread, NULL, worker_thread_function, worker) != 0) {
+    if (pthread_create(&worker->thread, NULL, worker_thread_function, worker) != 0)
+    {
       perror("pthread_create");
       return -1;
     }
@@ -99,17 +109,21 @@ int http_server_start(http_server_t *server) {
 
   // Accept connections and distribute to workers
   int worker_index = 0;
-  while (server->running) {
+  while (server->running)
+  {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
 
     int client_fd = accept(server->listen_fd, (struct sockaddr *)&client_addr, &client_len);
-    if (client_fd < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (client_fd < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
         usleep(1000); // 1ms
         continue;
       }
-      if (errno == EINTR) {
+      if (errno == EINTR)
+      {
         continue;
       }
       perror("accept");
@@ -122,11 +136,15 @@ int http_server_start(http_server_t *server) {
 
     // Distribute connection to worker
     worker_thread_t *worker = &server->workers[worker_index];
-    if (handle_new_connection(worker, client_fd) != 0) {
+    if (handle_new_connection(worker, client_fd) != 0)
+    {
       close(client_fd);
-    } else {
+    }
+    else
+    {
       // Record client address on the just-allocated connection (head of list).
-      if (worker->connections) {
+      if (worker->connections)
+      {
         worker->connections->client_addr = client_addr;
       }
     }
@@ -143,42 +161,53 @@ int http_server_start(http_server_t *server) {
   return 0;
 }
 
-int http_server_stop(http_server_t *server) {
-  if (!server) {
+int http_server_stop(http_server_t *server)
+{
+  if (!server)
+  {
     return -1;
   }
   server->running = false;
-  for (int i = 0; i < server->worker_count; i++) {
+  for (int i = 0; i < server->worker_count; i++)
+  {
     server->workers[i].running = false;
   }
   return 0;
 }
 
-int http_server_cleanup(http_server_t *server) {
-  if (!server) {
+int http_server_cleanup(http_server_t *server)
+{
+  if (!server)
+  {
     return -1;
   }
 
-  for (int i = 0; i < server->worker_count; i++) {
+  for (int i = 0; i < server->worker_count; i++)
+  {
     server->workers[i].running = false;
   }
-  for (int i = 0; i < server->worker_count; i++) {
-    if (server->workers[i].thread) {
+  for (int i = 0; i < server->worker_count; i++)
+  {
+    if (server->workers[i].thread)
+    {
       pthread_join(server->workers[i].thread, NULL);
     }
-    if (server->workers[i].epoll_fd > 0) {
+    if (server->workers[i].epoll_fd > 0)
+    {
       close(server->workers[i].epoll_fd);
     }
   }
 
   // Close listening socket
-  if (server->listen_fd > 0) {
+  if (server->listen_fd > 0)
+  {
     close(server->listen_fd);
     server->listen_fd = -1;
   }
 
   // Cleanup SSL
-  if (server->ssl_enabled) {
+  if (server->ssl_enabled)
+  {
     cleanup_ssl(server);
   }
 
@@ -190,7 +219,8 @@ int http_server_cleanup(http_server_t *server) {
 
   // Cleanup routes
   route_t *route = server->routes;
-  while (route) {
+  while (route)
+  {
     route_t *next = route->next;
     free(route);
     route = next;

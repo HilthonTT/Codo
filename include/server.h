@@ -11,7 +11,8 @@
 #include "route.h"
 #include "worker.h"
 
-typedef struct http_server {
+typedef struct http_server
+{
   int listen_fd;
   int listen_port;
   char *document_root;

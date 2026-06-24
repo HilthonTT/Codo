@@ -13,8 +13,10 @@
 #include "http_types.h"
 #include "websocket.h"
 
-void generate_websocket_accept_key(const char *key, char *accept_key) {
-  if (!key || !accept_key) {
+void generate_websocket_accept_key(const char *key, char *accept_key)
+{
+  if (!key || !accept_key)
+  {
     return;
   }
 
@@ -27,9 +29,12 @@ void generate_websocket_accept_key(const char *key, char *accept_key) {
 
   BIO *b64 = BIO_new(BIO_f_base64());
   BIO *mem = BIO_new(BIO_s_mem());
-  if (!b64 || !mem) {
-    if (b64) BIO_free(b64);
-    if (mem) BIO_free(mem);
+  if (!b64 || !mem)
+  {
+    if (b64)
+      BIO_free(b64);
+    if (mem)
+      BIO_free(mem);
     accept_key[0] = '\0';
     return;
   }
@@ -41,7 +46,8 @@ void generate_websocket_accept_key(const char *key, char *accept_key) {
   BUF_MEM *bptr = NULL;
   BIO_get_mem_ptr(b64, &bptr);
   size_t copy_len = 0;
-  if (bptr) {
+  if (bptr)
+  {
     copy_len = bptr->length < 63 ? bptr->length : 63;
     memcpy(accept_key, bptr->data, copy_len);
   }
@@ -50,11 +56,14 @@ void generate_websocket_accept_key(const char *key, char *accept_key) {
   BIO_free_all(b64);
 }
 
-int handle_websocket_upgrade(connection_t *conn, http_request_t *request) {
-  if (!conn || !request) {
+int handle_websocket_upgrade(connection_t *conn, http_request_t *request)
+{
+  if (!conn || !request)
+  {
     return -1;
   }
-  if (!request->is_websocket_upgrade || request->websocket_key[0] == '\0') {
+  if (!request->is_websocket_upgrade || request->websocket_key[0] == '\0')
+  {
     return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid WebSocket upgrade");
   }
 
@@ -68,7 +77,8 @@ int handle_websocket_upgrade(connection_t *conn, http_request_t *request) {
                      "Sec-WebSocket-Accept: %s\r\n"
                      "\r\n",
                      accept_key);
-  if (len < 0 || (size_t)len >= MAX_RESPONSE_SIZE) {
+  if (len < 0 || (size_t)len >= MAX_RESPONSE_SIZE)
+  {
     return -1;
   }
 
@@ -83,7 +93,8 @@ int handle_websocket_upgrade(connection_t *conn, http_request_t *request) {
   return 0;
 }
 
-int handle_websocket_frame(connection_t *conn, const char *data, size_t length) {
+int handle_websocket_frame(connection_t *conn, const char *data, size_t length)
+{
   // Minimal stub: this implementation does not yet parse WebSocket frames.
   // It exists so the symbol is defined and callers compile.
   (void)conn;

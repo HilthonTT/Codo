@@ -7,7 +7,8 @@
 // Route handler function type
 typedef int (*route_handler_t)(connection_t *conn, http_request_t *request, http_response_t *response);
 
-typedef struct route {
+typedef struct route
+{
   char pattern[512];
   http_method_t method;
   route_handler_t handler;

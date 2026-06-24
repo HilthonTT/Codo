@@ -11,12 +11,15 @@
 #include "util.h"
 
 int add_route(http_server_t *server, const char *pattern,
-              http_method_t method, route_handler_t handler) {
-  if (!server || !pattern || !handler) {
+              http_method_t method, route_handler_t handler)
+{
+  if (!server || !pattern || !handler)
+  {
     return -1;
   }
   route_t *route = calloc(1, sizeof(route_t));
-  if (!route) {
+  if (!route)
+  {
     return -1;
   }
   strncpy(route->pattern, pattern, sizeof(route->pattern) - 1);
@@ -28,27 +31,34 @@ int add_route(http_server_t *server, const char *pattern,
   return 0;
 }
 
-route_t *find_route(http_server_t *server, const char *uri, http_method_t method) {
-  if (!server || !uri) {
+route_t *find_route(http_server_t *server, const char *uri, http_method_t method)
+{
+  if (!server || !uri)
+  {
     return NULL;
   }
-  for (route_t *r = server->routes; r; r = r->next) {
-    if (r->method == method && strcmp(r->pattern, uri) == 0) {
+  for (route_t *r = server->routes; r; r = r->next)
+  {
+    if (r->method == method && strcmp(r->pattern, uri) == 0)
+    {
       return r;
     }
   }
   return NULL;
 }
 
-int default_file_handler(connection_t *conn, http_request_t *request, http_response_t *response) {
+int default_file_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
   (void)response;
 
-  if (request->method != HTTP_GET && request->method != HTTP_HEAD) {
+  if (request->method != HTTP_GET && request->method != HTTP_HEAD)
+  {
     return send_error_response(conn, HTTP_METHOD_NOT_ALLOWED, "Method not allowed");
   }
 
   // Check if path is safe
-  if (!is_valid_uri(request->uri)) {
+  if (!is_valid_uri(request->uri))
+  {
     return send_error_response(conn, HTTP_FORBIDDEN, "Access denied");
   }
 
@@ -58,7 +68,8 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
 
   // Check if file exists
   struct stat file_stat;
-  if (stat(file_path, &file_stat) < 0) {
+  if (stat(file_path, &file_stat) < 0)
+  {
     return send_error_response(conn, HTTP_NOT_FOUND, "File not found");
   }
 

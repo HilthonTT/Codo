@@ -16,7 +16,8 @@
 #define WAL_BUFFER_SIZE (1024 * 1024)
 
 // Page types
-typedef enum {
+typedef enum
+{
   PAGE_TYPE_LEAF = 1,
   PAGE_TYPE_INTERNAL = 2,
   PAGE_TYPE_OVERFLOW = 3,
@@ -24,7 +25,8 @@ typedef enum {
 } page_type_t;
 
 // Lock types
-typedef enum {
+typedef enum
+{
   LOCK_NONE = 0,
   LOCK_SHARED = 1,
   LOCK_EXCLUSIVE = 2,
@@ -32,7 +34,8 @@ typedef enum {
 } lock_type_t;
 
 // Transaction types
-typedef enum {
+typedef enum
+{
   TXN_STATE_ACTIVE,
   TXN_STATE_COMMITED,
   TXN_STATE_ABORTED,
@@ -40,7 +43,8 @@ typedef enum {
 } transaction_state_t;
 
 // WAL record types
-typedef enum {
+typedef enum
+{
   WAL_INSERT = 1,
   WAL_UPDATE = 2,
   WAL_DELETE = 3,
@@ -50,7 +54,8 @@ typedef enum {
 } wal_record_type_t;
 
 // Page header structure
-typedef struct {
+typedef struct
+{
   uint32_t page_id;
   page_type_t page_type;
   uint16_t key_count;
@@ -64,22 +69,25 @@ typedef struct {
 } page_header_t;
 
 // Key-value pair structure
-typedef struct {
+typedef struct
+{
   uint16_t key_length;
   uint16_t value_length;
   uint32_t child_page_id; // For internal node
-  char data[]; // Key followed by value
+  char data[];            // Key followed by value
 } kv_pair_t;
 
 // B-tree page structure
-typedef struct {
+typedef struct
+{
   page_header_t header;
   char data[PAGE_SIZE - sizeof(page_header_t)];
 } btree_page_t;
 
 // Buffer pool entry
-typedef struct {
-  btree_page_t* page;
+typedef struct
+{
+  btree_page_t *page;
   uint32_t page_id;
   bool dirty;
   bool pinned;
@@ -90,7 +98,8 @@ typedef struct {
 } buffer_entry_t;
 
 // Transaction structure
-typedef struct transaction {
+typedef struct transaction
+{
   uint64_t txn_id;
   transaction_state_t state;
   uint64_t start_lsn;
@@ -99,15 +108,16 @@ typedef struct transaction {
   time_t commit_time;
 
   // Lock table
-  struct lock_entry* locks;
+  struct lock_entry *locks;
   pthread_mutex_t lock_mutex;
 
   // Undo log
-  struct undo_entry* undo_log;
+  struct undo_entry *undo_log;
   size_t undo_count;
 
   // Statistics
-  struct {
+  struct
+  {
     uint64_t pages_read;
     uint64_t pages_written;
     uint64_t rows_inserted;
@@ -115,33 +125,36 @@ typedef struct transaction {
     uint64_t rows_deleted;
   } stats;
 
-  struct transaction* next;
+  struct transaction *next;
 } transaction_t;
 
 // Lock entry
-typedef struct lock_entry {
+typedef struct lock_entry
+{
   uint32_t page_id;
   uint64_t key_hash;
   lock_type_t lock_type;
-  transaction_t* owner;
-  struct lock_entry* next_in_txn;
-  struct lock_entry* next_in_table;
+  transaction_t *owner;
+  struct lock_entry *next_in_txn;
+  struct lock_entry *next_in_table;
 } lock_entry_t;
 
 // Undo log entry
-typedef struct undo_entry {
+typedef struct undo_entry
+{
   wal_record_type_t operation;
   uint32_t page_id;
   uint16_t slot_id;
   uint16_t key_length;
   uint16_t old_value_length;
-  char* key_data;
-  char* old_value_data;
-  struct undo_entry* next;
+  char *key_data;
+  char *old_value_data;
+  struct undo_entry *next;
 } undo_entry_t;
 
 // WAL record
-typedef struct {
+typedef struct
+{
   uint64_t lsn;
   uint64_t txn_id;
   wal_record_type_t type;
@@ -152,7 +165,8 @@ typedef struct {
 } wal_record_t;
 
 // Storage engine context
-typedef struct {
+typedef struct
+{
   // File management
   int data_fd;
   int wal_fd;
@@ -161,29 +175,29 @@ typedef struct {
 
   // Buffer pool
   buffer_entry_t buffer_pool[BUFFER_POOL_SIZE];
-  uint32_t* hash_table;
+  uint32_t *hash_table;
   size_t hash_table_size;
   pthread_mutex_t buffer_mutex;
 
   // Free page management
-  uint32_t* free_pages;
+  uint32_t *free_pages;
   size_t free_page_count;
   size_t free_page_capacity;
   uint32_t next_page_id;
   pthread_mutex_t free_page_mutex;
 
   // Transaction management
-  transaction_t* active_transactions;
+  transaction_t *active_transactions;
   uint64_t next_txn_id;
   pthread_mutex_t txn_mutex;
 
   // Lock table
-  lock_entry_t** lock_table;
+  lock_entry_t **lock_table;
   size_t lock_table_size;
   pthread_mutex_t lock_table_mutex;
 
   // WAL management
-  uint8_t* wal_buffer;
+  uint8_t *wal_buffer;
   size_t wal_buffer_pos;
   uint64_t next_lsn;
   uint64_t last_checkpoint_lsn;
@@ -193,7 +207,8 @@ typedef struct {
   uint32_t root_page_id;
 
   // Statistics
-  struct {
+  struct
+  {
     _Atomic uint64_t pages_read;
     _Atomic uint64_t pages_written;
     _Atomic uint64_t cache_hits;
@@ -205,7 +220,8 @@ typedef struct {
   } stats;
 
   // Configuration
-  struct {
+  struct
+  {
     bool enable_checksums;
     bool enable_wal;
     bool enable_compression;
@@ -219,20 +235,20 @@ typedef struct {
 // Utility functions
 uint64_t hash_key(const char *key, size_t length);
 uint32_t hash_page_id(uint32_t page_id);
-uint32_t calculate_checksum(const void* data, size_t length);
+uint32_t calculate_checksum(const void *data, size_t length);
 uint64_t allocate_lsn(void);
 
-int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, const void* data, size_t data_length);
+int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, const void *data, size_t data_length);
 int flush_wal_buffer(void);
-buffer_entry_t* find_buffer_entry(uint32_t page_id);
-buffer_entry_t* allocate_buffer_entry(uint32_t page_id);
-btree_page_t* get_page(uint32_t page_id, lock_type_t lock_type);
+buffer_entry_t *find_buffer_entry(uint32_t page_id);
+buffer_entry_t *allocate_buffer_entry(uint32_t page_id);
+btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type);
 void release_page(uint32_t page_id, lock_type_t lock_type);
 void mark_page_dirty(uint32_t page_id);
 uint32_t allocate_page(void);
 void deallocate_page(uint32_t page_id);
 
 // B-tree operations
-int compare_keys(const char* key1, size_t len1, const char* key2, size_t len2);
+int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2);
 
 #endif

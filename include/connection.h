@@ -13,7 +13,8 @@
 #include "http_types.h"
 
 // Per-connection state machine
-typedef enum {
+typedef enum
+{
   CONN_STATE_READING_REQUEST,
   CONN_STATE_PROCESSING,
   CONN_STATE_WRITNG_RESPONSE,
@@ -22,7 +23,8 @@ typedef enum {
   CONN_STATE_CLOSING,
 } connection_state_t;
 
-typedef struct connection {
+typedef struct connection
+{
   int socket_fd;
   struct sockaddr_in client_addr;
   connection_state_t state;
