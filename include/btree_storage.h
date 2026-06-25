@@ -252,5 +252,18 @@ void deallocate_page(uint32_t page_id);
 int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2);
 kv_pair_t *get_kv_pair(btree_page_t *page, int index);
 int find_key_position(btree_page_t *page, const char *key, size_t key_length);
+int insert_kv_pair(
+    btree_page_t *page,
+    int position,
+    const char *key,
+    size_t key_length,
+    const char *value,
+    size_t value_length,
+    uint32_t child_page_id);
+int delete_kv_pair(btree_page_t *page, int position);
+
+transaction_t *begin_transaction(void);
+int commit_transaction(transaction_t *txn);
+int abort_transaction(transaction_t *txn);
 
 #endif

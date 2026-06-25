@@ -461,3 +461,205 @@ int find_key_position(btree_page_t *page, const char *key, size_t key_length)
 
   return left;
 }
+
+int insert_kv_pair(
+    btree_page_t *page,
+    int position,
+    const char *key,
+    size_t key_length,
+    const char *value,
+    size_t value_length,
+    uint32_t child_page_id)
+{
+  size_t pair_size = sizeof(kv_pair_t) + key_length + value_length;
+
+  if (page->header.free_space < pair_size)
+  {
+    return -1; // Not enough size
+  }
+
+  // Find insertion point
+  char *insert_ptr = page->data;
+  for (int i = 0; i < position; i++)
+  {
+    kv_pair_t *kv = (kv_pair_t *)insert_ptr;
+    insert_ptr += sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+  }
+
+  // Calculate space neede to move existing data
+  char *end_ptr = page->data + (PAGE_SIZE - sizeof(page_header_t)) + page->header.free_space;
+  size_t move_size = end_ptr - insert_ptr;
+
+  // Move existing data to make room
+  if (move_size > 0)
+  {
+    memmove(insert_ptr + pair_size, insert_ptr, move_size);
+  }
+
+  // Move existing new key-value pair
+  kv_pair_t *new_kv = (kv_pair_t *)insert_ptr;
+  new_kv->key_length = key_length;
+  new_kv->value_length = value_length;
+  new_kv->child_page_id = child_page_id;
+
+  memcpy(new_kv->data, key, key_length);
+  memcpy(new_kv->data + key_length, value, value_length);
+
+  page->header.key_count++;
+  page->header.free_space -= pair_size;
+
+  return 0;
+}
+
+int delete_kv_pair(btree_page_t *page, int position)
+{
+  if (position < 0 || position >= page->header.key_count)
+  {
+    return -1;
+  }
+
+  kv_pair_t *kv = get_kv_pair(page, position);
+  if (!kv)
+  {
+    return -1;
+  }
+
+  size_t pair_size = sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+
+  // Calculate data to move
+  char *delete_ptr = (char *)kv;
+  char *next_ptr = delete_ptr + pair_size;
+  char *end_ptr = page->data + (PAGE_SIZE - sizeof(page_header_t) - page->header.free_space);
+  size_t move_size = end_ptr - next_ptr;
+
+  // Move data to close the gap
+  if (move_size > 0)
+  {
+    memmove(delete_ptr, next_ptr, move_size);
+  }
+
+  page->header.key_count--;
+  page->header.free_space += pair_size;
+
+  return 0;
+}
+
+transaction_t *begin_transaction(void)
+{
+  transaction_t *txn = malloc(sizeof(transaction_t));
+  if (!txn)
+  {
+    return NULL;
+  }
+
+  memset(txn, 0, sizeof(*txn));
+
+  pthread_mutex_lock(&storage_engine.txn_mutex);
+
+  txn->txn_id = storage_engine.next_txn_id++;
+  txn->state = TXN_STATE_ACTIVE;
+  txn->start_time = time(NULL);
+  txn->start_lsn = storage_engine.next_lsn;
+
+  pthread_mutex_init(&txn->lock_mutex, NULL);
+
+  // Add to active transactions list
+  txn->next = storage_engine.active_transactions;
+  storage_engine.active_transactions = txn;
+
+  pthread_mutex_unlock(&storage_engine.txn_mutex);
+
+  printf("Transaction %lu started\n", txn->txn_id);
+
+  return txn;
+}
+
+int commit_transaction(transaction_t *txn)
+{
+  if (!txn || txn->state != TXN_STATE_ACTIVE)
+  {
+    return -1;
+  }
+
+  pthread_mutex_lock(&txn->lock_mutex);
+
+  // Write commit record to WAL
+  if (storage_engine.config.enable_wal)
+  {
+    write_wal_record(txn->txn_id, WAL_COMMIT, 0, NULL, 0);
+    flush_wal_buffer();
+  }
+
+  txn->state = TXN_STATE_COMMITED;
+  txn->commit_time = time(NULL);
+  txn->commit_lsn = storage_engine.next_lsn - 1;
+
+  // Release all locks
+  lock_entry_t *lock = txn->locks;
+  while (lock)
+  {
+    lock_entry_t *next_lock = lock->next_in_txn;
+    free(lock);
+    lock = next_lock;
+  }
+  txn->locks = NULL;
+
+  pthread_mutex_unlock(&txn->lock_mutex);
+
+  atomic_fetch_add(&storage_engine.stats.transactions_committed, 1);
+
+  printf("Transaction %lu committed\n", txn->txn_id);
+
+  return 0;
+}
+
+int abort_transaction(transaction_t *txn)
+{
+  if (!txn || txn->state != TXN_STATE_ACTIVE)
+  {
+    return -1;
+  }
+
+  pthread_mutex_lock(&txn->lock_mutex);
+
+  // Apply undo operations in reverse order
+  undo_entry_t *undo = txn->undo_log;
+  while (undo)
+  {
+    // TODO: Implement undo logic here
+    // THis would restore the old values
+
+    undo_entry_t *next_undo = undo->next;
+    free(undo->key_data);
+    free(undo->old_value_data);
+    free(undo);
+    undo = next_undo;
+  }
+  txn->undo_log = NULL;
+
+  // Write abort record to WAL
+  if (storage_engine.config.enable_wal)
+  {
+    write_wal_record(txn->txn_id, WAL_ABORT, 0, NULL, 0);
+  }
+
+  txn->state = TXN_STATE_ABORTED;
+
+  // Release al llocks
+  lock_entry_t *lock = txn->locks;
+  while (lock)
+  {
+    lock_entry_t *next_lock = lock->next_in_txn;
+    free(lock);
+    lock = next_lock;
+  }
+  txn->locks = NULL;
+
+  pthread_mutex_unlock(&txn->lock_mutex);
+
+  atomic_fetch_add(&storage_engine.stats.transactions_aborted, 1);
+
+  printf("Transaction %lu aborted\n", txn->txn_id);
+
+  return 0;
+}
