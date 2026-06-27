@@ -268,6 +268,8 @@ int abort_transaction(transaction_t *txn);
 
 // High-level database operations
 int db_insert(transaction_t *txn, const char *key, size_t key_length, const char *value, size_t value_length);
-int db_search(transaction_t *txn, const char *key, size_t key_length, const char *value, size_t *value_length);
+int db_search(transaction_t *txn, const char *key, size_t key_length, char *value, size_t *value_length);
+int db_update(transaction_t *txn, const char *key, size_t key_length, const char *new_value, size_t new_value_length);
+int db_delete(transaction_t *txn, const char *key, size_t key_length);
 
 #endif

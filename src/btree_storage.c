@@ -741,7 +741,7 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
   return 0;
 }
 
-int db_search(transaction_t *txn, const char *key, size_t key_length, const char *value, size_t *value_length)
+int db_search(transaction_t *txn, const char *key, size_t key_length, char *value, size_t *value_length)
 {
   if (!txn || txn->state != TXN_STATE_ACTIVE)
   {
@@ -793,4 +793,197 @@ int db_search(transaction_t *txn, const char *key, size_t key_length, const char
 
   release_page(page_id, LOCK_SHARED);
   return -1; // Key not found
+}
+
+int db_update(transaction_t *txn, const char *key, size_t key_length, const char *new_value, size_t new_value_length)
+{
+  if (!txn || txn->state != TXN_STATE_ACTIVE)
+  {
+    return -1;
+  }
+
+  // Find the key first (similar to search)
+  uint32_t page_id = storage_engine.root_page_id;
+  btree_page_t *page = get_page(page_id, LOCK_EXCLUSIVE);
+  if (!page)
+  {
+    return -1;
+  }
+
+  // Navigate to leaf page
+  while (page->header.page_type == PAGE_TYPE_INTERNAL)
+  {
+    int pos = find_key_position(page, key, key_length);
+    kv_pair_t *kv = get_kv_pair(page, pos);
+
+    uint32_t child_page_id = kv ? kv->child_page_id : page->header.next_page_id;
+
+    release_page(page_id, LOCK_EXCLUSIVE);
+    page_id = child_page_id;
+    page = get_page(page_id, LOCK_EXCLUSIVE);
+
+    if (!page)
+    {
+      return -1;
+    }
+  }
+
+  // Find key in leaf page
+  int pos = find_key_position(page, key, key_length);
+  kv_pair_t *kv = get_kv_pair(page, pos);
+
+  if (!kv || compare_keys(key, key_length, kv->data, kv->key_length) != 0)
+  {
+    release_page(page_id, LOCK_EXCLUSIVE);
+    return -1; // Key not found
+  }
+
+  // Save old value for undo log
+  char *old_value = malloc(kv->key_length);
+  if (old_value)
+  {
+    memcpy(old_value, kv->data + kv->key_length, kv->value_length);
+
+    undo_entry_t *undo = malloc(sizeof(undo_entry_t));
+    if (undo)
+    {
+      undo->operation = WAL_UPDATE;
+      undo->page_id = page_id;
+      undo->slot_id = pos;
+      undo->key_length = key_length;
+      undo->old_value_length = kv->value_length;
+      undo->key_data = malloc(key_length);
+      undo->old_value_data = old_value;
+
+      if (undo->key_data)
+      {
+        memcpy(undo->key_data, key, key_length);
+      }
+
+      undo->next = txn->undo_log;
+      txn->undo_log = undo;
+      txn->undo_count++;
+    }
+  }
+
+  // Write WAL record
+  if (storage_engine.config.enable_wal)
+  {
+    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE * 2 + 16];
+    size_t wal_size = 0;
+
+    memcpy(wal_data + wal_size, &key_length, sizeof(key_length));
+    wal_size += sizeof(key_length);
+
+    uint16_t old_value_length = kv->value_length;
+    memcpy(wal_data + wal_size, &old_value_length, sizeof(old_value_length));
+    wal_size += sizeof(old_value_length);
+
+    memcpy(wal_data + wal_size, &new_value_length, sizeof(new_value_length));
+    wal_size += sizeof(new_value_length);
+
+    memcpy(wal_data + wal_size, key, key_length);
+    wal_size += sizeof(key_length);
+
+    memcpy(wal_data + wal_size, kv->data + kv->key_length, old_value_length);
+    wal_size += old_value_length;
+
+    memcpy(wal_data + wal_size, new_value, new_value_length);
+    wal_size += new_value_length;
+
+    write_wal_record(txn->txn_id, WAL_UPDATE, page_id, wal_data, wal_size);
+  }
+
+  // Update the alue (simplified - assumes same size)
+  if (kv->value_length == new_value_length)
+  {
+    memcpy(kv->data + kv->key_length, new_value, new_value_length);
+    mark_page_dirty(page_id);
+    txn->stats.rows_updated++;
+
+    printf("Updated key in transaction %lu\n", txn->txn_id);
+  }
+
+  release_page(page_id, LOCK_EXCLUSIVE);
+
+  return 0;
+}
+
+int db_delete(transaction_t *txn, const char *key, size_t key_length)
+{
+  if (!txn || txn->state != TXN_STATE_ACTIVE)
+  {
+    return -1;
+  }
+
+  // Find the key first (similar to search)
+  uint32_t page_id = storage_engine.root_page_id;
+  btree_page_t *page = get_page(page_id, LOCK_EXCLUSIVE);
+  if (!page)
+  {
+    return -1;
+  }
+
+  // Navigate to leaf page
+  while (page->header.page_type == PAGE_TYPE_INTERNAL)
+  {
+    int pos = find_key_position(page, key, key_length);
+    kv_pair_t *kv = get_kv_pair(page, pos);
+
+    uint32_t child_page_id = kv ? kv->child_page_id : page->header.next_page_id;
+
+    release_page(page_id, LOCK_EXCLUSIVE);
+    page_id = child_page_id;
+    page = get_page(page_id, LOCK_EXCLUSIVE);
+
+    if (!page)
+    {
+      return -1;
+    }
+  }
+
+  // Find key in leaf page
+  int pos = find_key_position(page, key, key_length);
+  kv_pair_t *kv = get_kv_pair(page, pos);
+
+  if (!kv || compare_keys(key, key_length, kv->data, kv->key_length) != 0)
+  {
+    release_page(page_id, LOCK_EXCLUSIVE);
+    return -1; // Key not found
+  }
+
+  // Write WAL record
+  if (storage_engine.config.enable_wal)
+  {
+    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE + 8];
+    size_t wal_size = 0;
+
+    memcpy(wal_data + wal_size, &key_length, sizeof(key_length));
+    wal_size += sizeof(key_length);
+
+    uint16_t old_value_length = kv->value_length;
+    memcpy(wal_data + wal_size, &old_value_length, sizeof(old_value_length));
+    wal_size += sizeof(old_value_length);
+
+    memcpy(wal_data + wal_size, key, key_length);
+    wal_size += sizeof(key_length);
+
+    memcpy(wal_data + wal_size, kv->data + kv->key_length, old_value_length);
+    wal_size += old_value_length;
+
+    write_wal_record(txn->txn_id, WAL_UPDATE, page_id, wal_data, wal_size);
+  }
+
+  // Delete the key-value pair
+  if (delete_kv_pair(page, pos) == 0)
+  {
+    mark_page_dirty(page_id);
+    txn->stats.rows_deleted++;
+
+    printf("Deleted key in transaction %lu\n", txn->txn_id);
+  }
+
+  release_page(page_id, LOCK_EXCLUSIVE);
+
+  return 0;
 }
