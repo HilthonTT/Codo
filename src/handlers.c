@@ -8,6 +8,7 @@
 #include "http_protocol.h"
 #include "http_types.h"
 #include "server.h"
+#include "stats.h"
 #include "websocket.h"
 
 int api_hello_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -75,6 +76,27 @@ int api_status_handler(connection_t *conn, http_request_t *request, http_respons
   response->status = HTTP_OK;
   strcpy(response->version, "HTTP/1.1");
   response->body = strdup(status_json);
+  response->body_length = response->body ? strlen(response->body) : 0;
+  response->keep_alive = request->keep_alive;
+
+  strcpy(response->headers[0].name, "Content-Type");
+  strcpy(response->headers[0].value, "application/json");
+  response->header_count = 1;
+
+  return send_http_response(conn, response);
+}
+
+int api_stats_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  char stats_json[512];
+  if (stats_format_json(stats_json, sizeof(stats_json)) < 0)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Stats too large");
+  }
+
+  response->status = HTTP_OK;
+  strcpy(response->version, "HTTP/1.1");
+  response->body = strdup(stats_json);
   response->body_length = response->body ? strlen(response->body) : 0;
   response->keep_alive = request->keep_alive;
 

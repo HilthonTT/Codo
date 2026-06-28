@@ -17,6 +17,7 @@
 #include "http_types.h"
 #include "route.h"
 #include "server.h"
+#include "stats.h"
 #include "worker.h"
 
 // Unlink a connection from its owning worker's list.
@@ -126,6 +127,7 @@ void *worker_thread_function(void *arg)
       if (event.events & (EPOLLERR | EPOLLHUP))
       {
         // Connection error or hangup
+        stats_record_error();
         remove_connection_from_worker(worker, conn);
         free_connection(&g_server, conn);
         continue;
@@ -253,6 +255,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     conn->read_buffer_pos += (size_t)bytes_read;
     conn->read_buffer[conn->read_buffer_pos] = '\0';
     worker->bytes_received += (uint64_t)bytes_read;
+    stats_record_bytes_received((uint64_t)bytes_read);
     conn->last_activity = time(NULL);
   }
 
@@ -372,6 +375,7 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
 
     conn->write_buffer_pos += (size_t)bytes_written;
     worker->bytes_sent += (uint64_t)bytes_written;
+    stats_record_bytes_sent((uint64_t)bytes_written);
   }
 
   // Response completely sent.

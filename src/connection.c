@@ -13,6 +13,7 @@
 #include "compression.h"
 #include "connection.h"
 #include "server.h"
+#include "stats.h"
 
 connection_t *allocate_connection(http_server_t *server)
 {
@@ -32,6 +33,7 @@ connection_t *allocate_connection(http_server_t *server)
   pthread_mutex_lock(&server->stats_mutex);
   server->active_connections++;
   pthread_mutex_unlock(&server->stats_mutex);
+  stats_record_connection_accepted();
   return conn;
 }
 
@@ -55,6 +57,7 @@ void free_connection(http_server_t *server, connection_t *conn)
     }
     pthread_mutex_unlock(&server->stats_mutex);
   }
+  stats_record_connection_closed();
   free(conn);
 }
 

@@ -82,6 +82,7 @@ int main(int argc, char *argv[])
   add_route(&g_server, "/api/hello", HTTP_GET, api_hello_handler);
   add_route(&g_server, "/api/echo", HTTP_POST, api_echo_handler);
   add_route(&g_server, "/api/status", HTTP_GET, api_status_handler);
+  add_route(&g_server, "/api/stats", HTTP_GET, api_stats_handler);
   add_route(&g_server, "/ws/chat", HTTP_GET, websocket_chat_handler);
 
   // Mount the Todo CRUD web API on top of the storage engine.

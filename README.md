@@ -14,7 +14,8 @@ It ships with a **Todo CRUD web API** backed by a built-in B-tree storage engine
 - WebSocket upgrade handshake (`Sec-WebSocket-Accept` via SHA1 + base64)
 - gzip plumbing via zlib (scaffolded)
 - B-tree storage engine (pages + buffer pool + WAL + transactions) mounted as a JSON Todo API
-- Example JSON endpoints: `/api/hello`, `/api/echo`, `/api/status`, `/ws/chat`
+- Live network statistics (atomic counters) exposed at `GET /api/stats`
+- Example JSON endpoints: `/api/hello`, `/api/echo`, `/api/status`, `/api/stats`, `/ws/chat`
 
 ## Todo API
 
@@ -77,6 +78,20 @@ scripts/delete_todo.sh 1                      # HTTP 204
 # Point the scripts at a different host/port
 BASE_URL=http://localhost:9000 scripts/list_todos.sh
 ```
+
+## Network stats
+
+`GET /api/stats` returns a snapshot of process-wide network counters (lock-free
+atomics updated on the accept / read / write / close paths):
+
+```bash
+curl localhost:8080/api/stats
+# {"bytes_sent":926,"bytes_received":513,"packets_sent":4,"packets_received":5,
+#  "connections_accepted":5,"connections_closed":4,"errors":0}
+```
+
+The counters live in `src/stats.c` (`include/stats.h`), which also carries socket
+diagnostics helpers (`diagnose_network_issue`, `debug_packet_dump`) for debugging.
 
 ## Build
 
