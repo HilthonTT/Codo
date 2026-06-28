@@ -271,5 +271,18 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
 int db_search(transaction_t *txn, const char *key, size_t key_length, char *value, size_t *value_length);
 int db_update(transaction_t *txn, const char *key, size_t key_length, const char *new_value, size_t new_value_length);
 int db_delete(transaction_t *txn, const char *key, size_t key_length);
+int perform_checkpoint(void);
+void print_storage_statistics(void);
+void print_storage_statistics(void);
+
+// Initialization and cleanup
+int init_storage_engine(const char *data_file, const char *wal_file);
+void cleanup_storage_engine(void);
+
+// Signal handlers
+void signal_handler(int sig);
+
+// Test and demonstration
+void test_storage_engine(void);
 
 #endif

@@ -5,6 +5,9 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <signal.h>
 
 #include "btree_storage.h"
 
@@ -987,3 +990,350 @@ int db_delete(transaction_t *txn, const char *key, size_t key_length)
 
   return 0;
 }
+
+int perform_checkpoint(void)
+{
+  printf("Starting checkpoint...\n");
+
+  atomic_fetch_add(&storage_engine.stats.checkpoints_performed, 1);
+
+  // Flush WAL buffer
+  flush_wal_buffer();
+
+  // Write all dirty pages to disk
+  pthread_mutex_lock(&storage_engine.buffer_mutex);
+
+  for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
+  {
+    buffer_entry_t *entry = &storage_engine.buffer_pool[i];
+
+    if (entry->dirty && entry->page)
+    {
+      off_t offset = entry->page_id * PAGE_SIZE;
+      if (pwrite(storage_engine.data_fd, entry->page, PAGE_SIZE, offset) == PAGE_SIZE)
+      {
+        entry->dirty = false;
+        atomic_fetch_add(&storage_engine.stats.pages_written, 1);
+      }
+    }
+  }
+
+  pthread_mutex_unlock(&storage_engine.buffer_mutex);
+
+  // Sync data file
+  fsync(storage_engine.data_fd);
+
+  // Write checkpoint record
+  write_wal_record(0, WAL_CHECKOUT, 0, NULL, 0);
+  flush_wal_buffer();
+
+  storage_engine.last_checkpoint_lsn = storage_engine.next_lsn - 1;
+
+  printf("Checkpoint completed (LSN: %lu)\n", storage_engine.last_checkpoint_lsn);
+
+  return 0;
+}
+
+void print_storage_statistics(void)
+{
+  printf("\n=== Storage Engine Statistics ===\n");
+
+  printf("Buffer Pool:\n");
+  printf("  Pages read: %lu\n", atomic_load(&storage_engine.stats.pages_read));
+  printf("  Pages written: %lu\n", atomic_load(&storage_engine.stats.pages_written));
+  printf("  Cache hits: %lu\n", atomic_load(&storage_engine.stats.cache_hits));
+  printf("  Cache misses: %lu\n", atomic_load(&storage_engine.stats.cache_misses));
+
+  uint64_t total_accesses = atomic_load(&storage_engine.stats.cache_hits) +
+                            atomic_load(&storage_engine.stats.cache_misses);
+  if (total_accesses > 0)
+  {
+    double hit_ratio = (double)atomic_load(&storage_engine.stats.cache_hits) / total_accesses;
+    printf("  Cache hit ratio: %.2f%%\n", hit_ratio * 100.0);
+  }
+
+  printf("\nTransactions:\n");
+  printf("  Committed: %lu\n", atomic_load(&storage_engine.stats.transactions_committed));
+  printf("  Aborted: %lu\n", atomic_load(&storage_engine.stats.transactions_aborted));
+
+  printf("\nWAL:\n");
+  printf("  Records written: %lu\n", atomic_load(&storage_engine.stats.wal_records_written));
+  printf("  Checkpoints: %lu\n", atomic_load(&storage_engine.stats.checkpoints_performed));
+  printf("  Next LSN: %lu\n", storage_engine.next_lsn);
+  printf("  Last checkpoint LSN: %lu\n", storage_engine.last_checkpoint_lsn);
+
+  printf("\nActive Transactions:\n");
+  pthread_mutex_lock(&storage_engine.txn_mutex);
+  transaction_t *txn = storage_engine.active_transactions;
+  int count = 0;
+  while (txn)
+  {
+    printf("  TXN %lu: inserts=%lu, updates=%lu, deletes=%lu\n",
+           txn->txn_id, txn->stats.rows_inserted,
+           txn->stats.rows_updated, txn->stats.rows_deleted);
+    txn = txn->next;
+    count++;
+  }
+  printf("  Total active: %d\n", count);
+  pthread_mutex_unlock(&storage_engine.txn_mutex);
+
+  printf("=================================\n");
+}
+
+int init_storage_engine(const char *data_file, const char *wal_file)
+{
+  memset(&storage_engine, 0, sizeof(storage_engine));
+
+  // Configuration
+  storage_engine.config.enable_checksums = true;
+  storage_engine.config.enable_wal = true;
+  storage_engine.config.checkpoint_interval = 10000;
+  storage_engine.config.wal_segment_size = 64 * 1024 * 1024;
+  storage_engine.config.buffer_pool_hit_ratio_target = 0.95;
+
+  // Open data file
+  storage_engine.data_fd = open(data_file, O_RDWR | O_CREAT, 0644);
+  if (storage_engine.data_fd < 0)
+  {
+    perror("open data file");
+    return -1;
+  }
+
+  storage_engine.data_filename = strdup(data_file);
+
+  // Open WAL file
+  storage_engine.wal_fd = open(wal_file, O_RDWR | O_CREAT | O_APPEND, 0644);
+  if (storage_engine.wal_fd < 0)
+  {
+    perror("open WAL file");
+    close(storage_engine.data_fd);
+    return -1;
+  }
+
+  storage_engine.wal_filename = strdup(wal_file);
+
+  // Initialize WAL buffer
+  storage_engine.wal_buffer = malloc(WAL_BUFFER_SIZE);
+  if (!storage_engine.wal_buffer)
+  {
+    close(storage_engine.data_fd);
+    close(storage_engine.wal_fd);
+    return -1;
+  }
+
+  // initialize hash table for buffer pool
+
+  storage_engine.hash_table_size = BUFFER_POOL_SIZE * 2;
+  storage_engine.hash_table = malloc(storage_engine.hash_table_size * sizeof(uint32_t));
+  if (!storage_engine.hash_table)
+  {
+    return -1;
+  }
+
+  for (size_t i = 0; i < storage_engine.hash_table_size; i++)
+  {
+    storage_engine.hash_table[i] = UINT32_MAX;
+  }
+
+  // Initialize buffer pool
+  for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
+  {
+    buffer_entry_t *entry = &storage_engine.buffer_pool[i];
+    pthread_rwlock_init(&entry->page_lock, NULL);
+    entry->hash_next = UINT32_MAX;
+  }
+
+  // Initialize lock table
+  storage_engine.lock_table_size = 10007; // Prime number
+  storage_engine.lock_table = calloc(storage_engine.lock_table_size, sizeof(lock_entry_t *));
+
+  // Initialize mutexes
+  pthread_mutex_init(&storage_engine.buffer_mutex, NULL);
+  pthread_mutex_init(&storage_engine.free_page_mutex, NULL);
+  pthread_mutex_init(&storage_engine.txn_mutex, NULL);
+  pthread_mutex_init(&storage_engine.lock_table_mutex, NULL);
+  pthread_mutex_init(&storage_engine.wal_mutex, NULL);
+
+  // Initialize counters
+  storage_engine.next_txn_id = 1;
+  storage_engine.next_lsn = 1;
+  storage_engine.next_page_id = 1;
+  storage_engine.root_page_id = 1;
+
+  // Initialize root page if file is empty
+  struct stat st;
+  if (fstat(storage_engine.data_fd, &st) == 0 && st.st_size == 0)
+  {
+    btree_page_t *root_page = get_page(storage_engine.root_page_id, LOCK_EXCLUSIVE);
+    if (root_page)
+    {
+      root_page->header.page_type = PAGE_TYPE_LEAF;
+      mark_page_dirty(storage_engine.root_page_id);
+      release_page(storage_engine.root_page_id, LOCK_EXCLUSIVE);
+    }
+  }
+
+  printf("Storage engine initialized\n");
+  printf("Data file: %s\n", data_file);
+  printf("WAL file: %s\n", wal_file);
+
+  return 0;
+}
+
+void cleanup_storage_engine(void)
+{
+  // Perform final checkpoint
+  perform_checkpoint();
+
+  // Close files
+  if (storage_engine.data_fd >= 0)
+  {
+    close(storage_engine.data_fd);
+  }
+
+  if (storage_engine.wal_fd >= 0)
+  {
+    close(storage_engine.wal_fd);
+  }
+
+  // Free memory
+  free(storage_engine.data_filename);
+  free(storage_engine.wal_filename);
+  free(storage_engine.wal_buffer);
+  free(storage_engine.hash_table);
+  free(storage_engine.free_pages);
+  free(storage_engine.lock_table);
+
+  // Cleanup buffer pool
+  for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
+  {
+    buffer_entry_t *entry = &storage_engine.buffer_pool[i];
+    if (entry->page)
+    {
+      free(entry->page);
+    }
+    pthread_rwlock_destroy(&entry->page_lock);
+  }
+
+  for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
+  {
+    buffer_entry_t *entry = &storage_engine.buffer_pool[i];
+    if (entry->page)
+    {
+      free(entry->page);
+    }
+    pthread_rwlock_destroy(&entry->page_lock);
+  }
+}
+
+void signal_handler(int sig)
+{
+  if (sig == SIGINT || sig == SIGTERM)
+  {
+    printf("\nReceived signal %d, shutting down storage engine...\n", sig);
+    cleanup_storage_engine();
+    exit(0);
+  }
+  else if (sig == SIGUSR1)
+  {
+    print_storage_statistics();
+  }
+  else if (sig == SIGUSR2)
+  {
+    perform_checkpoint();
+  }
+}
+
+// Test and demonstration
+void test_storage_engine(void)
+{
+  printf("Testing storage engine...\n");
+
+  // Create some test transactions
+  transaction_t *txn1 = begin_transaction();
+  transaction_t *txn2 = begin_transaction();
+
+  if (txn1 && txn2)
+  {
+    // Test insertions
+    db_insert(txn1, "key1", 4, "value1", 6);
+    db_insert(txn1, "key2", 4, "value2", 6);
+    db_insert(txn2, "key3", 4, "value3", 6);
+
+    // Test searches
+    char value[MAX_VALUE_SIZE];
+    size_t value_length = sizeof(value);
+
+    if (db_search(txn1, "key1", 4, value, &value_length) == 0)
+    {
+      printf("Found key1: %.*s\n", (int)value_length, value);
+    }
+
+    // Test updates
+    db_update(txn1, "key1", 4, "updated_value1", 14);
+
+    // Test deletion
+    db_delete(txn2, "key3", 4);
+
+    // Commit transactions
+    commit_transaction(txn1);
+    commit_transaction(txn2);
+
+    free(txn1);
+    free(txn2);
+  }
+
+  // Perform checkpoint
+  perform_checkpoint();
+
+  printf("Storage engine test completed\n");
+}
+
+// Main function
+// int main(int argc, char* argv[])
+// {
+//     const char* data_file = "database.db";
+//     const char* wal_file = "database.wal";
+
+//     if (argc > 1) {
+//         data_file = argv[1];
+//     }
+
+//     if (argc > 2) {
+//         wal_file = argv[2];
+//     }
+
+//     // Set up signal handlers
+//     signal(SIGINT, signal_handler);
+//     signal(SIGTERM, signal_handler);
+//     signal(SIGUSR1, signal_handler);
+//     signal(SIGUSR2, signal_handler);
+
+//     printf("Advanced Database Storage Engine\n");
+
+//     // Initialize storage engine
+//     if (init_storage_engine(data_file, wal_file) != 0) {
+//         fprintf(stderr, "Failed to initialize storage engine\n");
+//         return 1;
+//     }
+
+//     // Run tests
+//     test_storage_engine();
+
+//     printf("Storage engine running...\n");
+//     printf("Send SIGUSR1 for statistics, SIGUSR2 for checkpoint, SIGINT to exit\n");
+
+//     // Main loop
+//     while (1) {
+//         sleep(5);
+
+//         // Automatic checkpoint if needed
+//         if (storage_engine.next_lsn - storage_engine.last_checkpoint_lsn >
+//             storage_engine.config.checkpoint_interval) {
+//             perform_checkpoint();
+//         }
+//     }
+
+//     cleanup_storage_engine();
+//     return 0;
+// }
