@@ -37,13 +37,41 @@ route_t *find_route(http_server_t *server, const char *uri, http_method_t method
   {
     return NULL;
   }
+
+  // First pass: prefer an exact pattern match.
   for (route_t *r = server->routes; r; r = r->next)
   {
-    if (r->method == method && strcmp(r->pattern, uri) == 0)
+    if (r->method != method)
+    {
+      continue;
+    }
+    size_t plen = strlen(r->pattern);
+    if (plen > 0 && r->pattern[plen - 1] == '*')
+    {
+      continue; // wildcard routes are handled in the second pass
+    }
+    if (strcmp(r->pattern, uri) == 0)
     {
       return r;
     }
   }
+
+  // Second pass: trailing '*' patterns match by prefix, e.g. "/api/todos/*"
+  // matches "/api/todos/42".
+  for (route_t *r = server->routes; r; r = r->next)
+  {
+    if (r->method != method)
+    {
+      continue;
+    }
+    size_t plen = strlen(r->pattern);
+    if (plen > 0 && r->pattern[plen - 1] == '*' &&
+        strncmp(r->pattern, uri, plen - 1) == 0)
+    {
+      return r;
+    }
+  }
+
   return NULL;
 }
 

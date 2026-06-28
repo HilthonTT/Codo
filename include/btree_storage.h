@@ -271,6 +271,14 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
 int db_search(transaction_t *txn, const char *key, size_t key_length, char *value, size_t *value_length);
 int db_update(transaction_t *txn, const char *key, size_t key_length, const char *new_value, size_t new_value_length);
 int db_delete(transaction_t *txn, const char *key, size_t key_length);
+
+// Iterate every key-value pair in key order. The callback returns non-zero to
+// stop iteration early. Returns 0 on success, -1 on error.
+typedef int (*db_scan_callback_t)(const char *key, size_t key_length,
+                                  const char *value, size_t value_length,
+                                  void *ctx);
+int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx);
+
 int perform_checkpoint(void);
 void print_storage_statistics(void);
 void print_storage_statistics(void);

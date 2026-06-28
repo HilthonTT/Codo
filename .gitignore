@@ -56,3 +56,7 @@ dkms.conf
 
 bin/*
 CLAUDE.md
+
+# Storage engine data / write-ahead log files
+*.db
+*.wal

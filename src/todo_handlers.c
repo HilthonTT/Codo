@@ -1,0 +1,622 @@
+#define _GNU_SOURCE
+
+#include <stdatomic.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "btree_storage.h"
+#include "http_protocol.h"
+#include "http_types.h"
+#include "route.h"
+#include "server.h"
+#include "todo_handlers.h"
+
+// Todos are stored in the btree keyed by their decimal id (e.g. "42"); the
+// value is the canonical JSON object {"id":..,"title":..,"completed":..}.
+// Ids are handed out from a process-wide counter that is seeded at startup
+// from the highest id already on disk.
+static _Atomic uint64_t g_next_todo_id = 1;
+
+static const char TODO_COLLECTION[] = "/api/todos";
+static const char TODO_ITEM_PREFIX[] = "/api/todos/";
+
+// ---------------------------------------------------------------------------
+// JSON helpers (deliberately minimal -- enough for the flat todo object)
+// ---------------------------------------------------------------------------
+
+// Escape src into dst as a JSON string body (without surrounding quotes).
+// Returns the written length, or -1 if dst is too small.
+static int json_escape(char *dst, size_t dst_size, const char *src, size_t src_len)
+{
+  size_t out = 0;
+  for (size_t i = 0; i < src_len; i++)
+  {
+    unsigned char c = (unsigned char)src[i];
+    char unicode[8];
+    const char *rep = NULL;
+
+    switch (c)
+    {
+    case '"':
+      rep = "\\\"";
+      break;
+    case '\\':
+      rep = "\\\\";
+      break;
+    case '\n':
+      rep = "\\n";
+      break;
+    case '\r':
+      rep = "\\r";
+      break;
+    case '\t':
+      rep = "\\t";
+      break;
+    default:
+      if (c < 0x20)
+      {
+        snprintf(unicode, sizeof(unicode), "\\u%04x", c);
+        rep = unicode;
+      }
+      break;
+    }
+
+    if (rep)
+    {
+      size_t len = strlen(rep);
+      if (out + len >= dst_size)
+      {
+        return -1;
+      }
+      memcpy(dst + out, rep, len);
+      out += len;
+    }
+    else
+    {
+      if (out + 1 >= dst_size)
+      {
+        return -1;
+      }
+      dst[out++] = (char)c;
+    }
+  }
+
+  if (out >= dst_size)
+  {
+    return -1;
+  }
+  dst[out] = '\0';
+  return (int)out;
+}
+
+// Render a complete todo object into dst. Returns length or -1 on overflow.
+static int build_todo_json(char *dst, size_t dst_size, uint64_t id,
+                           const char *title, size_t title_len, bool completed)
+{
+  char escaped[MAX_VALUE_SIZE];
+  if (json_escape(escaped, sizeof(escaped), title, title_len) < 0)
+  {
+    return -1;
+  }
+
+  int n = snprintf(dst, dst_size,
+                   "{\"id\":%llu,\"title\":\"%s\",\"completed\":%s}",
+                   (unsigned long long)id, escaped, completed ? "true" : "false");
+  if (n < 0 || (size_t)n >= dst_size)
+  {
+    return -1;
+  }
+  return n;
+}
+
+static const char *skip_ws(const char *p, const char *end)
+{
+  while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+  {
+    p++;
+  }
+  return p;
+}
+
+// Locate the value that follows "field": in a JSON object body. Returns a
+// pointer to the first non-whitespace value character, or NULL if not found.
+static const char *find_field(const char *body, size_t len, const char *field)
+{
+  char needle[64];
+  int n = snprintf(needle, sizeof(needle), "\"%s\"", field);
+  if (n < 0 || (size_t)n >= sizeof(needle))
+  {
+    return NULL;
+  }
+
+  size_t nlen = (size_t)n;
+  const char *end = body + len;
+  for (const char *p = body; p + nlen <= end; p++)
+  {
+    if (memcmp(p, needle, nlen) == 0)
+    {
+      const char *colon = skip_ws(p + nlen, end);
+      if (colon < end && *colon == ':')
+      {
+        return skip_ws(colon + 1, end);
+      }
+    }
+  }
+  return NULL;
+}
+
+// Extract a string field, unescaping the common JSON escapes. Returns false if
+// the field is missing, not a string, or does not fit in out.
+static bool parse_json_string(const char *body, size_t len, const char *field,
+                              char *out, size_t out_size)
+{
+  const char *p = find_field(body, len, field);
+  const char *end = body + len;
+  if (!p || p >= end || *p != '"')
+  {
+    return false;
+  }
+  p++;
+
+  size_t out_len = 0;
+  while (p < end && *p != '"')
+  {
+    char c = *p;
+    if (c == '\\' && p + 1 < end)
+    {
+      p++;
+      switch (*p)
+      {
+      case 'n':
+        c = '\n';
+        break;
+      case 'r':
+        c = '\r';
+        break;
+      case 't':
+        c = '\t';
+        break;
+      case 'b':
+        c = '\b';
+        break;
+      case 'f':
+        c = '\f';
+        break;
+      case '/':
+        c = '/';
+        break;
+      case '"':
+        c = '"';
+        break;
+      case '\\':
+        c = '\\';
+        break;
+      case 'u':
+        // Non-ASCII escapes are collapsed to '?'; skip the 4 hex digits.
+        if (p + 4 < end)
+        {
+          p += 4;
+        }
+        c = '?';
+        break;
+      default:
+        c = *p;
+        break;
+      }
+    }
+
+    if (out_len + 1 >= out_size)
+    {
+      return false; // value too long
+    }
+    out[out_len++] = c;
+    p++;
+  }
+
+  if (p >= end || *p != '"')
+  {
+    return false; // unterminated string
+  }
+  out[out_len] = '\0';
+  return true;
+}
+
+// Extract a boolean field. Returns false if absent; *out is set on success.
+static bool parse_json_bool(const char *body, size_t len, const char *field, bool *out)
+{
+  const char *p = find_field(body, len, field);
+  const char *end = body + len;
+  if (!p)
+  {
+    return false;
+  }
+  if (p + 4 <= end && memcmp(p, "true", 4) == 0)
+  {
+    *out = true;
+    return true;
+  }
+  if (p + 5 <= end && memcmp(p, "false", 5) == 0)
+  {
+    *out = false;
+    return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// Request helpers
+// ---------------------------------------------------------------------------
+
+// Pull a numeric id out of "/api/todos/{id}". Returns false for missing,
+// empty, or non-numeric ids.
+static bool extract_id(const char *uri, char *out, size_t out_size)
+{
+  size_t prefix_len = strlen(TODO_ITEM_PREFIX);
+  if (strncmp(uri, TODO_ITEM_PREFIX, prefix_len) != 0)
+  {
+    return false;
+  }
+
+  const char *id = uri + prefix_len;
+  size_t out_len = 0;
+  while (id[out_len] && id[out_len] != '/' && id[out_len] != '?')
+  {
+    char c = id[out_len];
+    if (c < '0' || c > '9')
+    {
+      return false; // ids are decimal only
+    }
+    if (out_len + 1 >= out_size)
+    {
+      return false;
+    }
+    out[out_len] = c;
+    out_len++;
+  }
+
+  if (out_len == 0)
+  {
+    return false;
+  }
+  out[out_len] = '\0';
+  return true;
+}
+
+static int send_json(connection_t *conn, http_request_t *request,
+                     http_response_t *response, http_status_t status,
+                     const char *json)
+{
+  response->status = status;
+  strcpy(response->version, "HTTP/1.1");
+
+  if (response->body)
+  {
+    free(response->body);
+    response->body = NULL;
+  }
+  response->body = strdup(json ? json : "");
+  if (!response->body)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
+  }
+  response->body_length = strlen(response->body);
+  response->keep_alive = request->keep_alive;
+
+  strcpy(response->headers[0].name, "Content-Type");
+  strcpy(response->headers[0].value, "application/json");
+  response->header_count = 1;
+
+  return send_http_response(conn, response);
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+typedef struct
+{
+  char *buf;
+  size_t len;
+  size_t cap;
+  int count;
+  bool error;
+} list_ctx_t;
+
+static int list_append(list_ctx_t *ctx, const char *data, size_t n)
+{
+  if (ctx->len + n + 1 > ctx->cap)
+  {
+    size_t new_cap = ctx->cap ? ctx->cap * 2 : 4096;
+    while (new_cap < ctx->len + n + 1)
+    {
+      new_cap *= 2;
+    }
+    char *grown = realloc(ctx->buf, new_cap);
+    if (!grown)
+    {
+      ctx->error = true;
+      return -1;
+    }
+    ctx->buf = grown;
+    ctx->cap = new_cap;
+  }
+  memcpy(ctx->buf + ctx->len, data, n);
+  ctx->len += n;
+  ctx->buf[ctx->len] = '\0';
+  return 0;
+}
+
+static int list_scan_cb(const char *key, size_t key_length,
+                        const char *value, size_t value_length, void *ctx)
+{
+  (void)key;
+  (void)key_length;
+  list_ctx_t *list = (list_ctx_t *)ctx;
+
+  if (list->count > 0 && list_append(list, ",", 1) != 0)
+  {
+    return 1; // stop on allocation failure
+  }
+  if (list_append(list, value, value_length) != 0)
+  {
+    return 1;
+  }
+  list->count++;
+  return 0;
+}
+
+int todo_list_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  list_ctx_t list = {0};
+  if (list_append(&list, "[", 1) != 0)
+  {
+    free(list.buf);
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
+  }
+
+  transaction_t *txn = begin_transaction();
+  if (!txn)
+  {
+    free(list.buf);
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
+  }
+
+  db_scan(txn, list_scan_cb, &list);
+  commit_transaction(txn);
+  free(txn);
+
+  if (list.error || list_append(&list, "]", 1) != 0)
+  {
+    free(list.buf);
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
+  }
+
+  int rc = send_json(conn, request, response, HTTP_OK, list.buf);
+  free(list.buf);
+  return rc;
+}
+
+int todo_create_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  if (!request->body || request->body_length == 0)
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Request body required");
+  }
+
+  char title[MAX_VALUE_SIZE];
+  if (!parse_json_string(request->body, request->body_length, "title", title, sizeof(title)))
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Missing or invalid 'title'");
+  }
+
+  bool completed = false;
+  parse_json_bool(request->body, request->body_length, "completed", &completed);
+
+  uint64_t id = atomic_fetch_add(&g_next_todo_id, 1);
+
+  char key[32];
+  int key_len = snprintf(key, sizeof(key), "%llu", (unsigned long long)id);
+
+  char value[MAX_VALUE_SIZE];
+  int value_len = build_todo_json(value, sizeof(value), id, title, strlen(title), completed);
+  if (value_len < 0)
+  {
+    return send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Todo too large");
+  }
+
+  transaction_t *txn = begin_transaction();
+  if (!txn)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
+  }
+
+  int rc = db_insert(txn, key, (size_t)key_len, value, (size_t)value_len);
+  commit_transaction(txn);
+  free(txn);
+
+  if (rc != 0)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Insert failed");
+  }
+
+  return send_json(conn, request, response, HTTP_CREATED, value);
+}
+
+int todo_get_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  char key[32];
+  if (!extract_id(request->uri, key, sizeof(key)))
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
+  }
+
+  char value[MAX_VALUE_SIZE + 1];
+  size_t value_len = MAX_VALUE_SIZE;
+
+  transaction_t *txn = begin_transaction();
+  if (!txn)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
+  }
+
+  int rc = db_search(txn, key, strlen(key), value, &value_len);
+  commit_transaction(txn);
+  free(txn);
+
+  if (rc != 0)
+  {
+    return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
+
+  if (value_len > MAX_VALUE_SIZE)
+  {
+    value_len = MAX_VALUE_SIZE;
+  }
+  value[value_len] = '\0';
+
+  return send_json(conn, request, response, HTTP_OK, value);
+}
+
+int todo_update_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  char key[32];
+  if (!extract_id(request->uri, key, sizeof(key)))
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
+  }
+
+  if (!request->body || request->body_length == 0)
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Request body required");
+  }
+
+  char title[MAX_VALUE_SIZE];
+  if (!parse_json_string(request->body, request->body_length, "title", title, sizeof(title)))
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Missing or invalid 'title'");
+  }
+
+  bool completed = false;
+  parse_json_bool(request->body, request->body_length, "completed", &completed);
+
+  size_t key_len = strlen(key);
+  uint64_t id = strtoull(key, NULL, 10);
+
+  char value[MAX_VALUE_SIZE];
+  int value_len = build_todo_json(value, sizeof(value), id, title, strlen(title), completed);
+  if (value_len < 0)
+  {
+    return send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Todo too large");
+  }
+
+  transaction_t *txn = begin_transaction();
+  if (!txn)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
+  }
+
+  // db_update only handles same-length values, so replace via delete+insert.
+  char existing[MAX_VALUE_SIZE + 1];
+  size_t existing_len = MAX_VALUE_SIZE;
+  if (db_search(txn, key, key_len, existing, &existing_len) != 0)
+  {
+    commit_transaction(txn);
+    free(txn);
+    return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
+
+  db_delete(txn, key, key_len);
+  int rc = db_insert(txn, key, key_len, value, (size_t)value_len);
+  commit_transaction(txn);
+  free(txn);
+
+  if (rc != 0)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Update failed");
+  }
+
+  return send_json(conn, request, response, HTTP_OK, value);
+}
+
+int todo_delete_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  char key[32];
+  if (!extract_id(request->uri, key, sizeof(key)))
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
+  }
+
+  size_t key_len = strlen(key);
+
+  transaction_t *txn = begin_transaction();
+  if (!txn)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
+  }
+
+  char existing[MAX_VALUE_SIZE + 1];
+  size_t existing_len = MAX_VALUE_SIZE;
+  if (db_search(txn, key, key_len, existing, &existing_len) != 0)
+  {
+    commit_transaction(txn);
+    free(txn);
+    return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
+
+  db_delete(txn, key, key_len);
+  commit_transaction(txn);
+  free(txn);
+
+  return send_json(conn, request, response, HTTP_NO_CONTENT, "");
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+static int seed_id_scan_cb(const char *key, size_t key_length,
+                           const char *value, size_t value_length, void *ctx)
+{
+  (void)value;
+  (void)value_length;
+  uint64_t *max_id = (uint64_t *)ctx;
+
+  char buf[32];
+  size_t n = key_length < sizeof(buf) - 1 ? key_length : sizeof(buf) - 1;
+  memcpy(buf, key, n);
+  buf[n] = '\0';
+
+  uint64_t id = strtoull(buf, NULL, 10);
+  if (id > *max_id)
+  {
+    *max_id = id;
+  }
+  return 0;
+}
+
+void todo_api_init(void)
+{
+  uint64_t max_id = 0;
+
+  transaction_t *txn = begin_transaction();
+  if (txn)
+  {
+    db_scan(txn, seed_id_scan_cb, &max_id);
+    commit_transaction(txn);
+    free(txn);
+  }
+
+  atomic_store(&g_next_todo_id, max_id + 1);
+}
+
+void todo_api_register_routes(http_server_t *server)
+{
+  add_route(server, TODO_COLLECTION, HTTP_GET, todo_list_handler);
+  add_route(server, TODO_COLLECTION, HTTP_POST, todo_create_handler);
+  add_route(server, "/api/todos/*", HTTP_GET, todo_get_handler);
+  add_route(server, "/api/todos/*", HTTP_PUT, todo_update_handler);
+  add_route(server, "/api/todos/*", HTTP_DELETE, todo_delete_handler);
+}

@@ -73,8 +73,8 @@ int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, 
     fsync(storage_engine.wal_fd);
   }
 
-  // Create WAL record
-  wal_record_t *record = (wal_record_t *)(storage_engine.buffer_pool + storage_engine.wal_buffer_pos);
+  // Create WAL record in the WAL buffer (not the page buffer pool).
+  wal_record_t *record = (wal_record_t *)(storage_engine.wal_buffer + storage_engine.wal_buffer_pos);
   record->lsn = allocate_lsn();
   record->txn_id = txn_id;
   record->type = type;
@@ -489,8 +489,10 @@ int insert_kv_pair(
     insert_ptr += sizeof(kv_pair_t) + kv->key_length + kv->value_length;
   }
 
-  // Calculate space neede to move existing data
-  char *end_ptr = page->data + (PAGE_SIZE - sizeof(page_header_t)) + page->header.free_space;
+  // Calculate space needed to move existing data. end_ptr is the end of the
+  // currently-used region (capacity minus free space), so we shift only the
+  // pairs that sit after the insertion point.
+  char *end_ptr = page->data + (PAGE_SIZE - sizeof(page_header_t) - page->header.free_space);
   size_t move_size = end_ptr - insert_ptr;
 
   // Move existing data to make room
@@ -991,6 +993,72 @@ int db_delete(transaction_t *txn, const char *key, size_t key_length)
   return 0;
 }
 
+int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx)
+{
+  if (!txn || txn->state != TXN_STATE_ACTIVE || !callback)
+  {
+    return -1;
+  }
+
+  uint32_t page_id = storage_engine.root_page_id;
+  btree_page_t *page = get_page(page_id, LOCK_SHARED);
+  if (!page)
+  {
+    return -1;
+  }
+
+  // Descend to the leftmost leaf following the first child pointer.
+  while (page->header.page_type == PAGE_TYPE_INTERNAL)
+  {
+    kv_pair_t *kv = get_kv_pair(page, 0);
+    uint32_t child_page_id = kv ? kv->child_page_id : page->header.next_page_id;
+
+    release_page(page_id, LOCK_SHARED);
+    page_id = child_page_id;
+    page = get_page(page_id, LOCK_SHARED);
+
+    if (!page)
+    {
+      return -1;
+    }
+  }
+
+  // Walk the linked list of leaf pages, visiting every key-value pair.
+  while (page)
+  {
+    for (int i = 0; i < (int)page->header.key_count; i++)
+    {
+      kv_pair_t *kv = get_kv_pair(page, i);
+      if (!kv)
+      {
+        break;
+      }
+
+      const char *key = kv->data;
+      const char *value = kv->data + kv->key_length;
+
+      if (callback(key, kv->key_length, value, kv->value_length, ctx) != 0)
+      {
+        release_page(page_id, LOCK_SHARED);
+        return 0; // Caller requested early stop
+      }
+    }
+
+    uint32_t next_page_id = page->header.next_page_id;
+    release_page(page_id, LOCK_SHARED);
+
+    if (next_page_id == 0)
+    {
+      break;
+    }
+
+    page_id = next_page_id;
+    page = get_page(page_id, LOCK_SHARED);
+  }
+
+  return 0;
+}
+
 int perform_checkpoint(void)
 {
   printf("Starting checkpoint...\n");
@@ -1205,16 +1273,6 @@ void cleanup_storage_engine(void)
   free(storage_engine.lock_table);
 
   // Cleanup buffer pool
-  for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
-  {
-    buffer_entry_t *entry = &storage_engine.buffer_pool[i];
-    if (entry->page)
-    {
-      free(entry->page);
-    }
-    pthread_rwlock_destroy(&entry->page_lock);
-  }
-
   for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
   {
     buffer_entry_t *entry = &storage_engine.buffer_pool[i];

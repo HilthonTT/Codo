@@ -2,15 +2,64 @@
 
 Codo is a from-scratch multi-threaded HTTP/1.1 server written in C11, built directly on top of POSIX sockets and `epoll`. It uses an acceptor + worker-pool model: the main thread accepts connections and round-robins them to a fixed pool of worker threads, each running its own private `epoll` loop over a linked list of connections.
 
+It ships with a **Todo CRUD web API** backed by a built-in B-tree storage engine (buffer pool, write-ahead log, transactions, checkpointing), so todos persist across restarts.
+
 ## Features
 
 - HTTP/1.1 with keep-alive
 - Edge-triggered `epoll` per worker
 - Route table with per-method handlers + default static-file handler
+- Trailing-`*` wildcard routes (e.g. `/api/todos/*`) in addition to exact matches
 - Optional TLS via OpenSSL (auto-enabled when `server.crt` / `server.key` exist)
 - WebSocket upgrade handshake (`Sec-WebSocket-Accept` via SHA1 + base64)
 - gzip plumbing via zlib (scaffolded)
+- B-tree storage engine (pages + buffer pool + WAL + transactions) mounted as a JSON Todo API
 - Example JSON endpoints: `/api/hello`, `/api/echo`, `/api/status`, `/ws/chat`
+
+## Todo API
+
+A todo is a JSON object: `{"id": <number>, "title": <string>, "completed": <bool>}`.
+On `POST`/`PUT`, the body must supply `title` (required) and may supply `completed`
+(defaults to `false`); `id` is assigned by the server. Ids are numeric and are
+seeded from the highest id already on disk at startup.
+
+| Method   | Path              | Description                       | Success      |
+| -------- | ----------------- | --------------------------------- | ------------ |
+| `GET`    | `/api/todos`      | List all todos (JSON array)       | `200`        |
+| `POST`   | `/api/todos`      | Create a todo from the JSON body  | `201`        |
+| `GET`    | `/api/todos/{id}` | Fetch a single todo               | `200`        |
+| `PUT`    | `/api/todos/{id}` | Replace a todo                    | `200`        |
+| `DELETE` | `/api/todos/{id}` | Delete a todo                     | `204`        |
+
+Error responses: `400` (missing/invalid `title` or non-numeric id), `404` (no such todo).
+
+```bash
+# Create
+curl -X POST localhost:8080/api/todos -d '{"title":"buy milk","completed":false}'
+# -> 201 {"id":1,"title":"buy milk","completed":false}
+
+# List / fetch / update / delete
+curl localhost:8080/api/todos
+curl localhost:8080/api/todos/1
+curl -X PUT localhost:8080/api/todos/1 -d '{"title":"buy oat milk","completed":true}'
+curl -X DELETE localhost:8080/api/todos/1
+```
+
+### Helper scripts
+
+The `scripts/` folder wraps each operation in a small `curl` script that targets
+`localhost:8080` (override with the `BASE_URL` env var):
+
+```bash
+scripts/create_todo.sh "buy milk"            # POST   /api/todos
+scripts/create_todo.sh "walk the dog" true   #   title + completed
+scripts/list_todos.sh                        # GET    /api/todos
+scripts/get_todo.sh 1                         # GET    /api/todos/1
+scripts/update_todo.sh 1 "buy oat milk" true # PUT    /api/todos/1
+scripts/delete_todo.sh 1                      # DELETE /api/todos/1
+
+BASE_URL=http://localhost:9000 scripts/list_todos.sh   # point at another host
+```
 
 ## Build
 
@@ -32,16 +81,33 @@ Output binary: `bin/codo`. Link deps: `-lssl -lcrypto -lz -lpthread`.
 
 Defaults: port `8080`, document root `/var/www/html`. If `server.crt` and `server.key` are present in the working directory, TLS is enabled automatically.
 
+Configuration is read from a `.env` file (override the path with `ENV_FILE`), then overridden by CLI args. Relevant keys:
+
+| Key             | Default          | Purpose                              |
+| --------------- | ---------------- | ------------------------------------ |
+| `PORT`          | `8080`           | Listen port                          |
+| `DOCUMENT_ROOT` | `/var/www/html`  | Static file root                     |
+| `SSL_ENABLED`   | `true`           | Enable TLS when cert/key exist       |
+| `DB_FILE`       | `codo.db`        | B-tree data file (Todo storage)      |
+| `WAL_FILE`      | `codo.wal`       | Write-ahead log file                 |
+
+The storage engine runs a final checkpoint on shutdown (`SIGINT`/`SIGTERM`), so todos written in one run are visible on the next.
+
 ## Layout
 
 ```
 include/    public headers (one per subsystem)
 src/        implementation (main, server, worker, connection, http_protocol,
-            route, ssl, websocket, compression, mime, util, handlers)
+            route, ssl, websocket, compression, mime, util, handlers,
+            btree_storage, todo_handlers)
 build/      .o + .d files (auto-generated header deps via -MMD -MP)
 bin/        output binary
 tests/      reserved (no test harness yet)
 ```
+
+The Todo API lives in `src/todo_handlers.c` (HTTP/JSON layer) on top of
+`src/btree_storage.c` (the storage engine). `main.c` initializes the engine,
+seeds the id counter, and registers the routes.
 
 ## Status
 
