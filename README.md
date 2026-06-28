@@ -47,18 +47,35 @@ curl -X DELETE localhost:8080/api/todos/1
 
 ### Helper scripts
 
-The `scripts/` folder wraps each operation in a small `curl` script that targets
-`localhost:8080` (override with the `BASE_URL` env var):
+The `scripts/` folder wraps each CRUD operation in a small `curl` script so you can
+drive the API without typing `curl` by hand. Each script targets `http://localhost:8080`
+by default; set the `BASE_URL` environment variable to point somewhere else. They
+require `bash` and `curl` (on Windows, run them from WSL or Git Bash).
+
+| Script             | Endpoint                | Arguments                          | Notes                                                     |
+| ------------------ | ----------------------- | ---------------------------------- | --------------------------------------------------------- |
+| `create_todo.sh`   | `POST /api/todos`       | `"<title>" [completed]`            | `completed` defaults to `false`; prints the created todo  |
+| `list_todos.sh`    | `GET /api/todos`        | _(none)_                           | Prints the JSON array of all todos                        |
+| `get_todo.sh`      | `GET /api/todos/{id}`   | `<id>`                             | Prints the matching todo (or a `404` error body)          |
+| `update_todo.sh`   | `PUT /api/todos/{id}`   | `<id> "<title>" [completed]`       | Replaces the todo; prints the updated todo                |
+| `delete_todo.sh`   | `DELETE /api/todos/{id}`| `<id>`                             | Prints the HTTP status (`204` on success, `404` if absent)|
+
+`create_todo.sh` and `update_todo.sh` JSON-escape the title for you, so titles with
+spaces or quotes are safe to pass as a single argument.
 
 ```bash
-scripts/create_todo.sh "buy milk"            # POST   /api/todos
-scripts/create_todo.sh "walk the dog" true   #   title + completed
-scripts/list_todos.sh                        # GET    /api/todos
-scripts/get_todo.sh 1                         # GET    /api/todos/1
-scripts/update_todo.sh 1 "buy oat milk" true # PUT    /api/todos/1
-scripts/delete_todo.sh 1                      # DELETE /api/todos/1
+# Make them executable once
+chmod +x scripts/*.sh
 
-BASE_URL=http://localhost:9000 scripts/list_todos.sh   # point at another host
+scripts/create_todo.sh "buy milk"             # -> 201 {"id":1,"title":"buy milk","completed":false}
+scripts/create_todo.sh "walk the dog" true    # title + completed
+scripts/list_todos.sh                         # [ ...all todos... ]
+scripts/get_todo.sh 1                         # {"id":1,...}
+scripts/update_todo.sh 1 "buy oat milk" true  # {"id":1,"title":"buy oat milk","completed":true}
+scripts/delete_todo.sh 1                      # HTTP 204
+
+# Point the scripts at a different host/port
+BASE_URL=http://localhost:9000 scripts/list_todos.sh
 ```
 
 ## Build
@@ -102,6 +119,7 @@ src/        implementation (main, server, worker, connection, http_protocol,
             btree_storage, todo_handlers)
 build/      .o + .d files (auto-generated header deps via -MMD -MP)
 bin/        output binary
+scripts/    bash + curl helpers for the Todo API (create/list/get/update/delete)
 tests/      reserved (no test harness yet)
 ```
 

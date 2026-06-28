@@ -23,10 +23,6 @@ static _Atomic uint64_t g_next_todo_id = 1;
 static const char TODO_COLLECTION[] = "/api/todos";
 static const char TODO_ITEM_PREFIX[] = "/api/todos/";
 
-// ---------------------------------------------------------------------------
-// JSON helpers (deliberately minimal -- enough for the flat todo object)
-// ---------------------------------------------------------------------------
-
 // Escape src into dst as a JSON string body (without surrounding quotes).
 // Returns the written length, or -1 if dst is too small.
 static int json_escape(char *dst, size_t dst_size, const char *src, size_t src_len)
@@ -246,10 +242,6 @@ static bool parse_json_bool(const char *body, size_t len, const char *field, boo
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// Request helpers
-// ---------------------------------------------------------------------------
-
 // Pull a numeric id out of "/api/todos/{id}". Returns false for missing,
 // empty, or non-numeric ids.
 static bool extract_id(const char *uri, char *out, size_t out_size)
@@ -311,10 +303,6 @@ static int send_json(connection_t *conn, http_request_t *request,
 
   return send_http_response(conn, response);
 }
-
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
 
 typedef struct
 {
@@ -572,10 +560,6 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
 
   return send_json(conn, request, response, HTTP_NO_CONTENT, "");
 }
-
-// ---------------------------------------------------------------------------
-// Wiring
-// ---------------------------------------------------------------------------
 
 static int seed_id_scan_cb(const char *key, size_t key_length,
                            const char *value, size_t value_length, void *ctx)
