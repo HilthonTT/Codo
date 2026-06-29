@@ -131,6 +131,7 @@ Configuration is read from a `.env` file (override the path with `ENV_FILE`), th
 | `DB_FILE`       | `codo.db`        | B-tree data file (Todo storage)      |
 | `WAL_FILE`      | `codo.wal`       | Write-ahead log file                 |
 | `BALANCER_PORT` | `8000`           | Listen port for `codo-balancer`      |
+| `BALANCER_BACKENDS` | `127.0.0.1:8080` | Backends fronted by `codo-balancer` (`host:port[:weight]`, comma-separated) |
 
 The storage engine runs a final checkpoint on shutdown (`SIGINT`/`SIGTERM`), so todos written in one run are visible on the next.
 
@@ -151,9 +152,9 @@ server/     the HTTP/1.1 server (bin/codo)
             btree_storage, ssl_util, websocket
   src/      main, server, worker, connection_pool, route, handlers,
             todo_handlers, btree_storage, ssl, websocket
-balancer/   load balancer scaffold (bin/codo-balancer) -- WIP
+balancer/   epoll TCP load balancer (bin/codo-balancer)
   include/  balancer
-  src/      main
+  src/      main, balancer
 build/      .o + .d files per component + libcommon.a
 bin/        output binaries (codo, codo-balancer)
 scripts/    bash + curl helpers for the Todo API (create/list/get/update/delete)
@@ -184,15 +185,40 @@ Two deliberate seams keep `common/` free of server types:
 
 ## Balancer
 
-`balancer/` is a scaffold for a load balancer that fronts one or more `codo`
-instances; the implementation is a work in progress. `balancer/src/main.c`
-loads config from the environment and is wired into the build, but does not yet
-listen or proxy. It is meant to reuse the shared primitives from `common/`:
-`set_socket_options` / `set_socket_nonblocking` (`connection.h`) for the listen
-socket and `parse_http_request` (`http_protocol.h`) for request inspection.
+`balancer/` is a TCP load balancer (`bin/codo-balancer`) that fronts one or
+more `codo` instances. It runs a single-threaded `epoll` event loop:
+`load_balancer_init()` binds the listen socket and creates the epoll instance,
+`handle_new_connection()` accepts a client, picks a backend, and opens a
+non-blocking connection to it, and the loop then proxies bytes in both
+directions (`client -> backend` via `client_buffer`, `backend -> client` via
+`backend_buffer`), pausing reads on one side when the other side's socket is not
+yet writable.
 
-`balancer/include/balancer.h` sketches the config/backend structs and the
-`balancer_init` / `balancer_run` / `balancer_cleanup` entry points to fill in.
+Backend selection uses smooth weighted round-robin (`select_backend()`),
+skipping any backend whose `health_status` is not healthy. Each fd registers an
+`io_ctx_t` as its epoll `data.ptr`, so the loop knows which connection and which
+side (`IO_CLIENT` / `IO_BACKEND` / `IO_LISTEN`) every event belongs to.
+
+### Configuration
+
+The balancer reads the same `.env` file as the server (override with
+`ENV_FILE`). CLI args override the environment: `argv[1]` is the listen port and
+`argv[2]` is the backend list.
+
+| Key                 | Default          | Purpose                                          |
+| ------------------- | ---------------- | ------------------------------------------------ |
+| `BALANCER_PORT`     | `8000`           | Listen port for `codo-balancer`                  |
+| `BALANCER_BACKENDS` | `127.0.0.1:8080` | Comma-separated backend list: `host:port[:weight]` |
+
+```sh
+make balancer
+BALANCER_PORT=8000 BALANCER_BACKENDS=127.0.0.1:8080,127.0.0.1:8081:2 ./bin/codo-balancer
+# or override on the command line:
+./bin/codo-balancer 8000 127.0.0.1:8080,127.0.0.1:8081:2
+```
+
+Each backend is `host:port` with an optional `:weight` suffix (default `1`); a
+higher weight receives proportionally more connections.
 
 ## Status
 
