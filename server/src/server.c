@@ -12,10 +12,18 @@
 
 #include "config.h"
 #include "connection.h"
+#include "http_protocol.h"
 #include "route.h"
 #include "server.h"
 #include "ssl_util.h"
 #include "worker.h"
+
+// Hook consumed by the shared HTTP layer (common/http_protocol.c) to fill the
+// "Server:" header without depending on http_server_t directly.
+const char *http_server_name(void)
+{
+  return g_server.server_name ? g_server.server_name : "OTA";
+}
 
 int http_server_init(http_server_t *server, int port, const char *document_root)
 {

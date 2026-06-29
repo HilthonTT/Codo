@@ -95,15 +95,23 @@ diagnostics helpers (`diagnose_network_issue`, `debug_packet_dump`) for debuggin
 
 ## Build
 
+The repo is a small workspace: shared code is compiled once into a static
+`libcommon.a`, and each binary (the server and the load balancer) links against
+it.
+
 ```
-make             # default build
-make debug       # -g -O0 -DDEBUG with ASan + UBSan
-make release     # -O2 -DNDEBUG
+make             # build both binaries (bin/codo + bin/codo-balancer)
+make server      # build only the HTTP server
+make balancer    # build only the load balancer
+make debug       # both, -g -O0 -DDEBUG with ASan + UBSan
+make release     # both, -O2 -DNDEBUG
 make run         # build then run ./bin/codo
+make run-balancer# build then run ./bin/codo-balancer
 make clean
 ```
 
-Output binary: `bin/codo`. Link deps: `-lssl -lcrypto -lz -lpthread`.
+Output binaries: `bin/codo` (server) and `bin/codo-balancer` (balancer).
+Link deps: `-lssl -lcrypto -lz -lpthread`.
 
 ## Run
 
@@ -122,25 +130,69 @@ Configuration is read from a `.env` file (override the path with `ENV_FILE`), th
 | `SSL_ENABLED`   | `true`           | Enable TLS when cert/key exist       |
 | `DB_FILE`       | `codo.db`        | B-tree data file (Todo storage)      |
 | `WAL_FILE`      | `codo.wal`       | Write-ahead log file                 |
+| `BALANCER_PORT` | `8000`           | Listen port for `codo-balancer`      |
 
 The storage engine runs a final checkpoint on shutdown (`SIGINT`/`SIGTERM`), so todos written in one run are visible on the next.
 
 ## Layout
 
+The codebase is split into three components, each with its own `include/` +
+`src/`. `common/` is shared infrastructure; `server/` and `balancer/` are the
+two binaries built on top of it.
+
 ```
-include/    public headers (one per subsystem)
-src/        implementation (main, server, worker, connection, http_protocol,
-            route, ssl, websocket, compression, mime, util, handlers,
-            btree_storage, todo_handlers)
-build/      .o + .d files (auto-generated header deps via -MMD -MP)
-bin/        output binary
+common/     shared infrastructure compiled into libcommon.a
+  include/  config, http_types, env, util, stats, connection,
+            compression, http_protocol, mime
+  src/      env, util, stats, mime, compression, http_protocol,
+            connection (cleanup + socket helpers)
+server/     the HTTP/1.1 server (bin/codo)
+  include/  server, worker, route, handlers, todo_handlers,
+            btree_storage, ssl_util, websocket
+  src/      main, server, worker, connection_pool, route, handlers,
+            todo_handlers, btree_storage, ssl, websocket
+balancer/   load balancer scaffold (bin/codo-balancer) -- WIP
+  include/  balancer
+  src/      main
+build/      .o + .d files per component + libcommon.a
+bin/        output binaries (codo, codo-balancer)
 scripts/    bash + curl helpers for the Todo API (create/list/get/update/delete)
 tests/      reserved (no test harness yet)
 ```
 
-The Todo API lives in `src/todo_handlers.c` (HTTP/JSON layer) on top of
-`src/btree_storage.c` (the storage engine). `main.c` initializes the engine,
-seeds the id counter, and registers the routes.
+The Todo API lives in `server/src/todo_handlers.c` (HTTP/JSON layer) on top of
+`server/src/btree_storage.c` (the storage engine). `server/src/main.c`
+initializes the engine, seeds the id counter, and registers the routes.
+
+### What is shared vs. server-only
+
+`common/` holds everything that does not depend on `http_server_t`: config and
+env loading, the HTTP request parser / response writer (`http_protocol.c`),
+generic socket helpers and per-connection teardown (`connection.c`), network
+stats, MIME lookup, and gzip plumbing. The server adds the pieces bound to its
+own state: the connection pool (`connection_pool.c`, which tracks live
+connections in `http_server_t`), TLS context setup (`ssl.c`), the worker/epoll
+loop, routing, and the Todo API.
+
+Two deliberate seams keep `common/` free of server types:
+
+- `http_protocol.c` fills the `Server:` response header via `http_server_name()`,
+  a hook each binary defines for itself (the server returns its configured name).
+- `connection.c` provides `cleanup_connection()` + socket helpers (no server
+  state); `allocate_connection()` / `free_connection()`, which touch the pool,
+  live in the server's `connection_pool.c`.
+
+## Balancer
+
+`balancer/` is a scaffold for a load balancer that fronts one or more `codo`
+instances; the implementation is a work in progress. `balancer/src/main.c`
+loads config from the environment and is wired into the build, but does not yet
+listen or proxy. It is meant to reuse the shared primitives from `common/`:
+`set_socket_options` / `set_socket_nonblocking` (`connection.h`) for the listen
+socket and `parse_http_request` (`http_protocol.h`) for request inspection.
+
+`balancer/include/balancer.h` sketches the config/backend structs and the
+`balancer_init` / `balancer_run` / `balancer_cleanup` entry points to fill in.
 
 ## Status
 

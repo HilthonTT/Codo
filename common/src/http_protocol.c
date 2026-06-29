@@ -15,7 +15,6 @@
 #include "http_protocol.h"
 #include "http_types.h"
 #include "mime.h"
-#include "server.h"
 #include "util.h"
 
 int send_http_response(connection_t *conn, http_response_t *response)
@@ -39,7 +38,7 @@ int send_http_response(connection_t *conn, http_response_t *response)
                             response->version[0] ? response->version : "HTTP/1.1",
                             (int)response->status,
                             http_status_to_string(response->status),
-                            g_server.server_name ? g_server.server_name : "OTA",
+                            http_server_name(),
                             date_buf,
                             response->body_length,
                             response->keep_alive ? "keep-alive" : "close");
