@@ -307,6 +307,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   conn->read_buffer[0] = '\0';
 
   // Switch to writing the response.
+  conn->state = CONN_STATE_WRITING_RESPONSE;
   struct epoll_event ev;
   ev.events = EPOLLOUT | EPOLLET;
   ev.data.ptr = conn;
@@ -320,7 +321,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
 
 int handle_client_write(worker_thread_t *worker, connection_t *conn)
 {
-  if (!conn || conn->state != CONN_STATE_WRITNG_RESPONSE)
+  if (!conn || conn->state != CONN_STATE_WRITING_RESPONSE)
   {
     return -1;
   }

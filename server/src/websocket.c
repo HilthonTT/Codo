@@ -84,7 +84,7 @@ int handle_websocket_upgrade(connection_t *conn, http_request_t *request)
 
   conn->write_buffer_pos = 0;
   conn->write_buffer_size = (size_t)len;
-  conn->state = CONN_STATE_WRITNG_RESPONSE;
+  conn->state = CONN_STATE_WRITING_RESPONSE;
   conn->websocket_handshake_complete = true;
   // The connection stays open for WebSocket framing once the handshake is
   // flushed; we mark the request as keep-alive so handle_client_write does not

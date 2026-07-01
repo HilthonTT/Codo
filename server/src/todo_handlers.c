@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -282,7 +283,7 @@ static int send_json(connection_t *conn, http_request_t *request,
                      const char *json)
 {
   response->status = status;
-  strcpy(response->version, "HTTP/1.1");
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
 
   if (response->body)
   {
@@ -297,8 +298,8 @@ static int send_json(connection_t *conn, http_request_t *request,
   response->body_length = strlen(response->body);
   response->keep_alive = request->keep_alive;
 
-  strcpy(response->headers[0].name, "Content-Type");
-  strcpy(response->headers[0].value, "application/json");
+  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
+  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
   response->header_count = 1;
 
   return send_http_response(conn, response);
@@ -491,7 +492,13 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   parse_json_bool(request->body, request->body_length, "completed", &completed);
 
   size_t key_len = strlen(key);
-  uint64_t id = strtoull(key, NULL, 10);
+  errno = 0;
+  char *endptr = NULL;
+  uint64_t id = strtoull(key, &endptr, 10);
+  if (errno != 0 || !endptr || *endptr != '\0' || endptr == key)
+  {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
+  }
 
   char value[MAX_VALUE_SIZE];
   int value_len = build_todo_json(value, sizeof(value), id, title, strlen(title), completed);

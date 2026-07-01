@@ -87,7 +87,7 @@ int send_http_response(connection_t *conn, http_response_t *response)
 
   conn->write_buffer_pos = 0;
   conn->write_buffer_size = total_size;
-  conn->state = CONN_STATE_WRITNG_RESPONSE;
+  conn->state = CONN_STATE_WRITING_RESPONSE;
   return 0;
 }
 

@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <errno.h>
 
 #include "btree_storage.h"
 
@@ -102,12 +103,25 @@ int flush_wal_buffer(void)
 
   if (storage_engine.wal_buffer_pos > 0)
   {
-    ssize_t bytes_written = write(storage_engine.wal_fd, storage_engine.wal_buffer, storage_engine.wal_buffer_pos);
-
-    if (bytes_written != (ssize_t)storage_engine.wal_buffer_pos)
+    size_t total_written = 0;
+    while (total_written < storage_engine.wal_buffer_pos)
     {
-      pthread_mutex_unlock(&storage_engine.wal_mutex);
-      return -1;
+      ssize_t bytes_written = write(storage_engine.wal_fd,
+                                    storage_engine.wal_buffer + total_written,
+                                    storage_engine.wal_buffer_pos - total_written);
+      if (bytes_written < 0)
+      {
+        if (errno == EINTR)
+          continue;
+        pthread_mutex_unlock(&storage_engine.wal_mutex);
+        return -1;
+      }
+      if (bytes_written == 0)
+      {
+        pthread_mutex_unlock(&storage_engine.wal_mutex);
+        return -1;
+      }
+      total_written += (size_t)bytes_written;
     }
 
     fsync(storage_engine.wal_fd);
@@ -170,12 +184,28 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
   // Evict victim if dirty
   if (victim->dirty && victim->page)
   {
-    // Write page to disk
+    // Write page to disk (retry on partial writes / EINTR)
     off_t offset = victim->page_id * PAGE_SIZE;
-    if (pwrite(storage_engine.data_fd, victim->page, PAGE_SIZE, offset) != 0)
+    size_t total_written = 0;
+    while (total_written < PAGE_SIZE)
     {
-      pthread_mutex_unlock(&storage_engine.buffer_mutex);
-      return NULL;
+      ssize_t w = pwrite(storage_engine.data_fd,
+                         (const char *)victim->page + total_written,
+                         PAGE_SIZE - total_written,
+                         offset + total_written);
+      if (w < 0)
+      {
+        if (errno == EINTR)
+          continue;
+        pthread_mutex_unlock(&storage_engine.buffer_mutex);
+        return NULL;
+      }
+      if (w == 0)
+      {
+        pthread_mutex_unlock(&storage_engine.buffer_mutex);
+        return NULL;
+      }
+      total_written += (size_t)w;
     }
     atomic_fetch_add(&storage_engine.stats.pages_written, 1);
     victim->dirty = false;
@@ -184,12 +214,12 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
   // Remove from hash table
   if (victim->page_id != 0)
   {
-    uint32_t hash = hash_page_id(page_id);
+    uint32_t hash = hash_page_id(victim->page_id);
     uint32_t *current = &storage_engine.hash_table[hash];
 
     while (*current != UINT32_MAX)
     {
-      if (*current == (victim - storage_engine.buffer_pool))
+      if (*current == (uint32_t)(victim - storage_engine.buffer_pool))
       {
         *current = victim->hash_next;
         break;
@@ -259,6 +289,9 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
   }
 
   // Read page from disk
+  // TODO(concurrency): allocate_buffer_entry holds the buffer_mutex briefly
+  // but the page_lock is acquired after the pread below; a downgrade-during-IO
+  // scheme would let concurrent readers proceed while this page is loaded.
   off_t offset = page_id * PAGE_SIZE;
   if (pread(storage_engine.data_fd, entry->page, PAGE_SIZE, offset) != PAGE_SIZE)
   {
@@ -677,6 +710,9 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
     return -1;
   }
 
+  // TODO(concurrency): descending internal nodes with LOCK_EXCLUSIVE
+  // serializes all writers; switching internal-node descent to LOCK_SHARED
+  // (crab-latching) would improve concurrency.
   uint32_t page_id = storage_engine.root_page_id;
   btree_page_t *page = get_page(page_id, LOCK_EXCLUSIVE);
   if (!page)
@@ -844,7 +880,7 @@ int db_update(transaction_t *txn, const char *key, size_t key_length, const char
   }
 
   // Save old value for undo log
-  char *old_value = malloc(kv->key_length);
+  char *old_value = malloc(kv->value_length);
   if (old_value)
   {
     memcpy(old_value, kv->data + kv->key_length, kv->value_length);

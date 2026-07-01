@@ -16,13 +16,13 @@ int api_hello_handler(connection_t *conn, http_request_t *request, http_response
   const char *hello_msg = "{\"message\": \"Hello, World!\", \"timestamp\": \"2026-01-01T00:00:00Z\"}";
 
   response->status = HTTP_OK;
-  strcpy(response->version, "HTTP/1.1");
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
   response->body = strdup(hello_msg);
   response->body_length = strlen(hello_msg);
   response->keep_alive = request->keep_alive;
 
-  strcpy(response->headers[0].name, "Content-Type");
-  strcpy(response->headers[0].value, "application/json");
+  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
+  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
   response->header_count = 1;
 
   return send_http_response(conn, response);
@@ -48,11 +48,11 @@ int api_echo_handler(connection_t *conn, http_request_t *request, http_response_
   response->body_length = body_len;
 
   response->status = HTTP_OK;
-  strcpy(response->version, "HTTP/1.1");
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
   response->keep_alive = request->keep_alive;
 
-  strcpy(response->headers[0].name, "Content-Type");
-  strcpy(response->headers[0].value, "text/plain");
+  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
+  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "text/plain");
   response->header_count = 1;
 
   return send_http_response(conn, response);
@@ -74,13 +74,13 @@ int api_status_handler(connection_t *conn, http_request_t *request, http_respons
            (unsigned long)g_server.active_connections_count);
 
   response->status = HTTP_OK;
-  strcpy(response->version, "HTTP/1.1");
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
   response->body = strdup(status_json);
   response->body_length = response->body ? strlen(response->body) : 0;
   response->keep_alive = request->keep_alive;
 
-  strcpy(response->headers[0].name, "Content-Type");
-  strcpy(response->headers[0].value, "application/json");
+  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
+  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
   response->header_count = 1;
 
   return send_http_response(conn, response);
@@ -95,13 +95,13 @@ int api_stats_handler(connection_t *conn, http_request_t *request, http_response
   }
 
   response->status = HTTP_OK;
-  strcpy(response->version, "HTTP/1.1");
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
   response->body = strdup(stats_json);
   response->body_length = response->body ? strlen(response->body) : 0;
   response->keep_alive = request->keep_alive;
 
-  strcpy(response->headers[0].name, "Content-Type");
-  strcpy(response->headers[0].value, "application/json");
+  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
+  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
   response->header_count = 1;
 
   return send_http_response(conn, response);
