@@ -22,7 +22,7 @@
 // "Server:" header without depending on http_server_t directly.
 const char *http_server_name(void)
 {
-  return g_server.server_name ? g_server.server_name : "OTA";
+  return g_server.server_name ? g_server.server_name : "Codo";
 }
 
 int http_server_init(http_server_t *server, int port, const char *document_root)
@@ -36,7 +36,7 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
 
   server->listen_port = port;
   server->document_root = strdup(document_root);
-  server->server_name = strdup("OTA-HTTP-Server/1.0");
+  server->server_name = strdup("Codo-HTTP-Server/1.0");
   server->max_connections = MAX_CONNECTIONS;
   server->enable_keepalive = true;
   server->keepalive_timeout = KEEPALIVE_TIMEOUT;
