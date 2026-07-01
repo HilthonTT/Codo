@@ -4,6 +4,37 @@
 static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn);
 static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn);
 
+static void update_epoll_interest(load_balancer_t *lb, connection_t *conn)
+{
+    uint32_t client_events = 0, backend_events = 0;
+
+    bool c2b_pending = conn->client_buffer_len > conn->client_buffer_sent;
+    bool b2c_pending = conn->backend_buffer_len > conn->backend_buffer_sent;
+
+    // only read a fresh chunk from a side once its outbound buffer is drained.
+    if (!c2b_pending)
+    {
+        client_events |= EPOLLIN; // willing to read from client
+    }
+    if (!b2c_pending)
+    {
+        backend_events |= EPOLLIN;
+    }
+
+    // only wait for writeability when bytes are actually queued for that fd.
+    if (c2b_pending)
+    {
+        backend_events |= EPOLLOUT; // data waiting for backend
+    }
+    if (b2c_pending)
+    {
+        client_events |= EPOLLOUT; // data waiting for client
+    }
+
+    modify_epoll_events(lb, &conn->client_ctx, client_events);
+    modify_epoll_events(lb, &conn->backend_ctx, backend_events);
+}
+
 // High-performance load balancer main loop
 int load_balancer_main_loop(load_balancer_t *lb)
 {
@@ -367,9 +398,7 @@ static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn)
 
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
-            // Backend not ready: pause client reads, wait for EPOLLOUT.
-            modify_epoll_events(lb, &conn->client_ctx, 0);
-            modify_epoll_events(lb, &conn->backend_ctx, EPOLLIN | EPOLLOUT);
+            update_epoll_interest(lb, conn);
             return;
         }
 
@@ -380,8 +409,7 @@ static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn)
     // Fully forwarded: resume reading the client, stop waiting for writability.
     conn->client_buffer_len = 0;
     conn->client_buffer_sent = 0;
-    modify_epoll_events(lb, &conn->client_ctx, EPOLLIN);
-    modify_epoll_events(lb, &conn->backend_ctx, EPOLLIN);
+    update_epoll_interest(lb, conn);
 }
 
 // Mirror of flush_client_to_backend for the backend->client direction.
@@ -400,9 +428,7 @@ static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn)
 
         if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
         {
-            // Client not ready: pause backend reads, wait for EPOLLOUT.
-            modify_epoll_events(lb, &conn->backend_ctx, 0);
-            modify_epoll_events(lb, &conn->client_ctx, EPOLLIN | EPOLLOUT);
+            update_epoll_interest(lb, conn);
             return;
         }
 
@@ -412,8 +438,7 @@ static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn)
 
     conn->backend_buffer_len = 0;
     conn->backend_buffer_sent = 0;
-    modify_epoll_events(lb, &conn->backend_ctx, EPOLLIN);
-    modify_epoll_events(lb, &conn->client_ctx, EPOLLIN);
+    update_epoll_interest(lb, conn);
 }
 
 void close_connection(load_balancer_t *lb, connection_t *conn)
