@@ -1,8 +1,84 @@
 #include "balancer.h"
 
+#include <netinet/tcp.h>
+#include <sys/uio.h>
+
 // Forward declarations for the file-local proxy helpers.
 static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn);
 static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn);
+
+// Passive-health-check helpers. Every failure attributable to the backend
+// bumps consecutive_failures; once we cross the threshold the backend is
+// removed from rotation. Any successful data exchange resets the counter.
+// Callers must NOT already hold backend_mutex.
+static void mark_backend_failure(load_balancer_t *lb, backend_t *backend)
+{
+    if (!backend)
+    {
+        return;
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
+    pthread_mutex_lock(&lb->backend_mutex);
+    backend->failed_requests++;
+    backend->consecutive_failures++;
+    // Use CLOCK_MONOTONIC so the recovery timer isn't affected by wall-clock
+    // jumps (NTP steps, manual date changes).
+    backend->last_health_check = (time_t)ts.tv_sec;
+    if (backend->consecutive_failures >= HEALTH_FAILURE_THRESHOLD)
+    {
+        if (backend->health_status == 1)
+        {
+            fprintf(stderr,
+                    "backend %s:%d marked unhealthy after %d consecutive failures\n",
+                    inet_ntoa(backend->addr.sin_addr),
+                    ntohs(backend->addr.sin_port),
+                    backend->consecutive_failures);
+        }
+        backend->health_status = 0;
+    }
+    pthread_mutex_unlock(&lb->backend_mutex);
+}
+
+static void mark_backend_success(load_balancer_t *lb, backend_t *backend)
+{
+    if (!backend)
+        return;
+    pthread_mutex_lock(&lb->backend_mutex);
+    if (backend->consecutive_failures != 0 || backend->health_status != 1)
+    {
+        backend->consecutive_failures = 0;
+        backend->health_status = 1;
+    }
+    pthread_mutex_unlock(&lb->backend_mutex);
+}
+
+// Send a minimal HTTP 503 to a raw client fd. Best-effort; the fd is closed
+// by the caller. Used when no healthy backend is available.
+static void send_503(int client_fd)
+{
+    static const char body[] =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: text/plain\r\n"
+        "Content-Length: 19\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "No backend available";
+    ssize_t total = 0, len = (ssize_t)sizeof(body) - 1;
+    while (total < len)
+    {
+        ssize_t n = write(client_fd, body + total, (size_t)(len - total));
+        if (n > 0)
+        {
+            total += n;
+            continue;
+        }
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            break; // client can't keep up; give up rather than block
+        break;
+    }
+}
 
 static void update_epoll_interest(load_balancer_t *lb, connection_t *conn)
 {
@@ -218,12 +294,25 @@ void handle_new_connection(load_balancer_t *lb)
     }
 
     // Set non-blocking
-    set_nonblocking(client_fd);
+    if (set_nonblocking(client_fd) == -1)
+    {
+        perror("set_nonblocking(client_fd)");
+        close(client_fd);
+        return;
+    }
+
+    // Enable TCP_NODELAY on the client side so short request/response pairs
+    // aren't delayed by Nagle's algorithm.
+    int one = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     // Select backend using load balancing algorithm
     backend = select_backend(lb);
     if (!backend)
     {
+        // All backends are unhealthy — reply 503 instead of a silent close so
+        // clients get an actionable error.
+        send_503(client_fd);
         close(client_fd);
         return;
     }
@@ -232,12 +321,13 @@ void handle_new_connection(load_balancer_t *lb)
     backend_fd = create_backend_connection(backend);
     if (backend_fd == -1)
     {
+        // Immediate connect() failure (not EINPROGRESS) — that's the backend's
+        // fault, so count it against health.
+        mark_backend_failure(lb, backend);
         close(client_fd);
-        pthread_mutex_lock(&lb->backend_mutex);
-        backend->failed_requests++;
-        pthread_mutex_unlock(&lb->backend_mutex);
         return;
     }
+    setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     // Create connection structure
     conn = malloc(sizeof(connection_t));
@@ -276,6 +366,22 @@ backend_t *select_backend(load_balancer_t *lb)
     int i;
 
     pthread_mutex_lock(&lb->backend_mutex);
+
+    // Passive recovery: re-admit backends whose last failure is far enough
+    // in the past. Cheap enough to run on every selection. Uses
+    // CLOCK_MONOTONIC to match mark_backend_failure — must be the same clock.
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    time_t now = (time_t)ts.tv_sec;
+    for (i = 0; i < lb->backend_count; i++)
+    {
+        backend_t *b = &lb->backends[i];
+        if (b->health_status == 0 && (now - b->last_health_check) >= HEALTH_RECOVERY_SECS)
+        {
+            b->health_status = 1;
+            b->consecutive_failures = 0;
+        }
+    }
 
     // Calculate total weight of healthy backends
     for (i = 0; i < lb->backend_count; i++)
@@ -350,12 +456,22 @@ void handle_backend_data(load_balancer_t *lb, connection_t *conn)
     bytes_read = read(conn->backend_fd, conn->backend_buffer, BUFFER_SIZE);
     if (bytes_read <= 0)
     {
-        if (bytes_read == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        if (bytes_read == 0)
         {
+            // Clean EOF from backend — normal close of the response.
+            close_connection(lb, conn);
+        }
+        else if (errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            // Read error from backend — attribute to backend health.
+            mark_backend_failure(lb, conn->backend);
             close_connection(lb, conn);
         }
         return;
     }
+
+    // We successfully received data from this backend — reset failure count.
+    mark_backend_success(lb, conn->backend);
 
     conn->backend_buffer_len = (size_t)bytes_read;
     conn->backend_buffer_sent = 0;
@@ -377,6 +493,15 @@ void handle_backend_write(load_balancer_t *lb, connection_t *conn)
 
 void handle_connection_error(load_balancer_t *lb, connection_t *conn)
 {
+    // We don't know which side raised the error, but check the backend fd's
+    // pending socket error explicitly — a refused/reset backend is the most
+    // common cause and the only one worth demoting a backend for.
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    if (getsockopt(conn->backend_fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) == 0 && soerr != 0)
+    {
+        mark_backend_failure(lb, conn->backend);
+    }
     close_connection(lb, conn);
 }
 
@@ -402,6 +527,9 @@ static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn)
             return;
         }
 
+        // Write to backend failed for a non-transient reason — the backend
+        // is the responsible party, so this counts against its health.
+        mark_backend_failure(lb, conn->backend);
         close_connection(lb, conn);
         return;
     }
@@ -446,10 +574,21 @@ void close_connection(load_balancer_t *lb, connection_t *conn)
     struct timespec end_time;
     long long response_time;
 
-    // Calculate response time
+    // Calculate response time in ms. Normalize the nsec borrow so we don't
+    // produce a negative contribution when end.tv_nsec < start.tv_nsec.
     clock_gettime(CLOCK_MONOTONIC, &end_time);
-    response_time = (end_time.tv_sec - conn->start_time.tv_sec) * 1000 +
-                    (end_time.tv_nsec - conn->start_time.tv_nsec) / 1000000;
+    long sec = (long)(end_time.tv_sec - conn->start_time.tv_sec);
+    long nsec = end_time.tv_nsec - conn->start_time.tv_nsec;
+    if (nsec < 0)
+    {
+        sec -= 1;
+        nsec += 1000000000L;
+    }
+    response_time = (long long)sec * 1000 + nsec / 1000000;
+    if (response_time < 0)
+    {
+        response_time = 0; // clock went backwards; don't poison the EMA
+    }
 
     // Update backend statistics
     pthread_mutex_lock(&lb->backend_mutex);

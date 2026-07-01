@@ -25,6 +25,13 @@
 #define BUFFER_SIZE 8192
 #define MAX_BACKENDS 100
 
+// Passive health check tuning. A backend is marked unhealthy after this many
+// consecutive failures (connect refused, read/write errors, EPOLLERR/HUP).
+// It is re-admitted after HEALTH_RECOVERY_SECS have passed since the last
+// failure, giving it a chance to prove itself again.
+#define HEALTH_FAILURE_THRESHOLD 3
+#define HEALTH_RECOVERY_SECS 30
+
 typedef struct
 {
   int fd;
@@ -34,6 +41,7 @@ typedef struct
   int current_connections;
   int total_requests;
   int failed_requests;
+  int consecutive_failures;
   long long avg_response_time;
   int health_status;
   time_t last_health_check;
