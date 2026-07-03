@@ -4,6 +4,7 @@
 #include <pthread.h>
 #include <sys/time.h>
 #include <stdatomic.h>
+#include <stdio.h>
 
 // Task structure
 typedef struct task
@@ -18,7 +19,7 @@ typedef struct task
 typedef struct task_queue
 {
   task_t **queues; // Array of priority queue
-  int num_prioritities;
+  int num_priorities;
   pthread_mutex_t mutex;
   pthread_cond_t condition;
   _Atomic(int) size;
@@ -75,7 +76,7 @@ task_t *task_queue_try_pop(task_queue_t *queue);
 // Worker stealing implementation
 task_t *steal_task(thread_pool_t *pool, int worker_id);
 // Worker thread function
-task_t *worker_thread(void *arg);
+void *worker_thread(void *arg);
 // Create thread pool
 thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_threads, bool enable_work_stealing, int num_priorities);
 // Submit task to thread pool
