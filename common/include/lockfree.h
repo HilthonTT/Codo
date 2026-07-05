@@ -79,12 +79,13 @@ bool is_hazard_pointer(void *ptr);
 
 lockfree_queue_t *lockfree_queue_create(void);
 bool lock_free_queue_enqueue(lockfree_queue_t *queue, void *data);
-bool lock_free_queue_dequeue(lockfree_queue_t *queue, void **data);
+bool lockfree_queue_dequeue(lockfree_queue_t *queue, void **data);
 
 lockfree_hashtable_t *lockfree_hashtable_create(void);
 bool lockfree_hashtable_insert(lockfree_hashtable_t *table, uintptr_t key, void *value);
 bool lockfree_hashtable_lookup(lockfree_hashtable_t *table, uintptr_t key, void **value);
 
+lockfree_skiplist_t *lockfree_skiplist_create(void);
 bool lockfree_skiplist_insert(lockfree_skiplist_t *list, long key, void *value);
 bool lockfree_skiplist_search(lockfree_skiplist_t *list, long key, void **value);
 

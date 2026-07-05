@@ -68,8 +68,17 @@ typedef struct
   char reserved[32];
 } page_header_t;
 
-// Key-value pair structure
-typedef struct
+// Key-value pair structure.
+//
+// These are packed back-to-back into a page's data area at variable offsets
+// (each pair spans sizeof(kv_pair_t) + key_length + value_length bytes), so a
+// pair almost never lands on a 4-byte boundary. Accessing the uint32_t
+// child_page_id through such a pointer is undefined behaviour (and faults on
+// strict-alignment CPUs), which UBSan flags. Marking the struct packed tells
+// the compiler these accesses may be unaligned so it emits safe byte-wise
+// loads/stores. The layout is unchanged -- {u16,u16,u32} is already 8 bytes
+// with no padding -- so the on-disk format is identical.
+typedef struct __attribute__((packed))
 {
   uint16_t key_length;
   uint16_t value_length;

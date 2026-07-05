@@ -605,9 +605,12 @@ void todo_api_init(void)
 
 void todo_api_register_routes(http_server_t *server)
 {
-  add_route(server, TODO_COLLECTION, HTTP_GET, todo_list_handler);
-  add_route(server, TODO_COLLECTION, HTTP_POST, todo_create_handler);
-  add_route(server, "/api/todos/*", HTTP_GET, todo_get_handler);
-  add_route(server, "/api/todos/*", HTTP_PUT, todo_update_handler);
-  add_route(server, "/api/todos/*", HTTP_DELETE, todo_delete_handler);
+  // Every todo handler goes through the btree storage engine (transactions,
+  // WAL fsync, page reads/writes), so mark them for thread-pool offload to
+  // keep the epoll workers responsive under storage load.
+  add_route_offloaded(server, TODO_COLLECTION, HTTP_GET, todo_list_handler);
+  add_route_offloaded(server, TODO_COLLECTION, HTTP_POST, todo_create_handler);
+  add_route_offloaded(server, "/api/todos/*", HTTP_GET, todo_get_handler);
+  add_route_offloaded(server, "/api/todos/*", HTTP_PUT, todo_update_handler);
+  add_route_offloaded(server, "/api/todos/*", HTTP_DELETE, todo_delete_handler);
 }

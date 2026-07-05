@@ -18,7 +18,71 @@
 #include "route.h"
 #include "server.h"
 #include "stats.h"
+#include "thread_pool.h"
 #include "worker.h"
+
+// Payload handed to a storage-pool thread describing one offloaded request.
+typedef struct
+{
+  worker_thread_t *worker;
+  connection_t *conn;
+  route_t *route;
+} offload_task_t;
+
+// Shared tail for a completed request (inline or offloaded): account the
+// request, reset the read buffer for the next one, and arm the socket for the
+// response write. Returns the epoll_ctl result (0 ok, -1 -> caller tears down).
+static int finalize_response(worker_thread_t *worker, connection_t *conn)
+{
+  atomic_fetch_add(&g_server.total_requests, 1);
+  atomic_fetch_add(&worker->requests_processed, 1);
+
+  conn->read_buffer_pos = 0;
+  conn->read_buffer[0] = '\0';
+  conn->state = CONN_STATE_WRITING_RESPONSE;
+
+  struct epoll_event ev;
+  ev.events = EPOLLOUT | EPOLLET;
+  ev.data.ptr = conn;
+  return epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev);
+}
+
+// Runs on a storage-pool thread: execute the blocking handler that fills the
+// write buffer, then hand the connection back to its worker by arming EPOLLOUT.
+static void run_offloaded_handler(void *arg)
+{
+  offload_task_t *task = (offload_task_t *)arg;
+  worker_thread_t *worker = task->worker;
+  connection_t *conn = task->conn;
+  route_t *route = task->route;
+  free(task);
+
+  if (route->handler(conn, &conn->request, &conn->response) != 0 &&
+      conn->write_buffer_size == 0)
+  {
+    send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
+  }
+
+  // Account and reset while we still exclusively own the connection.
+  atomic_fetch_add(&g_server.total_requests, 1);
+  atomic_fetch_add(&worker->requests_processed, 1);
+  conn->read_buffer_pos = 0;
+  conn->read_buffer[0] = '\0';
+  conn->last_activity = time(NULL);
+  conn->state = CONN_STATE_WRITING_RESPONSE;
+
+  // Snapshot everything the epoll call needs BEFORE releasing ownership. Once
+  // we clear `offloaded` and arm EPOLLOUT, the worker may write, fail, and
+  // free(conn) at any instant -- so conn must not be dereferenced past here.
+  int epoll_fd = worker->epoll_fd;
+  int socket_fd = conn->socket_fd;
+  struct epoll_event ev;
+  ev.events = EPOLLOUT | EPOLLET;
+  ev.data.ptr = conn;
+
+  atomic_store(&conn->offloaded, false);
+  epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socket_fd, &ev);
+}
 
 // Unlink a connection from its owning worker's list.
 static void remove_connection_from_worker(worker_thread_t *worker, connection_t *conn)
@@ -124,6 +188,15 @@ void *worker_thread_function(void *arg)
         continue;
       }
 
+      // A storage-pool thread currently owns this connection. Defer every
+      // event -- including EPOLLERR/EPOLLHUP, which the kernel delivers
+      // regardless of the interest mask -- until the pool re-arms it. Touching
+      // (or freeing) it here would race the pool thread.
+      if (atomic_load(&conn->offloaded))
+      {
+        continue;
+      }
+
       if (event.events & (EPOLLERR | EPOLLHUP))
       {
         // Connection error or hangup
@@ -163,7 +236,9 @@ void *worker_thread_function(void *arg)
     {
       connection_t *next = conn->next;
 
-      if (current_time - conn->last_activity > g_server.keepalive_timeout)
+      // Never reap a connection a pool thread is still working on.
+      if (!atomic_load(&conn->offloaded) &&
+          current_time - conn->last_activity > g_server.keepalive_timeout)
       {
         remove_connection_from_worker(worker, conn);
         free_connection(&g_server, conn);
@@ -271,52 +346,67 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   if (parse_result != 0)
   {
     send_error_response(conn, HTTP_BAD_REQUEST, "Bad Request");
+    return finalize_response(worker, conn);
+  }
+
+  route_t *route = find_route(&g_server, conn->request.uri, conn->request.method);
+
+  // Blocking, storage-backed handlers are dispatched to the thread pool so a
+  // WAL fsync or page read/write can't freeze this worker's whole event loop.
+  // Gate on g_server.running: once shutdown starts, http_server_cleanup tears
+  // the pool down, so we must stop submitting and run inline instead.
+  if (route && route->handler && route->offload && g_server.pool && g_server.running)
+  {
+    offload_task_t *task = malloc(sizeof(*task));
+    if (task)
+    {
+      task->worker = worker;
+      task->conn = conn;
+      task->route = route;
+
+      // Take the connection off the interest set (no EPOLLIN/OUT while the pool
+      // owns it) and flag it so the event loop and timeout sweep leave it
+      // alone. Set before submit so the pool's re-arm is the only clear.
+      atomic_store(&conn->offloaded, true);
+      struct epoll_event off_ev;
+      off_ev.events = 0;
+      off_ev.data.ptr = conn;
+      epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &off_ev);
+
+      if (thread_pool_submit(g_server.pool, run_offloaded_handler, task, 0) == 0)
+      {
+        return 0; // handled asynchronously; pool arms EPOLLOUT when done
+      }
+
+      // Submit failed -- reclaim the connection and fall through to inline.
+      atomic_store(&conn->offloaded, false);
+      free(task);
+    }
+    // A malloc failure likewise falls through to inline handling.
+  }
+
+  if (route && route->handler)
+  {
+    if (route->handler(conn, &conn->request, &conn->response) != 0)
+    {
+      // Handler reported an error; if it didn't already prepare a response,
+      // send a generic one.
+      if (conn->write_buffer_size == 0)
+      {
+        send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
+      }
+    }
+  }
+  else if (g_server.default_handler)
+  {
+    g_server.default_handler(conn, &conn->request, &conn->response);
   }
   else
   {
-    route_t *route = find_route(&g_server, conn->request.uri, conn->request.method);
-    if (route && route->handler)
-    {
-      if (route->handler(conn, &conn->request, &conn->response) != 0)
-      {
-        // Handler reported an error; if it didn't already prepare a response,
-        // send a generic one.
-        if (conn->write_buffer_size == 0)
-        {
-          send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
-        }
-      }
-    }
-    else if (g_server.default_handler)
-    {
-      g_server.default_handler(conn, &conn->request, &conn->response);
-    }
-    else
-    {
-      send_error_response(conn, HTTP_NOT_FOUND, "Not Found");
-    }
+    send_error_response(conn, HTTP_NOT_FOUND, "Not Found");
   }
 
-  pthread_mutex_lock(&g_server.stats_mutex);
-  g_server.total_requests++;
-  pthread_mutex_unlock(&g_server.stats_mutex);
-  worker->requests_processed++;
-
-  // Reset read buffer for the next request on this connection.
-  conn->read_buffer_pos = 0;
-  conn->read_buffer[0] = '\0';
-
-  // Switch to writing the response.
-  conn->state = CONN_STATE_WRITING_RESPONSE;
-  struct epoll_event ev;
-  ev.events = EPOLLOUT | EPOLLET;
-  ev.data.ptr = conn;
-  if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev) < 0)
-  {
-    return -1;
-  }
-
-  return 0;
+  return finalize_response(worker, conn);
 }
 
 int handle_client_write(worker_thread_t *worker, connection_t *conn)

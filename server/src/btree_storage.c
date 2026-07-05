@@ -56,7 +56,14 @@ int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, 
 {
   pthread_mutex_lock(&storage_engine.wal_mutex);
 
-  size_t record_size = sizeof(wal_record_type_t) + data_length;
+  // The record is the full wal_record_t header followed by data_length payload
+  // bytes -- NOT just the type field. Using sizeof(wal_record_type_t) here made
+  // successive records overlap and land on unaligned offsets (the header has
+  // uint64_t fields), corrupting the WAL and tripping UBSan.
+  size_t content_size = sizeof(wal_record_t) + data_length;
+  // Round the stride up to 8 bytes so each record's header stays aligned
+  // (wal_buffer is malloc'd and wal_buffer_pos starts at 0).
+  size_t record_size = (content_size + 7u) & ~(size_t)7u;
 
   // Check if we need to flush the buffer
   if (storage_engine.wal_buffer_pos + record_size > WAL_BUFFER_SIZE)
@@ -87,7 +94,15 @@ int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, 
     memcpy(record->data, data, data_length);
   }
 
-  record->checksum = calculate_checksum(record, record_size - sizeof(record->checksum));
+  // Zero any alignment padding so we never flush uninitialized bytes to disk.
+  if (record_size > content_size)
+  {
+    memset((uint8_t *)record + content_size, 0, record_size - content_size);
+  }
+
+  // Checksum the real content only (padding excluded), matching what a reader
+  // would recompute over header+payload.
+  record->checksum = calculate_checksum(record, content_size - sizeof(record->checksum));
 
   storage_engine.wal_buffer_pos += record_size;
   atomic_fetch_add(&storage_engine.stats.wal_records_written, 1);

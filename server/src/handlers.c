@@ -69,9 +69,9 @@ int api_status_handler(connection_t *conn, http_request_t *request, http_respons
            "\"active_connections\": %lu"
            "}",
            g_server.server_name,
-           (unsigned long)g_server.total_connections,
-           (unsigned long)g_server.total_requests,
-           (unsigned long)g_server.active_connections_count);
+           (unsigned long)atomic_load(&g_server.total_connections),
+           (unsigned long)atomic_load(&g_server.total_requests),
+           (unsigned long)atomic_load(&g_server.active_connections_count));
 
   response->status = HTTP_OK;
   snprintf(response->version, sizeof(response->version), "HTTP/1.1");

@@ -16,6 +16,7 @@
 #include "route.h"
 #include "server.h"
 #include "ssl_util.h"
+#include "thread_pool.h"
 #include "worker.h"
 
 // Hook consumed by the shared HTTP layer (common/http_protocol.c) to fill the
@@ -46,8 +47,8 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   server->default_handler = default_file_handler;
   server->running = true;
 
-  // Initialize statistics mutex
-  pthread_mutex_init(&server->stats_mutex, NULL);
+  // Statistics counters are atomics (see http_server_t); memset above zeroed
+  // them, which is a valid initial value.
 
   // Create listening socket
   server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -91,6 +92,16 @@ int http_server_start(http_server_t *server)
   if (!server)
   {
     return -1;
+  }
+
+  // Spin up the storage thread pool before workers start accepting. If it
+  // can't be created we log and continue -- handlers fall back to running
+  // inline (correct, just less responsive under storage load).
+  server->pool = thread_pool_create(STORAGE_POOL_THREADS, STORAGE_POOL_THREADS,
+                                    STORAGE_POOL_THREADS, false, 1);
+  if (!server->pool)
+  {
+    fprintf(stderr, "thread_pool_create failed; blocking handlers will run inline\n");
   }
 
   for (int i = 0; i < server->worker_count; i++)
@@ -160,10 +171,8 @@ int http_server_start(http_server_t *server)
     worker_index = (worker_index + 1) % server->worker_count;
 
     // Update statistics
-    pthread_mutex_lock(&server->stats_mutex);
-    server->total_connections++;
-    server->active_connections_count++;
-    pthread_mutex_unlock(&server->stats_mutex);
+    atomic_fetch_add(&server->total_connections, 1);
+    atomic_fetch_add(&server->active_connections_count, 1);
   }
 
   return 0;
@@ -188,6 +197,15 @@ int http_server_cleanup(http_server_t *server)
   if (!server)
   {
     return -1;
+  }
+
+  // Tear the pool down first. thread_pool_destroy joins every pool thread, so
+  // once it returns no offload task can still be reading a connection or the
+  // worker's epoll fd -- which is what makes the worker drain below safe.
+  if (server->pool)
+  {
+    thread_pool_destroy(server->pool);
+    server->pool = NULL;
   }
 
   for (int i = 0; i < server->worker_count; i++)
@@ -234,8 +252,6 @@ int http_server_cleanup(http_server_t *server)
     route = next;
   }
   server->routes = NULL;
-
-  pthread_mutex_destroy(&server->stats_mutex);
 
   printf("HTTP server cleanup completed\n");
   return 0;

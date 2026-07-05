@@ -3,6 +3,7 @@
 
 #include <netinet/in.h>
 #include <openssl/ssl.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <sys/types.h>
@@ -44,6 +45,12 @@ typedef struct connection
 
   http_request_t request;
   http_response_t response;
+
+  // Set true while a worker thread has handed this connection off to the
+  // storage thread pool to run a blocking handler. While set, the owning
+  // worker must not touch the connection (no event handling, no timeout
+  // reaping) -- the pool thread owns it until it re-arms the socket for output.
+  _Atomic(bool) offloaded;
 
   // Timing
   time_t last_activity;

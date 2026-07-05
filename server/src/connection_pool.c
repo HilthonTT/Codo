@@ -26,9 +26,7 @@ connection_t *allocate_connection(http_server_t *server)
   // fields to -1 so cleanup_connection knows there is nothing to close yet.
   conn->socket_fd = -1;
   conn->file_fd = -1;
-  pthread_mutex_lock(&server->stats_mutex);
-  server->active_connections++;
-  pthread_mutex_unlock(&server->stats_mutex);
+  atomic_fetch_add(&server->active_connections, 1);
   stats_record_connection_accepted();
   return conn;
 }
@@ -42,16 +40,21 @@ void free_connection(http_server_t *server, connection_t *conn)
   cleanup_connection(conn);
   if (server)
   {
-    pthread_mutex_lock(&server->stats_mutex);
-    if (server->active_connections > 0)
+    // Saturating atomic decrements: never wrap below zero if free is somehow
+    // called more often than allocate.
+    int cur = atomic_load(&server->active_connections);
+    while (cur > 0 &&
+           !atomic_compare_exchange_weak(&server->active_connections, &cur, cur - 1))
     {
-      server->active_connections--;
+      // cur is reloaded by the CAS on failure; retry.
     }
-    if (server->active_connections_count > 0)
+
+    uint64_t cnt = atomic_load(&server->active_connections_count);
+    while (cnt > 0 &&
+           !atomic_compare_exchange_weak(&server->active_connections_count, &cnt, cnt - 1))
     {
-      server->active_connections_count--;
+      // retry
     }
-    pthread_mutex_unlock(&server->stats_mutex);
   }
   stats_record_connection_closed();
   free(conn);

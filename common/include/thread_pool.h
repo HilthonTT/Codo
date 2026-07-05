@@ -24,6 +24,10 @@ typedef struct task_queue
   pthread_cond_t condition;
   _Atomic(int) size;
   _Atomic(int) total_tasks;
+  // Set at teardown so a blocking task_queue_pop can wake and return instead of
+  // waiting forever for work that will never arrive (otherwise pthread_join in
+  // thread_pool_destroy deadlocks against idle workers).
+  _Atomic(bool) shutdown;
 } task_queue_t;
 
 // Worker thread statistics

@@ -18,6 +18,7 @@ int task_queue_init(task_queue_t *queue, int num_priorities)
     queue->num_priorities = num_priorities;
     atomic_init(&queue->size, 0);
     atomic_init(&queue->total_tasks, 0);
+    atomic_init(&queue->shutdown, false);
 
     if (pthread_mutex_init(&queue->mutex, NULL) != 0)
     {
@@ -63,9 +64,17 @@ task_t *task_queue_pop(task_queue_t *queue)
 {
     pthread_mutex_lock(&queue->mutex);
 
-    while (atomic_load(&queue->size) == 0)
+    while (atomic_load(&queue->size) == 0 && !atomic_load(&queue->shutdown))
     {
         pthread_cond_wait(&queue->condition, &queue->mutex);
+    }
+
+    // Woken for shutdown with nothing to do: return NULL so the worker loop can
+    // observe pool->shutdown and exit cleanly.
+    if (atomic_load(&queue->size) == 0)
+    {
+        pthread_mutex_unlock(&queue->mutex);
+        return NULL;
     }
 
     task_t *task = NULL;
@@ -475,8 +484,23 @@ void thread_pool_destroy(thread_pool_t *pool)
     // Signal shutdown
     atomic_store(&pool->shutdown, true);
 
-    // Wake up all threads
+    // Flag every queue as shutting down and wake all waiters, so workers parked
+    // in task_queue_pop return NULL and exit instead of blocking forever.
+    atomic_store(&pool->task_queue.shutdown, true);
+    pthread_mutex_lock(&pool->task_queue.mutex);
     pthread_cond_broadcast(&pool->task_queue.condition);
+    pthread_mutex_unlock(&pool->task_queue.mutex);
+
+    if (pool->local_queues)
+    {
+        for (int i = 0; i < pool->max_threads; i++)
+        {
+            atomic_store(&pool->local_queues[i].shutdown, true);
+            pthread_mutex_lock(&pool->local_queues[i].mutex);
+            pthread_cond_broadcast(&pool->local_queues[i].condition);
+            pthread_mutex_unlock(&pool->local_queues[i].mutex);
+        }
+    }
 
     // Wait for threads to finish
     for (int i = 0; i < pool->num_threads; i++)

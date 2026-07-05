@@ -26,8 +26,21 @@ int add_route(http_server_t *server, const char *pattern,
   route->pattern[sizeof(route->pattern) - 1] = '\0';
   route->method = method;
   route->handler = handler;
+  route->offload = false;
   route->next = server->routes;
   server->routes = route;
+  return 0;
+}
+
+int add_route_offloaded(http_server_t *server, const char *pattern,
+                        http_method_t method, route_handler_t handler)
+{
+  if (add_route(server, pattern, method, handler) != 0)
+  {
+    return -1;
+  }
+  // add_route prepends, so the route we just created is the list head.
+  server->routes->offload = true;
   return 0;
 }
 

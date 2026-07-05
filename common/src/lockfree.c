@@ -112,7 +112,7 @@ bool lock_free_queue_enqueue(lockfree_queue_t *queue, void *data)
   queue_node_t *new_node = malloc(sizeof(queue_node_t));
   if (!new_node)
   {
-    return NULL;
+    return false;
   }
 
   atomic_store(&new_node->data, data);
