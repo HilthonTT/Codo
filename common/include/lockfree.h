@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MAX_THREAD 64
+#define MAX_THREADS 64
 #define MAX_HAZARD_POINTERS 8
 
 #define HASH_TABLE_SIZE 1024
