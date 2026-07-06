@@ -26,8 +26,17 @@ typedef struct
 {
   worker_thread_t *worker;
   connection_t *conn;
-  route_t *route;
+  route_handler_t handler;
 } offload_task_t;
+
+// Storage-pool priority for a request: reads jump ahead of writes so a GET
+// (page read) isn't stuck behind a burst of WAL-fsyncing writes.
+static int request_priority(const http_request_t *request)
+{
+  return (request->method == HTTP_GET || request->method == HTTP_HEAD)
+             ? STORAGE_PRIORITY_READ
+             : STORAGE_PRIORITY_WRITE;
+}
 
 // Shared tail for a completed request (inline or offloaded): account the
 // request, reset the read buffer for the next one, and arm the socket for the
@@ -54,10 +63,10 @@ static void run_offloaded_handler(void *arg)
   offload_task_t *task = (offload_task_t *)arg;
   worker_thread_t *worker = task->worker;
   connection_t *conn = task->conn;
-  route_t *route = task->route;
+  route_handler_t handler = task->handler;
   free(task);
 
-  if (route->handler(conn, &conn->request, &conn->response) != 0 &&
+  if (run_with_middleware(conn, &conn->request, &conn->response, handler) != 0 &&
       conn->write_buffer_size == 0)
   {
     send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
@@ -351,18 +360,34 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
 
   route_t *route = find_route(&g_server, conn->request.uri, conn->request.method);
 
-  // Blocking, storage-backed handlers are dispatched to the thread pool so a
-  // WAL fsync or page read/write can't freeze this worker's whole event loop.
-  // Gate on g_server.running: once shutdown starts, http_server_cleanup tears
-  // the pool down, so we must stop submitting and run inline instead.
-  if (route && route->handler && route->offload && g_server.pool && g_server.running)
+  // Pick the handler and decide whether it blocks. A matched route offloads per
+  // its own flag; an unmatched request falls to the default file handler, which
+  // hits the disk (stat + read), so it's treated as blocking and offloaded too.
+  route_handler_t handler = NULL;
+  bool offload = false;
+  if (route && route->handler)
+  {
+    handler = route->handler;
+    offload = route->offload;
+  }
+  else if (g_server.default_handler)
+  {
+    handler = g_server.default_handler;
+    offload = true;
+  }
+
+  // Blocking handlers are dispatched to the thread pool so a WAL fsync or page/
+  // file read can't freeze this worker's whole event loop. Gate on
+  // g_server.running: once shutdown starts, http_server_cleanup tears the pool
+  // down, so we must stop submitting and run inline instead.
+  if (handler && offload && g_server.pool && g_server.running)
   {
     offload_task_t *task = malloc(sizeof(*task));
     if (task)
     {
       task->worker = worker;
       task->conn = conn;
-      task->route = route;
+      task->handler = handler;
 
       // Take the connection off the interest set (no EPOLLIN/OUT while the pool
       // owns it) and flag it so the event loop and timeout sweep leave it
@@ -373,7 +398,8 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
       off_ev.data.ptr = conn;
       epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &off_ev);
 
-      if (thread_pool_submit(g_server.pool, run_offloaded_handler, task, 0) == 0)
+      if (thread_pool_submit(g_server.pool, run_offloaded_handler, task,
+                             request_priority(&conn->request)) == 0)
       {
         return 0; // handled asynchronously; pool arms EPOLLOUT when done
       }
@@ -385,9 +411,9 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     // A malloc failure likewise falls through to inline handling.
   }
 
-  if (route && route->handler)
+  if (handler)
   {
-    if (route->handler(conn, &conn->request, &conn->response) != 0)
+    if (run_with_middleware(conn, &conn->request, &conn->response, handler) != 0)
     {
       // Handler reported an error; if it didn't already prepare a response,
       // send a generic one.
@@ -396,10 +422,6 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
         send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
       }
     }
-  }
-  else if (g_server.default_handler)
-  {
-    g_server.default_handler(conn, &conn->request, &conn->response);
   }
   else
   {

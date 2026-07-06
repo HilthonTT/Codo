@@ -98,7 +98,7 @@ int http_server_start(http_server_t *server)
   // can't be created we log and continue -- handlers fall back to running
   // inline (correct, just less responsive under storage load).
   server->pool = thread_pool_create(STORAGE_POOL_THREADS, STORAGE_POOL_THREADS,
-                                    STORAGE_POOL_THREADS, false, 1);
+                                    STORAGE_POOL_THREADS, false, STORAGE_POOL_PRIORITIES);
   if (!server->pool)
   {
     fprintf(stderr, "thread_pool_create failed; blocking handlers will run inline\n");

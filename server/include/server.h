@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include "connection.h"
+#include "middleware.h"
 #include "route.h"
 #include "thread_pool.h"
 #include "worker.h"
@@ -38,6 +39,11 @@ typedef struct http_server
   // Route handling
   route_t *routes;
   route_handler_t default_handler;
+
+  // Middlewares wrapping every route handler, run in registration order (the
+  // first registered is the outermost). See middleware.h.
+  middleware_fn_t middlewares[MAX_MIDDLEWARES];
+  int middleware_count;
 
   // Connection pool
   connection_t *connection_pool;

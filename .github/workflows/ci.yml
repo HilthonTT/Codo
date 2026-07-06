@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (e.g. rapid pushes to a PR branch).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-smoke-test:
+    name: Build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev
+
+      - name: Build
+        run: make
+
+      - name: Smoke test (server responds + middleware logs)
+        run: |
+          set -euo pipefail
+          root="$(mktemp -d)"
+          printf 'hello-ci' > "$root/index.html"
+
+          # Start the server on a throwaway port with the temp doc root.
+          ./bin/codo 18080 "$root" > server.log 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+
+          # Wait for the listener to come up (up to ~5s).
+          for _ in $(seq 1 50); do
+            if curl -fs -o /dev/null http://127.0.0.1:18080/index.html; then
+              break
+            fi
+            sleep 0.1
+          done
+
+          # Static file (offloaded default handler) must return the body.
+          body="$(curl -fs http://127.0.0.1:18080/index.html)"
+          test "$body" = "hello-ci"
+
+          # API route must return 200.
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/api/hello)"
+          test "$code" = "200"
+
+          # Unknown path must 404 via the default handler.
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18080/nope.html)"
+          test "$code" = "404"
+
+          # The logging middleware must have recorded the requests.
+          grep -q 'GET /api/hello -> 200' server.log
+          grep -q 'GET /nope.html -> 404' server.log
+
+          echo "--- server access log ---"
+          cat server.log
+
+      - name: Upload server log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-log
+          path: server.log
+          if-no-files-found: ignore
+
+  sanitizers:
+    name: Sanitizer build (ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev
+
+      # Compile the whole tree with -fsanitize=address,undefined so memory and
+      # UB regressions in the request path are caught at build time.
+      - name: Build with sanitizers
+        run: make debug

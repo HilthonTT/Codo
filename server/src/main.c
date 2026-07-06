@@ -7,6 +7,7 @@
 
 #include "btree_storage.h"
 #include "handlers.h"
+#include "middleware.h"
 #include "route.h"
 #include "server.h"
 #include "ssl_util.h"
@@ -77,6 +78,10 @@ int main(int argc, char *argv[])
     return 1;
   }
   todo_api_init();
+
+  // Register middleware first -- it wraps every route handler below. The
+  // logging middleware is registered first so it times the whole chain.
+  add_middleware(&g_server, logging_middleware);
 
   // Add example routes
   add_route(&g_server, "/api/hello", HTTP_GET, api_hello_handler);
