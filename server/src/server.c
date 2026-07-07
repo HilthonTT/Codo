@@ -110,6 +110,10 @@ int http_server_start(http_server_t *server)
     worker->thread_id = i;
     worker->running = true;
 
+    // Guards worker->connections against the accept loop, the worker's own
+    // event/timeout traversal, and pool-thread re-arms.
+    pthread_mutex_init(&worker->connections_lock, NULL);
+
     // Create epoll instance for this worker
     worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (worker->epoll_fd < 0)
@@ -153,26 +157,18 @@ int http_server_start(http_server_t *server)
     set_socket_nonblocking(client_fd);
     set_socket_options(client_fd);
 
-    // Distribute connection to worker
+    // Distribute connection to worker. handle_new_connection records
+    // client_addr on the node before publishing it, and owns client_fd on
+    // failure (it closes it), so we must not close it again here.
     worker_thread_t *worker = &server->workers[worker_index];
-    if (handle_new_connection(worker, client_fd) != 0)
+    if (handle_new_connection(worker, client_fd, client_addr) == 0)
     {
-      close(client_fd);
-    }
-    else
-    {
-      // Record client address on the just-allocated connection (head of list).
-      if (worker->connections)
-      {
-        worker->connections->client_addr = client_addr;
-      }
+      // Only count connections that were actually handed off successfully.
+      atomic_fetch_add(&server->total_connections, 1);
+      atomic_fetch_add(&server->active_connections_count, 1);
     }
 
     worker_index = (worker_index + 1) % server->worker_count;
-
-    // Update statistics
-    atomic_fetch_add(&server->total_connections, 1);
-    atomic_fetch_add(&server->active_connections_count, 1);
   }
 
   return 0;
@@ -199,29 +195,55 @@ int http_server_cleanup(http_server_t *server)
     return -1;
   }
 
-  // Tear the pool down first. thread_pool_destroy joins every pool thread, so
-  // once it returns no offload task can still be reading a connection or the
-  // worker's epoll fd -- which is what makes the worker drain below safe.
-  if (server->pool)
-  {
-    thread_pool_destroy(server->pool);
-    server->pool = NULL;
-  }
-
+  // Stop accepting and tell the workers to exit. Do this BEFORE touching the
+  // pool so no worker is still deciding to submit against it.
+  server->running = false;
   for (int i = 0; i < server->worker_count; i++)
   {
     server->workers[i].running = false;
   }
+
+  // Join the workers first. A worker only ever submits to the pool from its own
+  // loop, so once all workers have exited no new offload task can be submitted
+  // to (a soon-to-be-freed) pool. Each worker's drain leaves any still-running
+  // offloaded connections linked for us to free once the pool is gone.
   for (int i = 0; i < server->worker_count; i++)
   {
     if (server->workers[i].thread)
     {
       pthread_join(server->workers[i].thread, NULL);
     }
+  }
+
+  // Now tear the pool down. thread_pool_destroy joins every pool thread, so
+  // once it returns no offload task can still reference a connection or a
+  // worker's epoll fd.
+  if (server->pool)
+  {
+    thread_pool_destroy(server->pool);
+    server->pool = NULL;
+  }
+
+  // Free any connections the workers deferred (they were offloaded at drain
+  // time) and release per-worker resources -- safe now that no pool thread is
+  // left to re-arm them.
+  for (int i = 0; i < server->worker_count; i++)
+  {
+    connection_t *conn = server->workers[i].connections;
+    while (conn)
+    {
+      connection_t *next = conn->next;
+      free_connection(server, conn);
+      conn = next;
+    }
+    server->workers[i].connections = NULL;
+    server->workers[i].connection_count = 0;
+
     if (server->workers[i].epoll_fd > 0)
     {
       close(server->workers[i].epoll_fd);
     }
+    pthread_mutex_destroy(&server->workers[i].connections_lock);
   }
 
   // Close listening socket

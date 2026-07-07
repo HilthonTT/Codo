@@ -125,6 +125,16 @@ bool is_valid_uri(const char *uri)
     return false;
   }
 
+  // Also reject a trailing ".." segment with no slash after it: the whole URI is
+  // ".." or it ends with "/.." (e.g. "/", "/foo/.."), which the "../" check above
+  // would miss.
+  size_t len = strlen(uri);
+  if (len >= 2 && uri[len - 1] == '.' && uri[len - 2] == '.' &&
+      (len == 2 || uri[len - 3] == '/'))
+  {
+    return false;
+  }
+
   return true;
 }
 
@@ -160,19 +170,23 @@ char *url_decode(const char *url)
       int lo = hex_to_int(url[i + 2]);
       if (hi >= 0 && lo >= 0)
       {
-        decoded[j++] = (char)((hi << 4) | lo);
+        int c = (hi << 4) | lo;
+        // Reject an encoded NUL (%00): decoding it would embed a NUL that
+        // truncates the resulting path and lets input smuggle past later
+        // string-based checks.
+        if (c == 0)
+        {
+          free(decoded);
+          return NULL;
+        }
+        decoded[j++] = (char)c;
         i += 2;
         continue;
       }
     }
-    if (url[i] == '+')
-    {
-      decoded[j++] = ' ';
-    }
-    else
-    {
-      decoded[j++] = url[i];
-    }
+    // '+' is copied literally. The '+' -> space convention only applies to
+    // query-string values, not to paths, so decoding it here would be wrong.
+    decoded[j++] = url[i];
   }
   decoded[j] = '\0';
   return decoded;

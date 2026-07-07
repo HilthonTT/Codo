@@ -9,6 +9,12 @@
 // their own), so this shared layer carries no dependency on http_server_t.
 const char *http_server_name(void);
 
+// Parse a Content-Length field value safely. On success returns 0 and writes
+// the value to *out. Returns -1 for empty, non-numeric, negative, or
+// overflowing input (leading/trailing whitespace is tolerated). Used both by
+// request parsing and by the worker's message-framing check.
+int http_parse_content_length(const char *value, size_t *out);
+
 int parse_http_request(connection_t *conn, http_request_t *request);
 int generate_http_response(connection_t *conn, http_response_t *response);
 int send_http_response(connection_t *conn, http_response_t *response);

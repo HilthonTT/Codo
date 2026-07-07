@@ -62,35 +62,13 @@ int handle_websocket_upgrade(connection_t *conn, http_request_t *request)
   {
     return -1;
   }
-  if (!request->is_websocket_upgrade || request->websocket_key[0] == '\0')
-  {
-    return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid WebSocket upgrade");
-  }
 
-  char accept_key[64];
-  generate_websocket_accept_key(request->websocket_key, accept_key);
-
-  int len = snprintf(conn->write_buffer, MAX_RESPONSE_SIZE,
-                     "HTTP/1.1 101 Switching Protocols\r\n"
-                     "Upgrade: websocket\r\n"
-                     "Connection: Upgrade\r\n"
-                     "Sec-WebSocket-Accept: %s\r\n"
-                     "\r\n",
-                     accept_key);
-  if (len < 0 || (size_t)len >= MAX_RESPONSE_SIZE)
-  {
-    return -1;
-  }
-
-  conn->write_buffer_pos = 0;
-  conn->write_buffer_size = (size_t)len;
-  conn->state = CONN_STATE_WRITING_RESPONSE;
-  conn->websocket_handshake_complete = true;
-  // The connection stays open for WebSocket framing once the handshake is
-  // flushed; we mark the request as keep-alive so handle_client_write does not
-  // tear it down after writing.
-  conn->request.keep_alive = true;
-  return 0;
+  // WebSocket framing (RFC 6455) is not implemented. Returning 101 here and
+  // then reverting to HTTP parsing on the same stream is a request-smuggling /
+  // mis-framing hazard, so we deliberately do NOT accept the upgrade: reply
+  // 501 and let the connection be torn down. No connection is ever left in the
+  // ambiguous post-101 state, and websocket_handshake_complete stays false.
+  return send_error_response(conn, HTTP_NOT_IMPLEMENTED, "WebSocket not supported");
 }
 
 int handle_websocket_frame(connection_t *conn, const char *data, size_t length)

@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,82 @@
 #include "http_types.h"
 #include "mime.h"
 #include "util.h"
+
+int http_parse_content_length(const char *value, size_t *out)
+{
+  if (!value || !out)
+  {
+    return -1;
+  }
+
+  // Skip leading whitespace.
+  while (*value == ' ' || *value == '\t')
+  {
+    value++;
+  }
+  // Content-Length must be a bare digit string. Reject empty and any explicit
+  // sign -- a leading '-' would otherwise be silently wrapped by strtoul.
+  if (*value == '\0' || *value == '-' || *value == '+')
+  {
+    return -1;
+  }
+
+  errno = 0;
+  char *endptr = NULL;
+  unsigned long parsed = strtoul(value, &endptr, 10);
+  if (endptr == value || errno == ERANGE)
+  {
+    return -1;
+  }
+
+  // Only trailing whitespace may follow the digits.
+  while (*endptr == ' ' || *endptr == '\t')
+  {
+    endptr++;
+  }
+  if (*endptr != '\0')
+  {
+    return -1;
+  }
+  if (parsed > (unsigned long)SIZE_MAX)
+  {
+    return -1;
+  }
+
+  *out = (size_t)parsed;
+  return 0;
+}
+
+// True if `value` contains a CR or LF. Header names/values carrying these
+// could inject extra response headers (response splitting), so we refuse to
+// emit them.
+static bool header_field_has_crlf(const char *field)
+{
+  for (const char *c = field; *c; c++)
+  {
+    if (*c == '\r' || *c == '\n')
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Remove any CR/LF bytes from a stored header field in place. Header parsing
+// only strips the single terminating '\r'; a lone embedded '\r' would survive
+// and could leak into logs or an echoed response, so drop them all here.
+static void strip_crlf_inplace(char *s)
+{
+  char *dst = s;
+  for (char *src = s; *src; src++)
+  {
+    if (*src != '\r' && *src != '\n')
+    {
+      *dst++ = *src;
+    }
+  }
+  *dst = '\0';
+}
 
 int send_http_response(connection_t *conn, http_response_t *response)
 {
@@ -51,6 +128,13 @@ int send_http_response(connection_t *conn, http_response_t *response)
   // Add custom headers
   for (int i = 0; i < response->header_count; i++)
   {
+    // Refuse to emit a header whose name or value smuggles CR/LF: a handler
+    // that echoes client data must not be able to split the response.
+    if (header_field_has_crlf(response->headers[i].name) ||
+        header_field_has_crlf(response->headers[i].value))
+    {
+      return -1;
+    }
     int written = snprintf(header_buffer + header_len,
                            sizeof(header_buffer) - (size_t)header_len,
                            "%s: %s\r\n",
@@ -285,18 +369,28 @@ int parse_http_request(connection_t *conn, http_request_t *request)
 
     if (*p == '\0')
     {
-      // End of headers -- body (if any) starts here.
+      // End of headers -- body (if any) starts here. The worker only dispatches
+      // once Content-Length bytes have arrived, so bound the body to the
+      // declared length rather than grabbing every trailing byte (which could
+      // include a pipelined next request).
       p = next_end + 1;
       if (p < end)
       {
         size_t blen = (size_t)(end - p);
-        request->body = malloc(blen + 1);
-        if (request->body)
+        if (request->content_length > 0 && request->content_length < blen)
         {
-          memcpy(request->body, p, blen);
-          request->body[blen] = '\0';
-          request->body_length = blen;
+          blen = request->content_length;
         }
+        request->body = malloc(blen + 1);
+        if (!request->body)
+        {
+          // Signal an internal error so the caller replies 500 rather than
+          // proceeding as if the request carried no body.
+          return -2;
+        }
+        memcpy(request->body, p, blen);
+        request->body[blen] = '\0';
+        request->body_length = blen;
       }
       break;
     }
@@ -324,17 +418,39 @@ int parse_http_request(connection_t *conn, http_request_t *request)
       request->headers[request->header_count].name[255] = '\0';
       strncpy(request->headers[request->header_count].value, value, 2047);
       request->headers[request->header_count].value[2047] = '\0';
+      // Drop any embedded CR/LF so stored fields can't smuggle control bytes.
+      strip_crlf_inplace(request->headers[request->header_count].name);
+      strip_crlf_inplace(request->headers[request->header_count].value);
       request->header_count++;
     }
 
     // Check for special headers
     if (strcasecmp(name, "Connection") == 0)
     {
-      request->keep_alive = (strcasecmp(value, "keep-alive") == 0);
+      // Connection is a comma-separated token list; match keep-alive/upgrade/
+      // close as tokens (case-insensitive) so "keep-alive, Upgrade" is not
+      // mistaken for a close. An explicit "close" token wins.
+      if (strcasestr(value, "close"))
+      {
+        request->keep_alive = false;
+      }
+      else if (strcasestr(value, "keep-alive") || strcasestr(value, "upgrade"))
+      {
+        request->keep_alive = true;
+      }
     }
     else if (strcasecmp(name, "Content-Length") == 0)
     {
-      request->content_length = (size_t)atol(value);
+      if (http_parse_content_length(value, &request->content_length) != 0)
+      {
+        return -1;
+      }
+    }
+    else if (strcasecmp(name, "Transfer-Encoding") == 0)
+    {
+      // Chunked (and any other transfer coding) decoding is not implemented;
+      // reject rather than risk mis-framing the message body.
+      return -1;
     }
     else if (strcasecmp(name, "Expect") == 0)
     {

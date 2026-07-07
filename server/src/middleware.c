@@ -69,10 +69,22 @@ int logging_middleware(connection_t *conn, http_request_t *request,
     strcpy(client_ip, "-");
   }
 
+  // Sanitize control bytes in the URI before logging so a crafted request line
+  // cannot inject terminal escapes or forge log lines. The URI has no spaces or
+  // newlines (parsed with %2047s) but may carry other control characters.
+  char safe_uri[sizeof(request->uri)];
+  size_t ui = 0;
+  for (const char *u = request->uri; *u && ui + 1 < sizeof(safe_uri); u++)
+  {
+    unsigned char c = (unsigned char)*u;
+    safe_uri[ui++] = (c < 0x20 || c == 0x7f) ? '?' : (char)c;
+  }
+  safe_uri[ui] = '\0';
+
   printf("%s %s %s -> %d (%.2f ms)\n",
          client_ip,
          http_method_to_string(request->method),
-         request->uri,
+         safe_uri,
          response->status,
          elapsed_ms);
   fflush(stdout);

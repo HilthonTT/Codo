@@ -122,25 +122,50 @@ static const char *skip_ws(const char *p, const char *end)
 // pointer to the first non-whitespace value character, or NULL if not found.
 static const char *find_field(const char *body, size_t len, const char *field)
 {
-  char needle[64];
-  int n = snprintf(needle, sizeof(needle), "\"%s\"", field);
-  if (n < 0 || (size_t)n >= sizeof(needle))
-  {
-    return NULL;
-  }
-
-  size_t nlen = (size_t)n;
+  size_t field_len = strlen(field);
   const char *end = body + len;
-  for (const char *p = body; p + nlen <= end; p++)
+  const char *p = body;
+
+  // Walk the object one JSON string at a time so that "field" is only matched
+  // when it appears as an object key (its closing quote is followed by ':'),
+  // never when it appears inside a string value.
+  while (p < end)
   {
-    if (memcmp(p, needle, nlen) == 0)
+    if (*p != '"')
     {
-      const char *colon = skip_ws(p + nlen, end);
-      if (colon < end && *colon == ':')
+      p++;
+      continue;
+    }
+
+    // p is at a string's opening quote; scan to its unescaped closing quote.
+    const char *str = p + 1;
+    const char *q = str;
+    while (q < end && *q != '"')
+    {
+      if (*q == '\\' && q + 1 < end)
       {
-        return skip_ws(colon + 1, end);
+        q++; // skip the escaped character
+      }
+      q++;
+    }
+    if (q >= end)
+    {
+      return NULL; // unterminated string
+    }
+
+    // A key is a string immediately followed (after whitespace) by ':'.
+    const char *after = skip_ws(q + 1, end);
+    if (after < end && *after == ':')
+    {
+      if ((size_t)(q - str) == field_len && memcmp(str, field, field_len) == 0)
+      {
+        return skip_ws(after + 1, end);
       }
     }
+
+    // Not our key: advance past this string; a following value string is thus
+    // skipped rather than being mistaken for a key.
+    p = q + 1;
   }
   return NULL;
 }
@@ -523,15 +548,23 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
 
-  db_delete(txn, key, key_len);
-  int rc = db_insert(txn, key, key_len, value, (size_t)value_len);
-  commit_transaction(txn);
-  free(txn);
+  int rc = db_delete(txn, key, key_len);
+  if (rc == 0)
+  {
+    rc = db_insert(txn, key, key_len, value, (size_t)value_len);
+  }
 
   if (rc != 0)
   {
+    // Either the delete or the insert failed; roll back so a committed delete
+    // can never leave the todo lost while we return an error.
+    abort_transaction(txn);
+    free(txn);
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Update failed");
   }
+
+  commit_transaction(txn);
+  free(txn);
 
   return send_json(conn, request, response, HTTP_OK, value);
 }

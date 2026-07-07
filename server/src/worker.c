@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/epoll.h>
 #include <time.h>
 #include <unistd.h>
@@ -89,8 +90,15 @@ static void run_offloaded_handler(void *arg)
   ev.events = EPOLLOUT | EPOLLET;
   ev.data.ptr = conn;
 
+  // Release ownership and re-arm under the worker's list lock. The worker's
+  // free paths take the same lock and re-check `offloaded`, so it cannot see
+  // offloaded=false, free the connection, and close socket_fd in between --
+  // which would leave this MOD acting on a stale/reused fd with a dangling
+  // pointer stored in the epoll data.
+  pthread_mutex_lock(&worker->connections_lock);
   atomic_store(&conn->offloaded, false);
   epoll_ctl(epoll_fd, EPOLL_CTL_MOD, socket_fd, &ev);
+  pthread_mutex_unlock(&worker->connections_lock);
 }
 
 // Unlink a connection from its owning worker's list.
@@ -120,29 +128,53 @@ static void remove_connection_from_worker(worker_thread_t *worker, connection_t 
   }
 }
 
-int handle_new_connection(worker_thread_t *worker, int client_fd)
+// Tear a connection down from the worker thread. Guarded by the list lock and a
+// final `offloaded` re-check: a storage-pool thread re-arms offloaded
+// connections under the same lock, so this never frees (and closes the fd of) a
+// connection the pool is still handing back.
+static void drop_connection(worker_thread_t *worker, connection_t *conn)
+{
+  pthread_mutex_lock(&worker->connections_lock);
+  if (!atomic_load(&conn->offloaded))
+  {
+    remove_connection_from_worker(worker, conn);
+    free_connection(&g_server, conn);
+  }
+  pthread_mutex_unlock(&worker->connections_lock);
+}
+
+int handle_new_connection(worker_thread_t *worker, int client_fd,
+                          struct sockaddr_in client_addr)
 {
   // Allocate connection structure
   connection_t *conn = allocate_connection(&g_server);
   if (!conn)
   {
+    // No connection took ownership of the fd; close it here so the accept loop
+    // never double-closes it.
+    close(client_fd);
     return -1;
   }
 
   conn->socket_fd = client_fd;
+  // Set client_addr BEFORE publishing the node into the list: once it is
+  // linked, the worker thread may inspect (or reap) it concurrently.
+  conn->client_addr = client_addr;
   conn->state = CONN_STATE_READING_REQUEST;
   conn->last_activity = time(NULL);
   conn->connection_time = conn->last_activity;
 
-  // Add to worker's connection list
+  // Publish into the worker's connection list. The worker thread traverses and
+  // unlinks this same list, so the insert must hold the list lock.
+  pthread_mutex_lock(&worker->connections_lock);
   conn->next = worker->connections;
   if (worker->connections)
   {
     worker->connections->prev = conn;
   }
-
   worker->connections = conn;
   worker->connection_count++;
+  pthread_mutex_unlock(&worker->connections_lock);
 
   // Add to epoll
   struct epoll_event event;
@@ -152,8 +184,11 @@ int handle_new_connection(worker_thread_t *worker, int client_fd)
   if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_ADD, client_fd, &event) < 0)
   {
     perror("epoll_ctl");
+    pthread_mutex_lock(&worker->connections_lock);
     remove_connection_from_worker(worker, conn);
-    cleanup_connection(conn);
+    pthread_mutex_unlock(&worker->connections_lock);
+    // free_connection runs cleanup_connection, which closes client_fd exactly
+    // once. The accept loop must not close it again on this -1 return.
     free_connection(&g_server, conn);
     return -1;
   }
@@ -210,8 +245,7 @@ void *worker_thread_function(void *arg)
       {
         // Connection error or hangup
         stats_record_error();
-        remove_connection_from_worker(worker, conn);
-        free_connection(&g_server, conn);
+        drop_connection(worker, conn);
         continue;
       }
 
@@ -220,8 +254,7 @@ void *worker_thread_function(void *arg)
         // Data available for reading
         if (handle_client_data(worker, conn) != 0)
         {
-          remove_connection_from_worker(worker, conn);
-          free_connection(&g_server, conn);
+          drop_connection(worker, conn);
           continue;
         }
       }
@@ -230,14 +263,15 @@ void *worker_thread_function(void *arg)
       {
         if (handle_client_write(worker, conn) != 0)
         {
-          remove_connection_from_worker(worker, conn);
-          free_connection(&g_server, conn);
+          drop_connection(worker, conn);
           continue;
         }
       }
     }
 
-    // Check for connection timeouts
+    // Check for connection timeouts. Traversal + unlink under the list lock so
+    // it can't race the accept loop's insert or a pool thread's re-arm.
+    pthread_mutex_lock(&worker->connections_lock);
     time_t current_time = time(NULL);
     connection_t *conn = worker->connections;
 
@@ -255,23 +289,131 @@ void *worker_thread_function(void *arg)
 
       conn = next;
     }
+    pthread_mutex_unlock(&worker->connections_lock);
   }
 
   // Drain the worker's connection list before the thread exits so we don't
-  // leak the per-connection buffers on shutdown.
+  // leak the per-connection buffers on shutdown. A connection a storage-pool
+  // thread is still running (offloaded) must NOT be freed here -- the pool
+  // thread may still reference it. Leave those linked; http_server_cleanup
+  // frees them once the pool has been destroyed.
   connection_t *conn = worker->connections;
+  connection_t *offloaded_head = NULL;
+  int offloaded_count = 0;
   while (conn)
   {
     connection_t *next = conn->next;
-    free_connection(&g_server, conn);
+    if (atomic_load(&conn->offloaded))
+    {
+      conn->prev = NULL;
+      conn->next = offloaded_head;
+      if (offloaded_head)
+      {
+        offloaded_head->prev = conn;
+      }
+      offloaded_head = conn;
+      offloaded_count++;
+    }
+    else
+    {
+      free_connection(&g_server, conn);
+    }
     conn = next;
   }
-  worker->connections = NULL;
-  worker->connection_count = 0;
+  worker->connections = offloaded_head;
+  worker->connection_count = offloaded_count;
 
   printf("Worker thread %d stopping\n", worker->thread_id);
 
   return NULL;
+}
+
+// Decide whether a full request (headers plus any declared body) has arrived in
+// the read buffer, without mutating it. Content-Length may only be known after
+// the header terminator, and body bytes can straggle in over several reads, so
+// this is checked before every dispatch. Returns:
+//   1  request fully received
+//   0  incomplete, keep reading
+//  -1  malformed Content-Length -> 400
+//  -2  Transfer-Encoding present (chunked unsupported) -> 501
+//  -3  declared body exceeds max_body -> 413
+static int check_request_frame(connection_t *conn, size_t max_body)
+{
+  const char *buf = conn->read_buffer;
+
+  size_t term_len = 4;
+  const char *hdr_end = strstr(buf, "\r\n\r\n");
+  if (!hdr_end)
+  {
+    hdr_end = strstr(buf, "\n\n");
+    term_len = 2;
+  }
+  if (!hdr_end)
+  {
+    return 0; // header terminator not seen yet
+  }
+
+  size_t header_len = (size_t)(hdr_end - buf) + term_len;
+
+  // Walk the header lines (request line first, then fields) looking for
+  // Content-Length / Transfer-Encoding. Non-mutating so a later real parse
+  // still sees an intact buffer.
+  size_t content_length = 0;
+  const char *line = buf;
+  while (line < hdr_end)
+  {
+    const char *nl = memchr(line, '\n', (size_t)(hdr_end - line));
+    const char *line_end = nl ? nl : hdr_end;
+    size_t line_len = (size_t)(line_end - line);
+    if (line_len > 0 && line[line_len - 1] == '\r')
+    {
+      line_len--;
+    }
+
+    const char *colon = memchr(line, ':', line_len);
+    if (colon)
+    {
+      size_t name_len = (size_t)(colon - line);
+      if (name_len == 14 && strncasecmp(line, "Content-Length", 14) == 0)
+      {
+        const char *v = colon + 1;
+        const char *v_end = line + line_len;
+        char tmp[32];
+        size_t vl = (size_t)(v_end - v);
+        if (vl >= sizeof(tmp))
+        {
+          return -1; // implausibly long value
+        }
+        memcpy(tmp, v, vl);
+        tmp[vl] = '\0';
+        if (http_parse_content_length(tmp, &content_length) != 0)
+        {
+          return -1;
+        }
+      }
+      else if (name_len == 17 && strncasecmp(line, "Transfer-Encoding", 17) == 0)
+      {
+        return -2; // chunked (or any coding) decoding is not implemented
+      }
+    }
+
+    if (!nl)
+    {
+      break;
+    }
+    line = nl + 1;
+  }
+
+  if (content_length > max_body)
+  {
+    return -3;
+  }
+  if (header_len + content_length > conn->read_buffer_pos)
+  {
+    return 0; // full body not yet received
+  }
+
+  return 1;
 }
 
 int handle_client_data(worker_thread_t *worker, connection_t *conn)
@@ -343,10 +485,27 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     conn->last_activity = time(NULL);
   }
 
-  // Need at least the end-of-headers marker before we attempt a parse.
-  if (!strstr(conn->read_buffer, "\r\n\r\n") && !strstr(conn->read_buffer, "\n\n"))
+  // Wait until the full request -- headers plus any Content-Length body -- has
+  // arrived before dispatching. A body can straggle in over several reads.
+  int frame = check_request_frame(conn, g_server.max_request_size);
+  if (frame == 0)
   {
-    return 0; // wait for more data
+    return 0; // need more data
+  }
+  if (frame == -2)
+  {
+    send_error_response(conn, HTTP_NOT_IMPLEMENTED, "Transfer-Encoding not supported");
+    return finalize_response(worker, conn);
+  }
+  if (frame == -3)
+  {
+    send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
+    return finalize_response(worker, conn);
+  }
+  if (frame < 0)
+  {
+    send_error_response(conn, HTTP_BAD_REQUEST, "Bad Request");
+    return finalize_response(worker, conn);
   }
 
   conn->state = CONN_STATE_PROCESSING;
@@ -354,7 +513,12 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   int parse_result = parse_http_request(conn, &conn->request);
   if (parse_result != 0)
   {
-    send_error_response(conn, HTTP_BAD_REQUEST, "Bad Request");
+    // parse_http_request returns -2 for an internal failure (e.g. body malloc)
+    // and -1 for a malformed request.
+    http_status_t status =
+        (parse_result == -2) ? HTTP_INTERNAL_SERVER_ERROR : HTTP_BAD_REQUEST;
+    send_error_response(conn, status,
+                        (parse_result == -2) ? "Internal Server Error" : "Bad Request");
     return finalize_response(worker, conn);
   }
 

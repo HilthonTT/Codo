@@ -18,7 +18,8 @@ typedef struct task
 
 typedef struct task_queue
 {
-  task_t **queues; // Array of priority queue
+  task_t **queues; // Array of priority queue heads
+  task_t **tails;  // Array of priority queue tails (for FIFO enqueue)
   int num_priorities;
   pthread_mutex_t mutex;
   pthread_cond_t condition;

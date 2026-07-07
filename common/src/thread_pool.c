@@ -15,6 +15,15 @@ int task_queue_init(task_queue_t *queue, int num_priorities)
         return -1;
     }
 
+    // Per-priority tail pointers so pushes append in O(1) at the tail while pops
+    // dequeue at the head, giving FIFO ordering within a priority level.
+    queue->tails = calloc(num_priorities, sizeof(task_t *));
+    if (!queue->tails)
+    {
+        free(queue->queues);
+        return -1;
+    }
+
     queue->num_priorities = num_priorities;
     atomic_init(&queue->size, 0);
     atomic_init(&queue->total_tasks, 0);
@@ -29,11 +38,55 @@ int task_queue_init(task_queue_t *queue, int num_priorities)
     if (pthread_cond_init(&queue->condition, NULL) != 0)
     {
         pthread_mutex_destroy(&queue->mutex);
+        free(queue->tails);
         free(queue->queues);
         return -1;
     }
 
     return 0;
+}
+
+// Destroy a task queue's synchronization primitives and free its priority
+// arrays. Does not free queued task_t nodes (see task_queue_drain) or the queue
+// struct itself.
+static void task_queue_destroy(task_queue_t *queue)
+{
+    pthread_mutex_destroy(&queue->mutex);
+    pthread_cond_destroy(&queue->condition);
+    free(queue->queues);
+    free(queue->tails);
+}
+
+// Free every task_t still queued (without executing it) so teardown doesn't leak
+// the nodes. Callers must ensure no worker touches the queue concurrently.
+static void task_queue_drain(task_queue_t *queue)
+{
+    if (!queue->queues)
+    {
+        return;
+    }
+
+    for (int i = 0; i < queue->num_priorities; i++)
+    {
+        task_t *task = queue->queues[i];
+        while (task)
+        {
+            task_t *next = task->next;
+            // NOTE: task->argument (e.g. an offload_task_t) is intentionally not
+            // freed here. We do not own its lifetime and the connection it refers
+            // to may already be gone, so we must not run the handler. Freeing only
+            // the node stops the task_t leak; any arg still owned by the task
+            // leaks by design during a hard shutdown.
+            free(task);
+            task = next;
+        }
+        queue->queues[i] = NULL;
+        if (queue->tails)
+        {
+            queue->tails[i] = NULL;
+        }
+    }
+    atomic_store(&queue->size, 0);
 }
 
 // Add task to priority queue
@@ -46,9 +99,18 @@ int task_queue_push(task_queue_t *queue, task_t *task)
 
     pthread_mutex_lock(&queue->mutex);
 
-    // Insert at head of priority queue
-    task->next = queue->queues[task->priority];
-    queue->queues[task->priority] = task;
+    // Append at the tail of the priority queue so tasks are served FIFO.
+    task->next = NULL;
+    if (queue->queues[task->priority] == NULL)
+    {
+        queue->queues[task->priority] = task;
+        queue->tails[task->priority] = task;
+    }
+    else
+    {
+        queue->tails[task->priority]->next = task;
+        queue->tails[task->priority] = task;
+    }
 
     atomic_fetch_add(&queue->size, 1);
     atomic_fetch_add(&queue->total_tasks, 1);
@@ -79,13 +141,18 @@ task_t *task_queue_pop(task_queue_t *queue)
 
     task_t *task = NULL;
 
-    // Find highest priority non-empty queue
+    // Find highest priority non-empty queue (dequeue from the head for FIFO)
     for (int i = queue->num_priorities - 1; i >= 0; i--)
     {
         if (queue->queues[i])
         {
             task = queue->queues[i];
             queue->queues[i] = task->next;
+            if (queue->queues[i] == NULL)
+            {
+                queue->tails[i] = NULL;
+            }
+            task->next = NULL;
             break;
         }
     }
@@ -111,13 +178,18 @@ task_t *task_queue_try_pop(task_queue_t *queue)
 
     if (atomic_load(&queue->size) > 0)
     {
-        // Find highest priority non-empty queue
+        // Find highest priority non-empty queue (dequeue from the head for FIFO)
         for (int i = queue->num_priorities - 1; i >= 0; i--)
         {
             if (queue->queues[i])
             {
                 task = queue->queues[i];
                 queue->queues[i] = task->next;
+                if (queue->queues[i] == NULL)
+                {
+                    queue->tails[i] = NULL;
+                }
+                task->next = NULL;
                 atomic_fetch_sub(&queue->size, 1);
                 break;
             }
@@ -159,7 +231,10 @@ task_t *steal_task(thread_pool_t *pool, int worker_id)
 void *worker_thread(void *arg)
 {
     thread_pool_t *pool = (thread_pool_t *)arg;
-    int worker_id = atomic_fetch_add(&pool->round_robin_index, 1) % pool->max_threads;
+    // Cast through unsigned so a wrapped (negative) counter can never produce a
+    // negative index into the worker arrays.
+    int worker_id = (int)((unsigned)atomic_fetch_add(&pool->round_robin_index, 1) %
+                          (unsigned)pool->max_threads);
 
     // Set CPU affinity if specified
     if (pool->worker_stats[worker_id].cpu_affinity >= 0)
@@ -272,6 +347,8 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
         {
             free(pool->local_queues);
             free(pool->queue_locks);
+            // task_queue_init already allocated the main queue; release it too.
+            task_queue_destroy(&pool->task_queue);
             free(pool);
             return NULL;
         }
@@ -291,6 +368,19 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
     {
         free(pool->threads);
         free(pool->worker_stats);
+        // Release everything allocated so far: the local work-stealing queues
+        // (and their inner arrays / mutexes / conds), the queue-lock array, and
+        // the main task queue.
+        if (pool->local_queues)
+        {
+            for (int i = 0; i < max_threads; i++)
+            {
+                task_queue_destroy(&pool->local_queues[i]);
+            }
+            free(pool->local_queues);
+            free(pool->queue_locks);
+        }
+        task_queue_destroy(&pool->task_queue);
         free(pool);
         return NULL;
     }
@@ -307,13 +397,19 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
     pthread_mutex_init(&pool->resize_mutex, NULL);
 
     // Create worker threads
+    int created = 0;
     for (int i = 0; i < num_threads; i++)
     {
         if (pthread_create(&pool->threads[i], NULL, worker_thread, pool) != 0)
         {
+            // Only join the threads we actually created. thread_pool_destroy
+            // joins pool->num_threads handles, so cap it at the created count to
+            // avoid pthread_join on zeroed (never-created) pthread_t handles.
+            pool->num_threads = created;
             thread_pool_destroy(pool);
             return NULL;
         }
+        created++;
     }
 
     return pool;
@@ -339,20 +435,19 @@ int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argu
     task->next = NULL;
     gettimeofday(&task->submit_time, NULL);
 
-    // Load balancing: distribute tasks among local queues
-    if (pool->local_queues)
-    {
-        int target_queue = atomic_fetch_add(&pool->round_robin_index, 1) %
-                           atomic_load(&pool->active_threads);
-
-        if (task_queue_push(&pool->local_queues[target_queue], task) == 0)
-        {
-            atomic_fetch_add(&pool->total_tasks_submitted, 1);
-            return 0;
-        }
-    }
-
-    // Fallback to global queue
+    // Submit to the global queue.
+    //
+    // Idle workers park on the GLOBAL queue's condition variable (via
+    // task_queue_pop). A task pushed only to a per-worker local queue would
+    // therefore never wake a sleeping worker -- its local condvar has no waiters,
+    // and a woken worker re-checks the global size and goes straight back to
+    // sleep -- deadlocking submitted work behind idle threads. Until the worker
+    // loop is restructured to block on a shared "work available" condition,
+    // route every submission through the global queue so an idle worker is always
+    // woken. Workers still probe their local queue and steal first, so this stays
+    // correct; it only forgoes local-queue locality when work stealing is enabled.
+    // (The non-work-stealing path, which the server uses, already took this exact
+    // branch, so its behavior is unchanged.)
     if (task_queue_push(&pool->task_queue, task) == 0)
     {
         atomic_fetch_add(&pool->total_tasks_submitted, 1);
@@ -457,14 +552,15 @@ int thread_pool_resize(thread_pool_t *pool, int new_size)
     }
     else if (new_size < current_size)
     {
-        // Remove threads (they will exit naturally when checking shutdown flag)
-        atomic_store(&pool->active_threads, new_size);
-
-        // Join excess threads
-        for (int i = new_size; i < current_size; i++)
-        {
-            pthread_join(pool->threads[i], NULL);
-        }
+        // LIMITATION: shrinking is not supported. Workers only exit when the
+        // whole pool shuts down (they block in task_queue_pop), and a running
+        // worker's slot is decoupled from its threads[] index by the round-robin
+        // worker-id scheme, so there is no safe way to signal a *specific* worker
+        // to exit and then pthread_join(pool->threads[i]) it -- the join would
+        // block forever on a thread that never received the stop request.
+        // Refuse the shrink instead of deadlocking; growing back up still works.
+        pthread_mutex_unlock(&pool->resize_mutex);
+        return -1;
     }
 
     pool->num_threads = new_size;
@@ -508,9 +604,20 @@ void thread_pool_destroy(thread_pool_t *pool)
         pthread_join(pool->threads[i], NULL);
     }
 
+    // Workers have joined, so no one else touches the queues now. Free any tasks
+    // that were still queued at shutdown so their task_t nodes don't leak (we do
+    // NOT execute them: their connections may already be gone).
+    task_queue_drain(&pool->task_queue);
+    if (pool->local_queues)
+    {
+        for (int i = 0; i < pool->max_threads; i++)
+        {
+            task_queue_drain(&pool->local_queues[i]);
+        }
+    }
+
     // Cleanup
-    pthread_mutex_destroy(&pool->task_queue.mutex);
-    pthread_cond_destroy(&pool->task_queue.condition);
+    task_queue_destroy(&pool->task_queue);
     pthread_mutex_destroy(&pool->resize_mutex);
 
     // Free local queues
@@ -518,15 +625,12 @@ void thread_pool_destroy(thread_pool_t *pool)
     {
         for (int i = 0; i < pool->max_threads; i++)
         {
-            pthread_mutex_destroy(&pool->local_queues[i].mutex);
-            pthread_cond_destroy(&pool->local_queues[i].condition);
-            free(pool->local_queues[i].queues);
+            task_queue_destroy(&pool->local_queues[i]);
         }
         free(pool->local_queues);
         free(pool->queue_locks);
     }
 
-    free(pool->task_queue.queues);
     free(pool->threads);
     free(pool->worker_stats);
     free(pool);

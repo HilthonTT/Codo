@@ -24,7 +24,7 @@ typedef struct
     uint64_t bytes_sent;
     uint64_t bytes_received;
     uint32_t rtt_samples[100];
-    int rtt_index;
+    unsigned int rtt_index;
 } connection_stats_t;
 
 void update_connection_rtt(connection_stats_t *stats, uint32_t rtt_us);

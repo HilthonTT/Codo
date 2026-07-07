@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -103,6 +104,14 @@ int env_int(const char *key, int def)
   if (errno != 0 || end == v || *end != '\0')
   {
     fprintf(stderr, "warning: %s=\"%s\" is not a valid integer, using %d\n",
+            key, v, def);
+    return def;
+  }
+  // strtol parses a long; reject values that don't fit an int instead of
+  // silently truncating (e.g. on LP64, values in (INT_MAX, LONG_MAX]).
+  if (n < INT_MIN || n > INT_MAX)
+  {
+    fprintf(stderr, "warning: %s=\"%s\" is out of range for int, using %d\n",
             key, v, def);
     return def;
   }

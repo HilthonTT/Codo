@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,6 +113,27 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
   if (stat(file_path, &file_stat) < 0)
   {
     return send_error_response(conn, HTTP_NOT_FOUND, "File not found");
+  }
+
+  // Canonicalize both the document root and the candidate path, then confirm
+  // the resolved file lives under the resolved root. This is the authoritative
+  // check (is_valid_uri above is only a first-line denylist) and also defeats
+  // symlink escapes, since realpath() follows every symlink to its real target.
+  char real_root[PATH_MAX];
+  char real_path[PATH_MAX];
+  if (!realpath(g_server.document_root, real_root) ||
+      !realpath(file_path, real_path))
+  {
+    return send_error_response(conn, HTTP_NOT_FOUND, "File not found");
+  }
+
+  // The resolved path must equal the root exactly or sit below it on a path
+  // boundary ('/'), otherwise it has escaped the document root.
+  size_t root_len = strlen(real_root);
+  if (strncmp(real_path, real_root, root_len) != 0 ||
+      (real_path[root_len] != '\0' && real_path[root_len] != '/'))
+  {
+    return send_error_response(conn, HTTP_FORBIDDEN, "Access denied");
   }
 
   // Send file

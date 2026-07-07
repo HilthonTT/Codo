@@ -65,16 +65,40 @@ int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, 
   // (wal_buffer is malloc'd and wal_buffer_pos starts at 0).
   size_t record_size = (content_size + 7u) & ~(size_t)7u;
 
+  // Guard against records that cannot fit even in a freshly flushed buffer.
+  // Without this the memcpy below would overflow the fixed WAL_BUFFER_SIZE
+  // heap buffer for a large data_length.
+  if (record_size > WAL_BUFFER_SIZE)
+  {
+    pthread_mutex_unlock(&storage_engine.wal_mutex);
+    return -1;
+  }
+
   // Check if we need to flush the buffer
   if (storage_engine.wal_buffer_pos + record_size > WAL_BUFFER_SIZE)
   {
-    // Write buffer to disk
-    ssize_t bytes_written = write(storage_engine.wal_fd, storage_engine.wal_buffer, storage_engine.wal_buffer_pos);
-
-    if (bytes_written != (ssize_t)storage_engine.wal_buffer_pos)
+    // Write buffer to disk with EINTR/partial-write retry. On failure we must
+    // leave wal_buffer_pos unchanged so the next flush does not re-append the
+    // already-written prefix (which would duplicate records).
+    size_t total_written = 0;
+    while (total_written < storage_engine.wal_buffer_pos)
     {
-      pthread_mutex_unlock(&storage_engine.wal_mutex);
-      return -1;
+      ssize_t bytes_written = write(storage_engine.wal_fd,
+                                    storage_engine.wal_buffer + total_written,
+                                    storage_engine.wal_buffer_pos - total_written);
+      if (bytes_written < 0)
+      {
+        if (errno == EINTR)
+          continue;
+        pthread_mutex_unlock(&storage_engine.wal_mutex);
+        return -1;
+      }
+      if (bytes_written == 0)
+      {
+        pthread_mutex_unlock(&storage_engine.wal_mutex);
+        return -1;
+      }
+      total_written += (size_t)bytes_written;
     }
 
     storage_engine.wal_buffer_pos = 0;
@@ -168,7 +192,14 @@ buffer_entry_t *find_buffer_entry(uint32_t page_id)
 
 buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
 {
-  pthread_mutex_lock(&storage_engine.buffer_mutex);
+  // NOTE: the caller MUST already hold buffer_mutex. This selects and evicts an
+  // LRU victim and initializes it for page_id, but deliberately does NOT insert
+  // the entry into the hash table -- get_page publishes it only after the page
+  // has been fully loaded and checksum-verified. Keeping the whole
+  // lookup -> pin / allocate -> load sequence under buffer_mutex prevents the
+  // evictor from reclaiming a just-found entry, stops two threads from both
+  // creating an entry for the same page, and guarantees no other thread ever
+  // observes a half-loaded page in the hash table.
 
   // Find least recently used unpinned page
   buffer_entry_t *victim = NULL;
@@ -192,15 +223,19 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
 
   if (!victim)
   {
-    pthread_mutex_unlock(&storage_engine.buffer_mutex);
     return NULL; // Buffer pool full
   }
 
   // Evict victim if dirty
   if (victim->dirty && victim->page)
   {
-    // Write page to disk (retry on partial writes / EINTR)
-    off_t offset = victim->page_id * PAGE_SIZE;
+    // Write-ahead invariant: flush the WAL to disk before writing the dirty
+    // page back, so the log records covering these changes are durable first.
+    flush_wal_buffer();
+
+    // Write page to disk (retry on partial writes / EINTR). Cast page_id to
+    // off_t *before* the multiply so the offset is computed in 64 bits.
+    off_t offset = (off_t)victim->page_id * PAGE_SIZE;
     size_t total_written = 0;
     while (total_written < PAGE_SIZE)
     {
@@ -212,12 +247,10 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
       {
         if (errno == EINTR)
           continue;
-        pthread_mutex_unlock(&storage_engine.buffer_mutex);
         return NULL;
       }
       if (w == 0)
       {
-        pthread_mutex_unlock(&storage_engine.buffer_mutex);
         return NULL;
       }
       total_written += (size_t)w;
@@ -243,25 +276,28 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
     }
   }
 
-  // Initialize new entry
+  // Initialize new entry. It is NOT yet linked into the hash table: get_page
+  // links it only after the page load + checksum succeed.
   victim->page_id = page_id;
   victim->dirty = false;
   victim->pinned = false;
   atomic_store(&victim->ref_count, 1);
+  victim->hash_next = UINT32_MAX;
   clock_gettime(CLOCK_MONOTONIC, &victim->last_access);
-
-  // Add to hash table
-  uint32_t hash = hash_page_id(page_id);
-  victim->hash_next = storage_engine.hash_table[hash];
-  storage_engine.hash_table[hash] = victim - storage_engine.buffer_pool;
-
-  pthread_mutex_unlock(&storage_engine.buffer_mutex);
 
   return victim;
 }
 
 btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
 {
+  // The whole lookup + pin (hit path) or allocate + load + publish (miss path)
+  // runs under buffer_mutex. This closes the eviction races: a found entry is
+  // pinned before the lock drops (so the evictor cannot reclaim it), two
+  // threads missing the same page cannot both create an entry (the second one
+  // finds the first), and an entry is not visible in the hash table until its
+  // page is fully loaded and checksum-verified.
+  pthread_mutex_lock(&storage_engine.buffer_mutex);
+
   // Check buffer pool first
   buffer_entry_t *entry = find_buffer_entry(page_id);
 
@@ -271,7 +307,9 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
     clock_gettime(CLOCK_MONOTONIC, &entry->last_access);
     atomic_fetch_add(&storage_engine.stats.cache_hits, 1);
 
-    // Acquire page lock
+    pthread_mutex_unlock(&storage_engine.buffer_mutex);
+
+    // Acquire page lock (safe without buffer_mutex: the entry is pinned)
     if (lock_type == LOCK_SHARED)
     {
       pthread_rwlock_rdlock(&entry->page_lock);
@@ -284,10 +322,11 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
     return entry->page;
   }
 
-  // Page not in buffer pool - allocate new entry
+  // Page not in buffer pool - allocate new entry (buffer_mutex held).
   entry = allocate_buffer_entry(page_id);
   if (!entry)
   {
+    pthread_mutex_unlock(&storage_engine.buffer_mutex);
     return NULL;
   }
 
@@ -299,18 +338,38 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
     if (!entry->page)
     {
       atomic_fetch_sub(&entry->ref_count, 1);
+      pthread_mutex_unlock(&storage_engine.buffer_mutex);
       return NULL;
     }
   }
 
-  // Read page from disk
-  // TODO(concurrency): allocate_buffer_entry holds the buffer_mutex briefly
-  // but the page_lock is acquired after the pread below; a downgrade-during-IO
-  // scheme would let concurrent readers proceed while this page is loaded.
-  off_t offset = page_id * PAGE_SIZE;
-  if (pread(storage_engine.data_fd, entry->page, PAGE_SIZE, offset) != PAGE_SIZE)
+  // Read page from disk. Cast page_id to off_t before the multiply so the
+  // offset is computed in 64 bits.
+  off_t offset = (off_t)page_id * PAGE_SIZE;
+  ssize_t bytes_read = pread(storage_engine.data_fd, entry->page, PAGE_SIZE, offset);
+  if (bytes_read != PAGE_SIZE)
   {
-    // Page doesn´t exist - initialize new page
+    // Distinguish a legitimately fresh page (beyond the current end of file)
+    // from a read error / short read on a page that should already exist. In
+    // the latter case we must NOT zero-and-keep the page: a later eviction
+    // would pwrite the empty page over real on-disk data. Fail instead and
+    // leave the on-disk data intact. The entry is not yet published in the
+    // hash table, so releasing its pin returns the slot to the free pool.
+    off_t file_size = 0;
+    struct stat st;
+    if (fstat(storage_engine.data_fd, &st) == 0)
+    {
+      file_size = st.st_size;
+    }
+
+    if (bytes_read < 0 || offset < file_size)
+    {
+      atomic_fetch_sub(&entry->ref_count, 1);
+      pthread_mutex_unlock(&storage_engine.buffer_mutex);
+      return NULL;
+    }
+
+    // Page lies beyond the end of file -> initialize a new (fresh) page.
     memset(entry->page, 0, PAGE_SIZE);
     entry->page->header.page_id = page_id;
     entry->page->header.page_type = PAGE_TYPE_LEAF;
@@ -331,10 +390,21 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
     if (stored_checksum != 0 && stored_checksum != calculated_checksum)
     {
       printf("Checksum mismatch for page %u\n", page_id);
+      // The entry was never linked into the hash table, so a corrupt page is
+      // simply discarded here (ref_count back to 0) and can never be served
+      // from the cache on a later get_page.
       atomic_fetch_sub(&entry->ref_count, 1);
+      pthread_mutex_unlock(&storage_engine.buffer_mutex);
       return NULL;
     }
   }
+
+  // Publish the fully-loaded entry into the hash table.
+  uint32_t hash = hash_page_id(page_id);
+  entry->hash_next = storage_engine.hash_table[hash];
+  storage_engine.hash_table[hash] = (uint32_t)(entry - storage_engine.buffer_pool);
+
+  pthread_mutex_unlock(&storage_engine.buffer_mutex);
 
   // Acquire page lock
   if (lock_type == LOCK_SHARED)
@@ -351,7 +421,12 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
 
 void release_page(uint32_t page_id, lock_type_t lock_type)
 {
+  // Look up under buffer_mutex so the hash chain is not rewired by a concurrent
+  // evictor while we traverse it. The entry is pinned by the caller, so it will
+  // still be present.
+  pthread_mutex_lock(&storage_engine.buffer_mutex);
   buffer_entry_t *entry = find_buffer_entry(page_id);
+  pthread_mutex_unlock(&storage_engine.buffer_mutex);
   if (!entry)
   {
     return;
@@ -367,7 +442,11 @@ void release_page(uint32_t page_id, lock_type_t lock_type)
 
 void mark_page_dirty(uint32_t page_id)
 {
+  // Look up under buffer_mutex (see release_page). The caller holds the page's
+  // write lock and a pin, so the entry cannot be evicted here.
+  pthread_mutex_lock(&storage_engine.buffer_mutex);
   buffer_entry_t *entry = find_buffer_entry(page_id);
+  pthread_mutex_unlock(&storage_engine.buffer_mutex);
   if (entry)
   {
     entry->dirty = true;
@@ -375,7 +454,7 @@ void mark_page_dirty(uint32_t page_id)
     // Update LSN
     if (storage_engine.config.enable_wal)
     {
-      entry->page->header.lsn = storage_engine.next_lsn - 1;
+      entry->page->header.lsn = atomic_load(&storage_engine.next_lsn) - 1;
     }
 
     // Update checksum
@@ -461,18 +540,43 @@ kv_pair_t *get_kv_pair(btree_page_t *page, int index)
     return NULL;
   }
 
-  // Find the key-value pair at the given index
+  // Find the key-value pair at the given index. The on-disk key/value lengths
+  // are untrusted, so validate that every pair (header + key + value) stays
+  // within the page's data area before dereferencing it -- a corrupt page must
+  // not cause an out-of-bounds read.
+  const size_t data_capacity = PAGE_SIZE - sizeof(page_header_t);
   char *data_ptr = page->data;
+  size_t offset = 0;
 
   for (int i = 0; i <= index; i++)
   {
-    if (i == index)
+    // Need at least the fixed-size header to read the lengths.
+    if (offset + sizeof(kv_pair_t) > data_capacity)
     {
-      return (kv_pair_t *)data_ptr;
+      return NULL; // Corrupt page
     }
 
     kv_pair_t *kv = (kv_pair_t *)data_ptr;
-    data_ptr += sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+
+    if (i == index)
+    {
+      // Also verify this pair's payload fits before handing it back.
+      size_t pair_size = sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+      if (offset + pair_size > data_capacity)
+      {
+        return NULL; // Corrupt page
+      }
+      return kv;
+    }
+
+    size_t pair_size = sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+    if (pair_size > data_capacity - offset)
+    {
+      return NULL; // Corrupt page
+    }
+
+    data_ptr += pair_size;
+    offset += pair_size;
   }
 
   return NULL;
@@ -529,18 +633,38 @@ int insert_kv_pair(
     return -1; // Not enough size
   }
 
-  // Find insertion point
+  // Guard against a corrupt free_space that would place end_ptr out of bounds.
+  const size_t data_capacity = PAGE_SIZE - sizeof(page_header_t);
+  if (page->header.free_space > data_capacity)
+  {
+    return -1; // Corrupt page
+  }
+  size_t used = data_capacity - page->header.free_space;
+
+  // Find insertion point, validating each traversed pair stays within the
+  // used region (untrusted on-disk lengths).
   char *insert_ptr = page->data;
+  size_t insert_offset = 0;
   for (int i = 0; i < position; i++)
   {
+    if (insert_offset + sizeof(kv_pair_t) > used)
+    {
+      return -1; // Corrupt page
+    }
     kv_pair_t *kv = (kv_pair_t *)insert_ptr;
-    insert_ptr += sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+    size_t sz = sizeof(kv_pair_t) + kv->key_length + kv->value_length;
+    if (sz > used - insert_offset)
+    {
+      return -1; // Corrupt page
+    }
+    insert_ptr += sz;
+    insert_offset += sz;
   }
 
   // Calculate space needed to move existing data. end_ptr is the end of the
   // currently-used region (capacity minus free space), so we shift only the
   // pairs that sit after the insertion point.
-  char *end_ptr = page->data + (PAGE_SIZE - sizeof(page_header_t) - page->header.free_space);
+  char *end_ptr = page->data + used;
   size_t move_size = end_ptr - insert_ptr;
 
   // Move existing data to make room
@@ -579,10 +703,23 @@ int delete_kv_pair(btree_page_t *page, int position)
 
   size_t pair_size = sizeof(kv_pair_t) + kv->key_length + kv->value_length;
 
+  // Guard against a corrupt free_space that would make end_ptr precede
+  // next_ptr, which would underflow move_size into a huge memmove.
+  const size_t data_capacity = PAGE_SIZE - sizeof(page_header_t);
+  if (page->header.free_space > data_capacity)
+  {
+    return -1; // Corrupt page
+  }
+  size_t used = data_capacity - page->header.free_space;
+
   // Calculate data to move
   char *delete_ptr = (char *)kv;
   char *next_ptr = delete_ptr + pair_size;
-  char *end_ptr = page->data + (PAGE_SIZE - sizeof(page_header_t) - page->header.free_space);
+  char *end_ptr = page->data + used;
+  if (next_ptr > end_ptr)
+  {
+    return -1; // Corrupt page
+  }
   size_t move_size = end_ptr - next_ptr;
 
   // Move data to close the gap
@@ -612,7 +749,7 @@ transaction_t *begin_transaction(void)
   txn->txn_id = storage_engine.next_txn_id++;
   txn->state = TXN_STATE_ACTIVE;
   txn->start_time = time(NULL);
-  txn->start_lsn = storage_engine.next_lsn;
+  txn->start_lsn = atomic_load(&storage_engine.next_lsn);
 
   pthread_mutex_init(&txn->lock_mutex, NULL);
 
@@ -645,7 +782,7 @@ int commit_transaction(transaction_t *txn)
 
   txn->state = TXN_STATE_COMMITED;
   txn->commit_time = time(NULL);
-  txn->commit_lsn = storage_engine.next_lsn - 1;
+  txn->commit_lsn = atomic_load(&storage_engine.next_lsn) - 1;
 
   // Release all locks
   lock_entry_t *lock = txn->locks;
@@ -658,6 +795,23 @@ int commit_transaction(transaction_t *txn)
   txn->locks = NULL;
 
   pthread_mutex_unlock(&txn->lock_mutex);
+
+  // Unlink from the active_transactions list before the caller free()s the
+  // txn, otherwise the global list would hold a dangling pointer (any later
+  // traversal, e.g. print_storage_statistics, would be a use-after-free).
+  pthread_mutex_lock(&storage_engine.txn_mutex);
+  transaction_t **pp = &storage_engine.active_transactions;
+  while (*pp)
+  {
+    if (*pp == txn)
+    {
+      *pp = txn->next;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  txn->next = NULL;
+  pthread_mutex_unlock(&storage_engine.txn_mutex);
 
   atomic_fetch_add(&storage_engine.stats.transactions_committed, 1);
 
@@ -710,6 +864,22 @@ int abort_transaction(transaction_t *txn)
 
   pthread_mutex_unlock(&txn->lock_mutex);
 
+  // Unlink from the active_transactions list before the caller free()s the
+  // txn (see commit_transaction) to avoid a dangling pointer / use-after-free.
+  pthread_mutex_lock(&storage_engine.txn_mutex);
+  transaction_t **pp = &storage_engine.active_transactions;
+  while (*pp)
+  {
+    if (*pp == txn)
+    {
+      *pp = txn->next;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  txn->next = NULL;
+  pthread_mutex_unlock(&storage_engine.txn_mutex);
+
   atomic_fetch_add(&storage_engine.stats.transactions_aborted, 1);
 
   printf("Transaction %lu aborted\n", txn->txn_id);
@@ -721,6 +891,13 @@ int abort_transaction(transaction_t *txn)
 int db_insert(transaction_t *txn, const char *key, size_t key_length, const char *value, size_t value_length)
 {
   if (!txn || txn->state != TXN_STATE_ACTIVE)
+  {
+    return -1;
+  }
+
+  // Validate lengths up front so the on-page pair and the WAL payload can never
+  // exceed their fixed-size buffers.
+  if (key_length > MAX_KEY_SIZE || value_length > MAX_VALUE_SIZE)
   {
     return -1;
   }
@@ -762,10 +939,11 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
     return -1; // Key Already exists
   }
 
-  // Write WAL record
+  // Write WAL record. The payload prefixes two size_t length fields, so the
+  // buffer must reserve sizeof(size_t)*2 for them (not 8).
   if (storage_engine.config.enable_wal)
   {
-    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE + 8];
+    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE + sizeof(size_t) * 2];
     size_t wal_size = 0;
 
     memcpy(wal_data + wal_size, &key_length, sizeof(key_length));
@@ -783,14 +961,20 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
     write_wal_record(txn->txn_id, WAL_INSERT, page_id, wal_data, wal_size);
   }
 
-  // Insert key-value pair
-  if (insert_kv_pair(page, pos, key, key_length, value, value_length, 0) == 0)
+  // Insert key-value pair. NOTE: B-tree page-split is not implemented, so a
+  // leaf's capacity is bounded by a single page. If insert_kv_pair reports the
+  // page is full (-1) we must propagate the failure rather than silently
+  // returning success (which would lose the row and report a false 201).
+  if (insert_kv_pair(page, pos, key, key_length, value, value_length, 0) != 0)
   {
-    mark_page_dirty(page_id);
-    txn->stats.rows_inserted++;
-
-    printf("Inserted key-value pair in transaction %lu\n", txn->txn_id);
+    release_page(page_id, LOCK_EXCLUSIVE);
+    return -1;
   }
+
+  mark_page_dirty(page_id);
+  txn->stats.rows_inserted++;
+
+  printf("Inserted key-value pair in transaction %lu\n", txn->txn_id);
 
   release_page(page_id, LOCK_EXCLUSIVE);
 
@@ -938,8 +1122,10 @@ int db_update(transaction_t *txn, const char *key, size_t key_length, const char
     memcpy(wal_data + wal_size, &new_value_length, sizeof(new_value_length));
     wal_size += sizeof(new_value_length);
 
+    // Advance by key_length (the actual key bytes just copied), not by
+    // sizeof(key_length) -- otherwise the value bytes land at the wrong offset.
     memcpy(wal_data + wal_size, key, key_length);
-    wal_size += sizeof(key_length);
+    wal_size += key_length;
 
     memcpy(wal_data + wal_size, kv->data + kv->key_length, old_value_length);
     wal_size += old_value_length;
@@ -950,15 +1136,21 @@ int db_update(transaction_t *txn, const char *key, size_t key_length, const char
     write_wal_record(txn->txn_id, WAL_UPDATE, page_id, wal_data, wal_size);
   }
 
-  // Update the alue (simplified - assumes same size)
-  if (kv->value_length == new_value_length)
+  // Update the value in place. NOTE: this only supports a same-size update --
+  // variable-length in-place resize (which could need a page-split) is not
+  // implemented. If the new value differs in size we cannot update in place,
+  // so propagate a failure instead of silently dropping the change.
+  if (kv->value_length != new_value_length)
   {
-    memcpy(kv->data + kv->key_length, new_value, new_value_length);
-    mark_page_dirty(page_id);
-    txn->stats.rows_updated++;
-
-    printf("Updated key in transaction %lu\n", txn->txn_id);
+    release_page(page_id, LOCK_EXCLUSIVE);
+    return -1;
   }
+
+  memcpy(kv->data + kv->key_length, new_value, new_value_length);
+  mark_page_dirty(page_id);
+  txn->stats.rows_updated++;
+
+  printf("Updated key in transaction %lu\n", txn->txn_id);
 
   release_page(page_id, LOCK_EXCLUSIVE);
 
@@ -1008,10 +1200,11 @@ int db_delete(transaction_t *txn, const char *key, size_t key_length)
     return -1; // Key not found
   }
 
-  // Write WAL record
+  // Write WAL record. Buffer sized for the size_t + uint16_t length prefix
+  // plus a full key and value.
   if (storage_engine.config.enable_wal)
   {
-    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE + 8];
+    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE + sizeof(size_t) + sizeof(uint16_t)];
     size_t wal_size = 0;
 
     memcpy(wal_data + wal_size, &key_length, sizeof(key_length));
@@ -1021,13 +1214,16 @@ int db_delete(transaction_t *txn, const char *key, size_t key_length)
     memcpy(wal_data + wal_size, &old_value_length, sizeof(old_value_length));
     wal_size += sizeof(old_value_length);
 
+    // Advance by key_length (the actual key bytes), not sizeof(key_length),
+    // so the old value lands at the correct offset.
     memcpy(wal_data + wal_size, key, key_length);
-    wal_size += sizeof(key_length);
+    wal_size += key_length;
 
     memcpy(wal_data + wal_size, kv->data + kv->key_length, old_value_length);
     wal_size += old_value_length;
 
-    write_wal_record(txn->txn_id, WAL_UPDATE, page_id, wal_data, wal_size);
+    // This is a delete: log a WAL_DELETE record, not WAL_UPDATE.
+    write_wal_record(txn->txn_id, WAL_DELETE, page_id, wal_data, wal_size);
   }
 
   // Delete the key-value pair
@@ -1128,7 +1324,7 @@ int perform_checkpoint(void)
 
     if (entry->dirty && entry->page)
     {
-      off_t offset = entry->page_id * PAGE_SIZE;
+      off_t offset = (off_t)entry->page_id * PAGE_SIZE;
       if (pwrite(storage_engine.data_fd, entry->page, PAGE_SIZE, offset) == PAGE_SIZE)
       {
         entry->dirty = false;
@@ -1146,7 +1342,7 @@ int perform_checkpoint(void)
   write_wal_record(0, WAL_CHECKOUT, 0, NULL, 0);
   flush_wal_buffer();
 
-  storage_engine.last_checkpoint_lsn = storage_engine.next_lsn - 1;
+  storage_engine.last_checkpoint_lsn = atomic_load(&storage_engine.next_lsn) - 1;
 
   printf("Checkpoint completed (LSN: %lu)\n", storage_engine.last_checkpoint_lsn);
 
@@ -1178,7 +1374,7 @@ void print_storage_statistics(void)
   printf("\nWAL:\n");
   printf("  Records written: %lu\n", atomic_load(&storage_engine.stats.wal_records_written));
   printf("  Checkpoints: %lu\n", atomic_load(&storage_engine.stats.checkpoints_performed));
-  printf("  Next LSN: %lu\n", storage_engine.next_lsn);
+  printf("  Next LSN: %lu\n", atomic_load(&storage_engine.next_lsn));
   printf("  Last checkpoint LSN: %lu\n", storage_engine.last_checkpoint_lsn);
 
   printf("\nActive Transactions:\n");
@@ -1226,6 +1422,7 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   {
     perror("open WAL file");
     close(storage_engine.data_fd);
+    free(storage_engine.data_filename);
     return -1;
   }
 
@@ -1237,6 +1434,8 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   {
     close(storage_engine.data_fd);
     close(storage_engine.wal_fd);
+    free(storage_engine.data_filename);
+    free(storage_engine.wal_filename);
     return -1;
   }
 
@@ -1246,6 +1445,11 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   storage_engine.hash_table = malloc(storage_engine.hash_table_size * sizeof(uint32_t));
   if (!storage_engine.hash_table)
   {
+    close(storage_engine.data_fd);
+    close(storage_engine.wal_fd);
+    free(storage_engine.data_filename);
+    free(storage_engine.wal_filename);
+    free(storage_engine.wal_buffer);
     return -1;
   }
 
@@ -1265,6 +1469,20 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   // Initialize lock table
   storage_engine.lock_table_size = 10007; // Prime number
   storage_engine.lock_table = calloc(storage_engine.lock_table_size, sizeof(lock_entry_t *));
+  if (!storage_engine.lock_table)
+  {
+    close(storage_engine.data_fd);
+    close(storage_engine.wal_fd);
+    free(storage_engine.data_filename);
+    free(storage_engine.wal_filename);
+    free(storage_engine.wal_buffer);
+    free(storage_engine.hash_table);
+    for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
+    {
+      pthread_rwlock_destroy(&storage_engine.buffer_pool[i].page_lock);
+    }
+    return -1;
+  }
 
   // Initialize mutexes
   pthread_mutex_init(&storage_engine.buffer_mutex, NULL);
@@ -1278,6 +1496,13 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   storage_engine.next_lsn = 1;
   storage_engine.next_page_id = 1;
   storage_engine.root_page_id = 1;
+
+  // TODO(durability): WAL crash-recovery replay is NOT implemented. On restart
+  // we do not scan the WAL to redo committed changes / undo uncommitted ones,
+  // so any committed writes that were logged but not yet checkpointed to the
+  // data file are lost after a crash. Eviction/checkpoint honour the
+  // write-ahead ordering (WAL is flushed before dirty pages are written back),
+  // but full recovery still needs a replay pass here.
 
   // Initialize root page if file is empty
   struct stat st;
@@ -1335,6 +1560,13 @@ void cleanup_storage_engine(void)
   }
 }
 
+// WARNING: this handler is async-signal-UNSAFE. It calls printf, the full
+// cleanup_storage_engine path (malloc/free, pthread ops, fsync) and exit(),
+// none of which are async-signal-safe. It must NOT be registered with
+// signal()/sigaction() as-is -- doing so can deadlock or corrupt state if a
+// signal arrives mid-allocation or while a mutex is held. A safe version would
+// only set a volatile sig_atomic_t flag and let the main loop do the work.
+// (Deliberately left unregistered; see the commented-out main().)
 void signal_handler(int sig)
 {
   if (sig == SIGINT || sig == SIGTERM)

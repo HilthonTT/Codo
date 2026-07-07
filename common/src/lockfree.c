@@ -10,6 +10,15 @@ static hazard_pointer_record_t hazard_pointer_table[MAX_THREADS];
 // Thread-local hazard pointer record
 static __thread hazard_pointer_record_t *local_hazard_record = NULL;
 
+// LIMITATION: a hazard-pointer record is claimed lazily on first use by a thread
+// and is never released when that thread exits -- there is no thread-exit hook
+// wired up here. A long-lived process that spawns and joins more than
+// MAX_THREADS distinct threads over its lifetime will therefore eventually run
+// out of slots (get_hazard_pointer_record returns NULL). A full fix needs a
+// destructor registered via pthread_key_create / pthread_setspecific (or an
+// explicit "retire this thread's record" call). This module currently has no
+// callers, so the limitation is documented rather than fixed to avoid adding an
+// unused teardown path.
 hazard_pointer_record_t *get_hazard_pointer_record(void)
 {
   if (local_hazard_record)
@@ -203,13 +212,21 @@ bool lockfree_queue_dequeue(lockfree_queue_t *queue, void **data)
         {
           atomic_fetch_sub(&queue->size, 1);
 
-          // Free old head node (with hazard pointer protection)
+          // Clear our OWN hazard pointer to head first: HP[0] still points at
+          // head here, so is_hazard_pointer(head) would otherwise always match
+          // this very thread and the node would never be freed (guaranteed
+          // leak). After clearing it, the scan only sees OTHER threads.
+          //
+          // NOTE: reclamation is best-effort. Without a retire list this
+          // check-then-free is still racy (another thread could publish a hazard
+          // pointer to head between the scan and the free), but this at least
+          // removes the guaranteed self-match leak.
+          clear_hazard_pointer(0);
           if (!is_hazard_pointer(head))
           {
             free(head);
           }
 
-          clear_hazard_pointer(0);
           clear_hazard_pointer(1);
           return true;
         }
@@ -280,16 +297,13 @@ bool lockfree_hashtable_lookup(lockfree_hashtable_t *table, uintptr_t key, void 
   hash_node_t *current = atomic_load(&table->buckets[bucket]);
   set_hazard_pointer(0, current);
 
+  // Walk the bucket chain. The previous revalidation compared every traversed
+  // node to the bucket HEAD, so any node past the first always mismatched, reset
+  // the walk back to the head, and spun forever. Insertions only ever prepend a
+  // new head, so following next pointers reaches every node exactly once; we
+  // simply traverse to the end. (Hazard-pointer protection remains best-effort.)
   while (current)
   {
-    // Verify node is still valid
-    if (current != atomic_load(&table->buckets[bucket]))
-    {
-      current = atomic_load(&table->buckets[bucket]);
-      set_hazard_pointer(0, current);
-      continue;
-    }
-
     if (!atomic_load(&current->deleted) &&
         atomic_load(&current->key) == key)
     {
@@ -309,8 +323,21 @@ bool lockfree_hashtable_lookup(lockfree_hashtable_t *table, uintptr_t key, void 
 // Random level generation
 static int random_level(void)
 {
+  // rand() is not thread-safe (shared global state). Use rand_r with a
+  // per-thread seed so concurrent inserters don't race on the RNG.
+  static __thread unsigned int rng_seed = 0;
+  if (rng_seed == 0)
+  {
+    rng_seed = (unsigned int)(uintptr_t)&rng_seed ^
+               (unsigned int)(uintptr_t)pthread_self();
+    if (rng_seed == 0)
+    {
+      rng_seed = 2463534242u;
+    }
+  }
+
   int level = 1;
-  while ((rand() & 0x1) && level < MAX_LEVEL)
+  while ((rand_r(&rng_seed) & 0x1) && level < MAX_LEVEL)
   {
     level++;
   }
@@ -353,8 +380,13 @@ bool lockfree_skiplist_insert(lockfree_skiplist_t *list, long key, void *value)
   skip_node_t *update[MAX_LEVEL];
   skip_node_t *current = list->header;
 
+  // Snapshot the level we actually traverse so we can initialize any update[]
+  // slots above it later (a concurrent raise of list->max_level must not leave
+  // update[old_max .. level-1] uninitialized).
+  int list_level = atomic_load(&list->max_level);
+
   // Find position to insert
-  for (int i = atomic_load(&list->max_level) - 1; i >= 0; i--)
+  for (int i = list_level - 1; i >= 0; i--)
   {
     while (true)
     {
@@ -388,27 +420,57 @@ bool lockfree_skiplist_insert(lockfree_skiplist_t *list, long key, void *value)
   atomic_store(&new_node->level, level);
   atomic_store(&new_node->deleted, false);
 
-  // Update max level if necessary
-  if (level > atomic_load(&list->max_level))
+  // Any levels above the ones we traversed default to the header. This also
+  // covers the case where another thread raised list->max_level after we read it
+  // into list_level: without this, update[list_level .. level-1] would be
+  // uninitialized.
+  if (level > list_level)
   {
-    for (int i = atomic_load(&list->max_level); i < level; i++)
+    for (int i = list_level; i < level; i++)
     {
       update[i] = list->header;
     }
-    atomic_store(&list->max_level, level);
+
+    // Publish the new max level, but only ever raise it (never lower a value a
+    // concurrent inserter may have set higher).
+    int cur_max = atomic_load(&list->max_level);
+    while (cur_max < level &&
+           !atomic_compare_exchange_weak(&list->max_level, &cur_max, level))
+    {
+      // cur_max is refreshed by the failed CAS; loop until it is >= level.
+    }
   }
 
-  // Link new node
+  // Link new node level by level. Once new_node is linked at ANY level it is
+  // reachable by other threads and must never be freed. If a CAS fails, the
+  // predecessor's forward pointer changed, so re-locate the predecessor at that
+  // level and retry the link (loop, not recursion, and no free()).
   for (int i = 0; i < level; i++)
   {
-    skip_node_t *next = atomic_load(&update[i]->forward[i]);
-    atomic_store(&new_node->forward[i], next);
-
-    if (!atomic_compare_exchange_weak(&update[i]->forward[i], &next, new_node))
+    while (true)
     {
-      // Retry on failure
-      free(new_node);
-      return lockfree_skiplist_insert(list, key, value);
+      skip_node_t *next = atomic_load(&update[i]->forward[i]);
+      atomic_store(&new_node->forward[i], next);
+
+      if (atomic_compare_exchange_weak(&update[i]->forward[i], &next, new_node))
+      {
+        break;
+      }
+
+      // Re-find the predecessor at level i, descending from the header. new_node
+      // is not yet linked at level i (only at levels < i), so the walk cannot
+      // encounter it.
+      skip_node_t *pred = list->header;
+      for (int j = atomic_load(&list->max_level) - 1; j >= i; j--)
+      {
+        skip_node_t *n = atomic_load(&pred->forward[j]);
+        while (n && atomic_load(&n->key) < key)
+        {
+          pred = n;
+          n = atomic_load(&pred->forward[j]);
+        }
+      }
+      update[i] = pred;
     }
   }
 

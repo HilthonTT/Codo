@@ -208,7 +208,7 @@ typedef struct
   // WAL management
   uint8_t *wal_buffer;
   size_t wal_buffer_pos;
-  uint64_t next_lsn;
+  _Atomic uint64_t next_lsn;
   uint64_t last_checkpoint_lsn;
   pthread_mutex_t wal_mutex;
 

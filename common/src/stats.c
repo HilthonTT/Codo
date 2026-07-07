@@ -68,13 +68,16 @@ int stats_format_json(char *buf, size_t size)
 
 void update_connection_rtt(connection_stats_t *stats, uint32_t rtt_us)
 {
-    stats->rtt_samples[stats->rtt_index++ % 100] = rtt_us;
+    // rtt_index is unsigned (wraps with well-defined behavior); take the modulo
+    // before indexing so the write always lands in [0, 99].
+    stats->rtt_samples[stats->rtt_index % 100] = rtt_us;
+    stats->rtt_index++;
 }
 
 uint32_t get_average_rtt(connection_stats_t *stats)
 {
     uint64_t sum = 0;
-    int count = (stats->rtt_index < 100) ? stats->rtt_index : 100;
+    int count = (stats->rtt_index < 100) ? (int)stats->rtt_index : 100;
 
     for (int i = 0; i < count; i++)
     {
@@ -124,12 +127,11 @@ void debug_packet_dump(const uint8_t *data, size_t len)
 // Network diagnostic tool
 void diagnose_network_issue(int sock)
 {
-    // Get socket error
-    int error;
+    // Get socket error. Initialize to 0 and only trust it if getsockopt
+    // succeeds, otherwise `error` could be read uninitialized.
+    int error = 0;
     socklen_t len = sizeof(error);
-    getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len);
-
-    if (error != 0)
+    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error != 0)
     {
         printf("Socket error: %s\n", strerror(error));
     }
