@@ -308,7 +308,7 @@ void handle_new_connection(load_balancer_t *lb)
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     // Select backend using load balancing algorithm
-    backend = select_backend(lb);
+    backend = select_backend(lb, &client_addr);
     if (!backend)
     {
         // All backends are unhealthy — reply 503 instead of a silent close so
@@ -360,7 +360,7 @@ void handle_new_connection(load_balancer_t *lb)
     pthread_mutex_unlock(&lb->backend_mutex);
 }
 
-backend_t *select_backend(load_balancer_t *lb)
+backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_in *client_addr)
 {
     switch (lb->strategy)
     {
@@ -369,7 +369,7 @@ backend_t *select_backend(load_balancer_t *lb)
     case LB_STRATEGY_LEAST_CONN:
         return least_connection_select(lb);
     case LB_STRATEGY_IP_HASH:
-        return ip_hash_select(lb);
+        return ip_hash_select(lb, client_addr);
     case LB_STRATEGY_RANDOM:
         return random_select(lb);
     default:

@@ -21,11 +21,20 @@ static void passive_recovery(load_balancer_t *lb)
   }
 }
 
-static char *get_client_ip(load_balancer_t *lb)
+// Format the client's IPv4 address into buf. Falls back to "0.0.0.0" when the
+// address is missing or not AF_INET so the hash stays deterministic instead of
+// reading garbage.
+static const char *get_client_ip(const struct sockaddr_in *client_addr,
+                                 char *buf, size_t buf_len)
 {
-  assert(lb);
+  assert(buf && buf_len >= INET_ADDRSTRLEN);
 
-  return "mock-IP";
+  if (!client_addr || client_addr->sin_family != AF_INET ||
+      !inet_ntop(AF_INET, &client_addr->sin_addr, buf, (socklen_t)buf_len))
+  {
+    snprintf(buf, buf_len, "0.0.0.0");
+  }
+  return buf;
 }
 
 backend_t *backend_round_robin_select(load_balancer_t *lb)
@@ -125,7 +134,7 @@ backend_t *least_connection_select(load_balancer_t *lb)
   return least_conn_backend;
 }
 
-backend_t *ip_hash_select(load_balancer_t *lb)
+backend_t *ip_hash_select(load_balancer_t *lb, const struct sockaddr_in *client_addr)
 {
   assert(lb);
 
@@ -138,7 +147,8 @@ backend_t *ip_hash_select(load_balancer_t *lb)
     return NULL;
   }
 
-  char *ip = get_client_ip(lb);
+  char ip_buf[INET_ADDRSTRLEN];
+  const char *ip = get_client_ip(client_addr, ip_buf, sizeof(ip_buf));
 
   uint32_t hash = fnv1_32(ip, strlen(ip));
   size_t idx = hash % (uint32_t)lb->backend_count;

@@ -35,7 +35,7 @@ int load_balancer_main_loop(load_balancer_t *lb);
 // Handle new client connection
 void handle_new_connection(load_balancer_t *lb);
 
-backend_t *select_backend(load_balancer_t *lb);
+backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_in *client_addr);
 
 void handle_client_data(load_balancer_t *lb, connection_t *conn);
 

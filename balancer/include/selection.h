@@ -20,7 +20,7 @@
 
 backend_t *backend_round_robin_select(load_balancer_t *lb);
 backend_t *least_connection_select(load_balancer_t *lb);
-backend_t *ip_hash_select(load_balancer_t *lb);
+backend_t *ip_hash_select(load_balancer_t *lb, const struct sockaddr_in *client_addr);
 backend_t *random_select(load_balancer_t *lb);
 backend_t *random_select(load_balancer_t *lb);
 
