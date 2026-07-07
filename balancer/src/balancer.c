@@ -235,6 +235,7 @@ int load_balancer_init(load_balancer_t *lb, int port)
     lb->listen_ctx.fd = lb->listen_fd;
     lb->listen_ctx.role = IO_LISTEN;
     lb->listen_ctx.conn = NULL;
+    lb->strategy = LB_STRATEGY_ROUND_ROBIN;
 
     struct epoll_event ev;
     ev.events = EPOLLIN;
@@ -361,71 +362,19 @@ void handle_new_connection(load_balancer_t *lb)
 
 backend_t *select_backend(load_balancer_t *lb)
 {
-    backend_t *selected = NULL;
-    int total_weight = 0;
-    int i;
-
-    pthread_mutex_lock(&lb->backend_mutex);
-
-    // Passive recovery: re-admit backends whose last failure is far enough
-    // in the past. Cheap enough to run on every selection. Uses
-    // CLOCK_MONOTONIC to match mark_backend_failure — must be the same clock.
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    time_t now = (time_t)ts.tv_sec;
-    for (i = 0; i < lb->backend_count; i++)
+    switch (lb->strategy)
     {
-        backend_t *b = &lb->backends[i];
-        if (b->health_status == 0 && (now - b->last_health_check) >= HEALTH_RECOVERY_SECS)
-        {
-            b->health_status = 1;
-            b->consecutive_failures = 0;
-        }
+    case LB_STRATEGY_ROUND_ROBIN:
+        return backend_round_robin_select(lb);
+    case LB_STRATEGY_LEAST_CONN:
+        return least_connection_select(lb);
+    case LB_STRATEGY_IP_HASH:
+        return ip_hash_select(lb);
+    case LB_STRATEGY_RANDOM:
+        return random_select(lb);
+    default:
+        return backend_round_robin_select(lb);
     }
-
-    // Calculate total weight of healthy backends
-    for (i = 0; i < lb->backend_count; i++)
-    {
-        if (lb->backends[i].health_status == 1)
-        {
-            total_weight += lb->backends[i].weight;
-        }
-    }
-
-    if (total_weight == 0)
-    {
-        pthread_mutex_unlock(&lb->backend_mutex);
-        return NULL;
-    }
-
-    // Smooth weighted round-robin selection (nginx-style).
-    int best_weight = -1;
-
-    for (i = 0; i < lb->backend_count; i++)
-    {
-        backend_t *backend = &lb->backends[i];
-
-        if (backend->health_status != 1)
-        {
-            continue;
-        }
-
-        backend->current_weight += backend->weight;
-
-        if (backend->current_weight > best_weight)
-        {
-            best_weight = backend->current_weight;
-            selected = backend;
-        }
-    }
-
-    if (selected)
-    {
-        selected->current_weight -= total_weight;
-    }
-
-    pthread_mutex_unlock(&lb->backend_mutex);
-    return selected;
 }
 
 // Client -> backend: read a chunk from the client and forward it.
