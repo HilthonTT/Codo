@@ -96,8 +96,8 @@ diagnostics helpers (`diagnose_network_issue`, `debug_packet_dump`) for debuggin
 ## Build
 
 The repo is a small workspace: shared code is compiled once into a static
-`libcommon.a`, and each binary (the server and the load balancer) links against
-it.
+`libcommon.a`, the storage engine into `libstorage.a`, and each binary links
+what it needs (the server links both; the balancer only `libcommon.a`).
 
 ```
 make             # build both binaries (bin/codo + bin/codo-balancer)
@@ -137,9 +137,9 @@ The storage engine runs a final checkpoint on shutdown (`SIGINT`/`SIGTERM`), so 
 
 ## Layout
 
-The codebase is split into three components, each with its own `include/` +
-`src/`. `common/` is shared infrastructure; `server/` and `balancer/` are the
-two binaries built on top of it.
+The codebase is split into four components, each with its own `include/` +
+`src/`. `common/` and `storage/` are libraries; `server/` and `balancer/` are
+the two binaries built on top of them.
 
 ```
 common/     shared infrastructure compiled into libcommon.a
@@ -147,23 +147,35 @@ common/     shared infrastructure compiled into libcommon.a
             compression, http_protocol, mime
   src/      env, util, stats, mime, compression, http_protocol,
             connection (cleanup + socket helpers)
+storage/    embedded B-tree storage engine compiled into libstorage.a
+  include/  storage.h — the public API (engine lifecycle, transactions,
+            db_insert/search/update/delete/scan)
+  src/      storage_internal.h (private structs, shared by the .c files below)
+            engine   — singleton, init/cleanup, checkpoint, statistics
+            wal      — write-ahead log append + flush
+            pager    — buffer pool, page IO, free-page management, checksums
+            btree    — page-level key search/insert/delete
+            txn      — transaction begin/commit/abort
+            db       — CRUD/scan API (tree descent over the layers above)
 server/     the HTTP/1.1 server (bin/codo)
   include/  server, worker, route, handlers, todo_handlers,
-            btree_storage, ssl_util, websocket
+            ssl_util, websocket, middleware
   src/      main, server, worker, connection_pool, route, handlers,
-            todo_handlers, btree_storage, ssl, websocket
+            todo_handlers, ssl_util, websocket, middleware
 balancer/   epoll TCP load balancer (bin/codo-balancer)
-  include/  balancer
-  src/      main, balancer
-build/      .o + .d files per component + libcommon.a
+  include/  balancer, types, selection, hash
+  src/      main, balancer, selection, hash
+build/      .o + .d files per component + libcommon.a + libstorage.a
 bin/        output binaries (codo, codo-balancer)
 scripts/    bash + curl helpers for the Todo API (create/list/get/update/delete)
 tests/      reserved (no test harness yet)
 ```
 
 The Todo API lives in `server/src/todo_handlers.c` (HTTP/JSON layer) on top of
-`server/src/btree_storage.c` (the storage engine). `server/src/main.c`
-initializes the engine, seeds the id counter, and registers the routes.
+the storage engine's public API (`storage/include/storage.h`). The engine's
+internals — pages, buffer pool, WAL records, locking — are private to
+`storage/src/`. `server/src/main.c` initializes the engine, seeds the id
+counter, and registers the routes.
 
 ### What is shared vs. server-only
 
@@ -172,8 +184,8 @@ env loading, the HTTP request parser / response writer (`http_protocol.c`),
 generic socket helpers and per-connection teardown (`connection.c`), network
 stats, MIME lookup, and gzip plumbing. The server adds the pieces bound to its
 own state: the connection pool (`connection_pool.c`, which tracks live
-connections in `http_server_t`), TLS context setup (`ssl.c`), the worker/epoll
-loop, routing, and the Todo API.
+connections in `http_server_t`), TLS context setup (`ssl_util.c`), the
+worker/epoll loop, routing, and the Todo API.
 
 Two deliberate seams keep `common/` free of server types:
 
@@ -188,7 +200,7 @@ Two deliberate seams keep `common/` free of server types:
 `balancer/` is a TCP load balancer (`bin/codo-balancer`) that fronts one or
 more `codo` instances. It runs a single-threaded `epoll` event loop:
 `load_balancer_init()` binds the listen socket and creates the epoll instance,
-`handle_new_connection()` accepts a client, picks a backend, and opens a
+`lb_handle_new_connection()` accepts a client, picks a backend, and opens a
 non-blocking connection to it, and the loop then proxies bytes in both
 directions (`client -> backend` via `client_buffer`, `backend -> client` via
 `backend_buffer`), pausing reads on one side when the other side's socket is not

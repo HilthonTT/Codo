@@ -1,206 +1,147 @@
 [
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/compression.o",
-      "src/compression.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/compression.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/compression.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/connection_pool.c -o build/server/connection_pool.o",
+    "file": "server/src/connection_pool.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/connection.o",
-      "src/connection.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/connection.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/connection.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/handlers.c -o build/server/handlers.o",
+    "file": "server/src/handlers.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/handlers.o",
-      "src/handlers.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/handlers.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/handlers.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/main.c -o build/server/main.o",
+    "file": "server/src/main.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/http_protocol.o",
-      "src/http_protocol.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/http_protocol.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/http_protocol.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/middleware.c -o build/server/middleware.o",
+    "file": "server/src/middleware.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/main.o",
-      "src/main.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/main.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/main.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/route.c -o build/server/route.o",
+    "file": "server/src/route.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/mime.o",
-      "src/mime.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/mime.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/mime.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/server.c -o build/server/server.o",
+    "file": "server/src/server.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/route.o",
-      "src/route.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/route.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/route.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/ssl_util.c -o build/server/ssl_util.o",
+    "file": "server/src/ssl_util.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/server.o",
-      "src/server.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/server.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/server.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/todo_handlers.c -o build/server/todo_handlers.o",
+    "file": "server/src/todo_handlers.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/ssl.o",
-      "src/ssl.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/ssl.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/ssl.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/websocket.c -o build/server/websocket.o",
+    "file": "server/src/websocket.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/util.o",
-      "src/util.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/util.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/util.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -MMD -MP -c server/src/worker.c -o build/server/worker.o",
+    "file": "server/src/worker.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/websocket.o",
-      "src/websocket.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/websocket.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/websocket.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Istorage/include -MMD -MP -c storage/src/btree.c -o build/storage/btree.o",
+    "file": "storage/src/btree.c"
   },
   {
-    "arguments": [
-      "/usr/bin/gcc",
-      "-Wall",
-      "-Wextra",
-      "-Wpedantic",
-      "-std=c11",
-      "-Iinclude",
-      "-c",
-      "-o",
-      "build/worker.o",
-      "src/worker.c"
-    ],
-    "directory": "/home/nobody_home/Documents/Repos/OTA",
-    "file": "/home/nobody_home/Documents/Repos/OTA/src/worker.c",
-    "output": "/home/nobody_home/Documents/Repos/OTA/build/worker.o"
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Istorage/include -MMD -MP -c storage/src/db.c -o build/storage/db.o",
+    "file": "storage/src/db.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Istorage/include -MMD -MP -c storage/src/engine.c -o build/storage/engine.o",
+    "file": "storage/src/engine.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Istorage/include -MMD -MP -c storage/src/pager.c -o build/storage/pager.o",
+    "file": "storage/src/pager.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Istorage/include -MMD -MP -c storage/src/txn.c -o build/storage/txn.o",
+    "file": "storage/src/txn.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Istorage/include -MMD -MP -c storage/src/wal.c -o build/storage/wal.o",
+    "file": "storage/src/wal.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/compression.c -o build/common/compression.o",
+    "file": "common/src/compression.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/connection.c -o build/common/connection.o",
+    "file": "common/src/connection.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/env.c -o build/common/env.o",
+    "file": "common/src/env.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/http_protocol.c -o build/common/http_protocol.o",
+    "file": "common/src/http_protocol.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/lockfree.c -o build/common/lockfree.o",
+    "file": "common/src/lockfree.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/mime.c -o build/common/mime.o",
+    "file": "common/src/mime.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/stats.c -o build/common/stats.o",
+    "file": "common/src/stats.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/thread_pool.c -o build/common/thread_pool.o",
+    "file": "common/src/thread_pool.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/util.c -o build/common/util.o",
+    "file": "common/src/util.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Ibalancer/include -MMD -MP -c balancer/src/balancer.c -o build/balancer/balancer.o",
+    "file": "balancer/src/balancer.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Ibalancer/include -MMD -MP -c balancer/src/hash.c -o build/balancer/hash.o",
+    "file": "balancer/src/hash.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Ibalancer/include -MMD -MP -c balancer/src/main.c -o build/balancer/main.o",
+    "file": "balancer/src/main.c"
+  },
+  {
+    "directory": "/mnt/d/ProgrammingProjects/C/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Ibalancer/include -MMD -MP -c balancer/src/selection.c -o build/balancer/selection.o",
+    "file": "balancer/src/selection.c"
   }
 ]

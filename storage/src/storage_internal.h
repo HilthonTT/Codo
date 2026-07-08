@@ -1,15 +1,27 @@
-#ifndef BTREE_STORAGE_H
-#define BTREE_STORAGE_H
+#ifndef STORAGE_INTERNAL_H
+#define STORAGE_INTERNAL_H
 
-#include <stdint.h>
-#include <stdatomic.h>
+// Private data structures and cross-file helpers of the storage engine.
+// Nothing outside storage/src may include this header; the public contract is
+// storage/include/storage.h. The engine is split by concern:
+//
+//   engine.c  singleton definition, init/cleanup, checkpoint, statistics
+//   wal.c     LSN allocation, WAL record append + flush (write-ahead ordering)
+//   pager.c   buffer pool (hash lookup, LRU eviction, pin/lock), page IO,
+//             free-page management, checksums
+//   btree.c   page-level key operations (search, insert, delete within a page)
+//   txn.c     transaction lifecycle (begin/commit/abort, undo log teardown)
+//   db.c      public CRUD/scan API: tree descent on top of the layers above
+
 #include <pthread.h>
-#include <time.h>
+#include <stdatomic.h>
 #include <stdbool.h>
+#include <stdint.h>
+#include <time.h>
+
+#include "storage.h"
 
 #define PAGE_SIZE 4096
-#define MAX_KEY_SIZE 256
-#define MAX_VALUE_SIZE 1024
 #define MAX_PAGES 1000000
 #define BTREE_ORDER 128
 #define BUFFER_POOL_SIZE 10000
@@ -33,7 +45,7 @@ typedef enum
   LOCK_UPDATE = 3,
 } lock_type_t;
 
-// Transaction types
+// Transaction states
 typedef enum
 {
   TXN_STATE_ACTIVE,
@@ -106,8 +118,8 @@ typedef struct
   uint32_t hash_next; // For hash table chaining
 } buffer_entry_t;
 
-// Transaction structure
-typedef struct transaction
+// Transaction structure (public alias: transaction_t, opaque in storage.h)
+struct transaction
 {
   uint64_t txn_id;
   transaction_state_t state;
@@ -135,7 +147,7 @@ typedef struct transaction
   } stats;
 
   struct transaction *next;
-} transaction_t;
+};
 
 // Lock entry
 typedef struct lock_entry
@@ -241,14 +253,18 @@ typedef struct
 
 } storage_engine_t;
 
-// Utility functions
-uint64_t hash_key(const char *key, size_t length);
+// The process-wide engine singleton, defined in engine.c.
+extern storage_engine_t g_storage;
+
+// wal.c
+uint64_t allocate_lsn(void);
+int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id,
+                     const void *data, size_t data_length);
+int flush_wal_buffer(void);
+
+// pager.c
 uint32_t hash_page_id(uint32_t page_id);
 uint32_t calculate_checksum(const void *data, size_t length);
-uint64_t allocate_lsn(void);
-
-int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, const void *data, size_t data_length);
-int flush_wal_buffer(void);
 buffer_entry_t *find_buffer_entry(uint32_t page_id);
 buffer_entry_t *allocate_buffer_entry(uint32_t page_id);
 btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type);
@@ -257,7 +273,7 @@ void mark_page_dirty(uint32_t page_id);
 uint32_t allocate_page(void);
 void deallocate_page(uint32_t page_id);
 
-// B-tree operations
+// btree.c
 int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2);
 kv_pair_t *get_kv_pair(btree_page_t *page, int index);
 int find_key_position(btree_page_t *page, const char *key, size_t key_length);
@@ -270,36 +286,5 @@ int insert_kv_pair(
     size_t value_length,
     uint32_t child_page_id);
 int delete_kv_pair(btree_page_t *page, int position);
-
-transaction_t *begin_transaction(void);
-int commit_transaction(transaction_t *txn);
-int abort_transaction(transaction_t *txn);
-
-// High-level database operations
-int db_insert(transaction_t *txn, const char *key, size_t key_length, const char *value, size_t value_length);
-int db_search(transaction_t *txn, const char *key, size_t key_length, char *value, size_t *value_length);
-int db_update(transaction_t *txn, const char *key, size_t key_length, const char *new_value, size_t new_value_length);
-int db_delete(transaction_t *txn, const char *key, size_t key_length);
-
-// Iterate every key-value pair in key order. The callback returns non-zero to
-// stop iteration early. Returns 0 on success, -1 on error.
-typedef int (*db_scan_callback_t)(const char *key, size_t key_length,
-                                  const char *value, size_t value_length,
-                                  void *ctx);
-int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx);
-
-int perform_checkpoint(void);
-void print_storage_statistics(void);
-void print_storage_statistics(void);
-
-// Initialization and cleanup
-int init_storage_engine(const char *data_file, const char *wal_file);
-void cleanup_storage_engine(void);
-
-// Signal handlers
-void signal_handler(int sig);
-
-// Test and demonstration
-void test_storage_engine(void);
 
 #endif

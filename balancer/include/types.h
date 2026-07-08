@@ -1,23 +1,19 @@
-#ifndef LB_TYPES
-#define LB_TYPES
+#ifndef LB_TYPES_H
+#define LB_TYPES_H
 
-#include <time.h>
-#include <stdint.h>
-#include <sys/epoll.h>
-#include <sys/socket.h>
+// Core data types of the load balancer. Names carry an lb_/LB_ prefix where a
+// bare name would collide with the server side of the workspace (the server
+// has its own connection_t in common/include/connection.h and its own
+// MAX_EVENTS / BUFFER_SIZE in common/include/config.h).
+
 #include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
 #include <pthread.h>
-#include <errno.h>
-#include <stdbool.h>
+#include <stddef.h>
+#include <sys/epoll.h>
+#include <time.h>
 
-#define MAX_EVENTS 1000
-#define BUFFER_SIZE 8192
+#define LB_MAX_EVENTS 1000
+#define LB_BUFFER_SIZE 8192
 #define MAX_BACKENDS 100
 
 typedef enum
@@ -53,13 +49,13 @@ typedef enum
   IO_BACKEND
 } io_role_t;
 
-struct connection;
+struct lb_connection;
 
 typedef struct
 {
   int fd;
   io_role_t role;
-  struct connection *conn; // NULL for the listen socket
+  struct lb_connection *conn; // NULL for the listen socket
 } io_ctx_t;
 
 typedef struct
@@ -71,11 +67,11 @@ typedef struct
   int backend_count;
   int current_backend;
   pthread_mutex_t backend_mutex;
-  struct epoll_event events[MAX_EVENTS];
+  struct epoll_event events[LB_MAX_EVENTS];
   lb_strategy_t strategy;
 } load_balancer_t;
 
-typedef struct connection
+typedef struct lb_connection
 {
   int client_fd;
   int backend_fd;
@@ -85,13 +81,13 @@ typedef struct connection
   // client_buffer holds bytes travelling client -> backend; backend_buffer
   // holds bytes travelling backend -> client. *_sent tracks how much of the
   // current chunk has already been flushed when a write is only partial.
-  char client_buffer[BUFFER_SIZE];
-  char backend_buffer[BUFFER_SIZE];
+  char client_buffer[LB_BUFFER_SIZE];
+  char backend_buffer[LB_BUFFER_SIZE];
   size_t client_buffer_len;
   size_t client_buffer_sent;
   size_t backend_buffer_len;
   size_t backend_buffer_sent;
   struct timespec start_time;
-} connection_t;
+} lb_connection_t;
 
 #endif

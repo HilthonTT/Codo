@@ -8,11 +8,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "btree_storage.h"
 #include "http_protocol.h"
 #include "http_types.h"
 #include "route.h"
 #include "server.h"
+#include "storage.h"
 #include "todo_handlers.h"
 
 // Todos are stored in the btree keyed by their decimal id (e.g. "42"); the

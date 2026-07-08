@@ -1,3 +1,13 @@
+#define _GNU_SOURCE
+
+#include <arpa/inet.h>
+#include <assert.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "hash.h"
 #include "selection.h"
 
 static void passive_recovery(load_balancer_t *lb)

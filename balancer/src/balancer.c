@@ -1,11 +1,23 @@
+#define _GNU_SOURCE
+
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/tcp.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
+
 #include "balancer.h"
 
-#include <netinet/tcp.h>
-#include <sys/uio.h>
-
 // Forward declarations for the file-local proxy helpers.
-static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn);
-static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn);
+static void flush_client_to_backend(load_balancer_t *lb, lb_connection_t *conn);
+static void flush_backend_to_client(load_balancer_t *lb, lb_connection_t *conn);
 
 // Passive-health-check helpers. Every failure attributable to the backend
 // bumps consecutive_failures; once we cross the threshold the backend is
@@ -80,7 +92,7 @@ static void send_503(int client_fd)
     }
 }
 
-static void update_epoll_interest(load_balancer_t *lb, connection_t *conn)
+static void update_epoll_interest(load_balancer_t *lb, lb_connection_t *conn)
 {
     uint32_t client_events = 0, backend_events = 0;
 
@@ -118,7 +130,7 @@ int load_balancer_main_loop(load_balancer_t *lb)
 
     while (true)
     {
-        nfds = epoll_wait(lb->epoll_fd, lb->events, MAX_EVENTS, -1);
+        nfds = epoll_wait(lb->epoll_fd, lb->events, LB_MAX_EVENTS, -1);
         if (nfds == -1)
         {
             if (errno == EINTR)
@@ -137,17 +149,17 @@ int load_balancer_main_loop(load_balancer_t *lb)
             // New client connection on the listen socket.
             if (ctx->role == IO_LISTEN)
             {
-                handle_new_connection(lb);
+                lb_handle_new_connection(lb);
                 continue;
             }
 
-            connection_t *conn = ctx->conn;
+            lb_connection_t *conn = ctx->conn;
 
             // Hangup / error tears the whole connection down regardless of the
             // other reported events, so handle it first and move on.
             if (event->events & (EPOLLHUP | EPOLLERR))
             {
-                handle_connection_error(lb, conn);
+                lb_handle_connection_error(lb, conn);
                 continue;
             }
 
@@ -157,22 +169,22 @@ int load_balancer_main_loop(load_balancer_t *lb)
             {
                 if (ctx->role == IO_CLIENT)
                 {
-                    handle_client_data(lb, conn);
+                    lb_handle_client_data(lb, conn);
                 }
                 else
                 {
-                    handle_backend_data(lb, conn);
+                    lb_handle_backend_data(lb, conn);
                 }
             }
             else if (event->events & EPOLLOUT)
             {
                 if (ctx->role == IO_CLIENT)
                 {
-                    handle_client_write(lb, conn);
+                    lb_handle_client_write(lb, conn);
                 }
                 else
                 {
-                    handle_backend_write(lb, conn);
+                    lb_handle_backend_write(lb, conn);
                 }
             }
         }
@@ -278,13 +290,13 @@ int add_backend(load_balancer_t *lb, const char *host, int port, int weight)
 }
 
 // Handle new client connection
-void handle_new_connection(load_balancer_t *lb)
+void lb_handle_new_connection(load_balancer_t *lb)
 {
     struct sockaddr_in client_addr;
     socklen_t client_len = sizeof(client_addr);
     int client_fd, backend_fd;
     backend_t *backend;
-    connection_t *conn;
+    lb_connection_t *conn;
 
     // Accept client connection
     client_fd = accept(lb->listen_fd, (struct sockaddr *)&client_addr, &client_len);
@@ -331,14 +343,14 @@ void handle_new_connection(load_balancer_t *lb)
     setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
     // Create connection structure
-    conn = malloc(sizeof(connection_t));
+    conn = malloc(sizeof(lb_connection_t));
     if (!conn)
     {
         close(client_fd);
         close(backend_fd);
         return;
     }
-    memset(conn, 0, sizeof(connection_t));
+    memset(conn, 0, sizeof(lb_connection_t));
     conn->client_fd = client_fd;
     conn->backend_fd = backend_fd;
     conn->backend = backend;
@@ -378,16 +390,16 @@ backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_in *client_
 }
 
 // Client -> backend: read a chunk from the client and forward it.
-void handle_client_data(load_balancer_t *lb, connection_t *conn)
+void lb_handle_client_data(load_balancer_t *lb, lb_connection_t *conn)
 {
     ssize_t bytes_read;
 
-    bytes_read = read(conn->client_fd, conn->client_buffer, BUFFER_SIZE);
+    bytes_read = read(conn->client_fd, conn->client_buffer, LB_BUFFER_SIZE);
     if (bytes_read <= 0)
     {
         if (bytes_read == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
         {
-            close_connection(lb, conn);
+            lb_close_connection(lb, conn);
         }
         return;
     }
@@ -398,23 +410,23 @@ void handle_client_data(load_balancer_t *lb, connection_t *conn)
 }
 
 // Backend -> client: read a chunk from the backend and forward it.
-void handle_backend_data(load_balancer_t *lb, connection_t *conn)
+void lb_handle_backend_data(load_balancer_t *lb, lb_connection_t *conn)
 {
     ssize_t bytes_read;
 
-    bytes_read = read(conn->backend_fd, conn->backend_buffer, BUFFER_SIZE);
+    bytes_read = read(conn->backend_fd, conn->backend_buffer, LB_BUFFER_SIZE);
     if (bytes_read <= 0)
     {
         if (bytes_read == 0)
         {
             // Clean EOF from backend — normal close of the response.
-            close_connection(lb, conn);
+            lb_close_connection(lb, conn);
         }
         else if (errno != EAGAIN && errno != EWOULDBLOCK)
         {
             // Read error from backend — attribute to backend health.
             mark_backend_failure(lb, conn->backend);
-            close_connection(lb, conn);
+            lb_close_connection(lb, conn);
         }
         return;
     }
@@ -428,19 +440,19 @@ void handle_backend_data(load_balancer_t *lb, connection_t *conn)
 }
 
 // The client socket is writable again: drain whatever the backend produced.
-void handle_client_write(load_balancer_t *lb, connection_t *conn)
+void lb_handle_client_write(load_balancer_t *lb, lb_connection_t *conn)
 {
     flush_backend_to_client(lb, conn);
 }
 
 // The backend socket is writable again (also fires when a non-blocking connect
 // completes): drain whatever the client sent.
-void handle_backend_write(load_balancer_t *lb, connection_t *conn)
+void lb_handle_backend_write(load_balancer_t *lb, lb_connection_t *conn)
 {
     flush_client_to_backend(lb, conn);
 }
 
-void handle_connection_error(load_balancer_t *lb, connection_t *conn)
+void lb_handle_connection_error(load_balancer_t *lb, lb_connection_t *conn)
 {
     // We don't know which side raised the error, but check the backend fd's
     // pending socket error explicitly — a refused/reset backend is the most
@@ -451,13 +463,13 @@ void handle_connection_error(load_balancer_t *lb, connection_t *conn)
     {
         mark_backend_failure(lb, conn->backend);
     }
-    close_connection(lb, conn);
+    lb_close_connection(lb, conn);
 }
 
 // Push the buffered client->backend bytes to the backend. If the backend blocks
 // we stop reading the client and wait for the backend to become writable; once
 // fully drained we restore normal read interest on both sides.
-static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn)
+static void flush_client_to_backend(load_balancer_t *lb, lb_connection_t *conn)
 {
     while (conn->client_buffer_sent < conn->client_buffer_len)
     {
@@ -479,7 +491,7 @@ static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn)
         // Write to backend failed for a non-transient reason — the backend
         // is the responsible party, so this counts against its health.
         mark_backend_failure(lb, conn->backend);
-        close_connection(lb, conn);
+        lb_close_connection(lb, conn);
         return;
     }
 
@@ -490,7 +502,7 @@ static void flush_client_to_backend(load_balancer_t *lb, connection_t *conn)
 }
 
 // Mirror of flush_client_to_backend for the backend->client direction.
-static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn)
+static void flush_backend_to_client(load_balancer_t *lb, lb_connection_t *conn)
 {
     while (conn->backend_buffer_sent < conn->backend_buffer_len)
     {
@@ -509,7 +521,7 @@ static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn)
             return;
         }
 
-        close_connection(lb, conn);
+        lb_close_connection(lb, conn);
         return;
     }
 
@@ -518,7 +530,7 @@ static void flush_backend_to_client(load_balancer_t *lb, connection_t *conn)
     update_epoll_interest(lb, conn);
 }
 
-void close_connection(load_balancer_t *lb, connection_t *conn)
+void lb_close_connection(load_balancer_t *lb, lb_connection_t *conn)
 {
     struct timespec end_time;
     long long response_time;
@@ -594,7 +606,7 @@ int create_backend_connection(backend_t *backend)
 }
 
 // Register both ends of a freshly-accepted connection with epoll.
-int add_connection_to_epoll(load_balancer_t *lb, connection_t *conn)
+int add_connection_to_epoll(load_balancer_t *lb, lb_connection_t *conn)
 {
     conn->client_ctx.fd = conn->client_fd;
     conn->client_ctx.role = IO_CLIENT;
