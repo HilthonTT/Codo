@@ -41,6 +41,7 @@ int main(int argc, char *argv[])
   bool ssl_enabled = env_bool("SSL_ENABLED", true);
   const char *db_file = env_str("DB_FILE", "codo.db");
   const char *wal_file = env_str("WAL_FILE", "codo.wal");
+  const char *cors_origin = env_str("CORS_ALLOW_ORIGIN", "*");
 
   // Command line arguments still override everything
   if (argc > 1)
@@ -79,9 +80,16 @@ int main(int argc, char *argv[])
   }
   todo_api_init();
 
+  // Store the CORS policy where the middleware can reach it.
+  snprintf(g_server.cors_allow_origin, sizeof(g_server.cors_allow_origin),
+           "%s", cors_origin);
+
   // Register middleware first -- it wraps every route handler below. The
-  // logging middleware is registered first so it times the whole chain.
+  // logging middleware is registered first so it times the whole chain
+  // (including CORS). CORS runs next so it can answer preflight requests before
+  // they reach any route or the default file handler.
   add_middleware(&g_server, logging_middleware);
+  add_middleware(&g_server, cors_middleware);
 
   // Add example routes
   add_route(&g_server, "/api/hello", HTTP_GET, api_hello_handler);

@@ -20,6 +20,7 @@
 #include "server.h"
 #include "stats.h"
 #include "thread_pool.h"
+#include "websocket.h"
 #include "worker.h"
 
 // Payload handed to a storage-pool thread describing one offloaded request.
@@ -416,11 +417,125 @@ static int check_request_frame(connection_t *conn, size_t max_body)
   return 1;
 }
 
+// Drive an established WebSocket connection: drain readable bytes, decode the
+// buffered frames, and stage the server's replies. Returns 0 to keep the
+// connection (armed for read or write as appropriate) or -1 to tear it down.
+static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
+{
+  bool should_close = false;
+
+  // Read/decode in passes so an edge-triggered socket is fully drained even if
+  // the read buffer fills mid-way (decoding frees space by consuming frames).
+  for (;;)
+  {
+    bool drained = false;
+
+    for (;;)
+    {
+      if (conn->read_buffer_pos >= sizeof(conn->read_buffer) - 1)
+      {
+        break; // buffer full; decode below frees room (or flags a close)
+      }
+
+      ssize_t bytes_read;
+      if (conn->ssl_enabled && conn->ssl)
+      {
+        bytes_read = SSL_read(conn->ssl,
+                              conn->read_buffer + conn->read_buffer_pos,
+                              (int)(sizeof(conn->read_buffer) - conn->read_buffer_pos - 1));
+        if (bytes_read <= 0)
+        {
+          int ssl_error = SSL_get_error(conn->ssl, (int)bytes_read);
+          if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
+          {
+            drained = true;
+            break;
+          }
+          return -1;
+        }
+      }
+      else
+      {
+        bytes_read = read(conn->socket_fd,
+                          conn->read_buffer + conn->read_buffer_pos,
+                          sizeof(conn->read_buffer) - conn->read_buffer_pos - 1);
+        if (bytes_read == 0)
+        {
+          return -1; // peer closed
+        }
+        if (bytes_read < 0)
+        {
+          if (errno == EAGAIN || errno == EWOULDBLOCK)
+          {
+            drained = true;
+            break;
+          }
+          if (errno == EINTR)
+          {
+            continue;
+          }
+          return -1;
+        }
+      }
+
+      conn->read_buffer_pos += (size_t)bytes_read;
+      worker->bytes_received += (uint64_t)bytes_read;
+      stats_record_bytes_received((uint64_t)bytes_read);
+      conn->last_activity = time(NULL);
+    }
+
+    ws_process_frames(conn, &should_close);
+    if (should_close)
+    {
+      break;
+    }
+    if (drained)
+    {
+      break;
+    }
+    // Buffer filled: if decoding could not free any room the pending frame is
+    // wedged (ws_process_frames emits a Close in that case), so stop. Otherwise
+    // loop back and keep reading the still-readable socket.
+    if (conn->read_buffer_pos >= sizeof(conn->read_buffer) - 1)
+    {
+      should_close = true;
+      break;
+    }
+  }
+
+  // Flush any staged reply frames (echoes/pongs/close) by arming EPOLLOUT.
+  if (conn->write_buffer_size > 0)
+  {
+    conn->write_buffer_pos = 0;
+    conn->websocket_closing = should_close;
+    conn->state = CONN_STATE_WRITING_RESPONSE;
+
+    struct epoll_event ev;
+    ev.events = EPOLLOUT | EPOLLET;
+    ev.data.ptr = conn;
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev) < 0)
+    {
+      return -1;
+    }
+    return 0;
+  }
+
+  // Nothing to send: either wait for more data, or tear down on a bare close.
+  return should_close ? -1 : 0;
+}
+
 int handle_client_data(worker_thread_t *worker, connection_t *conn)
 {
   if (!worker || !conn)
   {
     return -1;
+  }
+
+  // Once the handshake has switched this connection to WebSocket framing, all
+  // further inbound bytes are frames, not HTTP requests.
+  if (conn->state == CONN_STATE_WEBSOCKET)
+  {
+    return handle_websocket_data(worker, conn);
   }
 
   // Drain everything currently readable on the socket into the read buffer.
@@ -656,6 +771,32 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
   }
 
   // Response completely sent.
+
+  // A WebSocket connection (the 101 handshake or a subsequent reply frame just
+  // finished flushing): either close after a staged Close, or return to frame-
+  // read mode. Do NOT touch read_buffer_pos here -- it may already hold the
+  // start of the next frame.
+  if (conn->websocket_handshake_complete)
+  {
+    if (conn->websocket_closing)
+    {
+      return -1; // Close frame flushed; tear the connection down.
+    }
+
+    conn->state = CONN_STATE_WEBSOCKET;
+    conn->write_buffer_pos = 0;
+    conn->write_buffer_size = 0;
+
+    struct epoll_event event;
+    event.events = EPOLLIN | EPOLLET;
+    event.data.ptr = conn;
+    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &event) < 0)
+    {
+      return -1;
+    }
+    return 0;
+  }
+
   if (conn->request.keep_alive && g_server.enable_keepalive)
   {
     // Reset for next request on this connection.

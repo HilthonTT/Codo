@@ -104,9 +104,20 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
     return send_error_response(conn, HTTP_FORBIDDEN, "Access denied");
   }
 
-  // Construct file path
-  char file_path[2048];
-  snprintf(file_path, sizeof(file_path), "%s%s", g_server.document_root, request->uri);
+  // Construct file path. A request for a directory (trailing '/', including the
+  // bare "/") is served from its index.html so the demo site loads at the root.
+  // A truncated path is treated as not-found rather than silently serving a
+  // different (shortened) file.
+  char file_path[4096];
+  size_t uri_len = strlen(request->uri);
+  const char *suffix =
+      (uri_len > 0 && request->uri[uri_len - 1] == '/') ? "index.html" : "";
+  int path_len = snprintf(file_path, sizeof(file_path), "%s%s%s",
+                          g_server.document_root, request->uri, suffix);
+  if (path_len < 0 || (size_t)path_len >= sizeof(file_path))
+  {
+    return send_error_response(conn, HTTP_NOT_FOUND, "File not found");
+  }
 
   // Check if file exists
   struct stat file_stat;

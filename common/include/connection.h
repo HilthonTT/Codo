@@ -58,6 +58,10 @@ typedef struct connection
 
   // Websocket support
   bool websocket_handshake_complete;
+  // Set once a Close frame (or a fatal protocol error) has been staged for
+  // sending: the write path tears the connection down after flushing it rather
+  // than returning to frame-read mode.
+  bool websocket_closing;
   char websocket_frame_buffer[BUFFER_SIZE];
   size_t websocket_frame_pos;
 

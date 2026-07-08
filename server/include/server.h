@@ -55,6 +55,9 @@ typedef struct http_server
   int keepalive_timeout;
   bool enable_compression;
   size_t max_request_size;
+  // Value emitted in Access-Control-Allow-Origin by the CORS middleware. "*" by
+  // default; override with the CORS_ALLOW_ORIGIN environment variable.
+  char cors_allow_origin[256];
 
   // Statistics. These are updated concurrently from every worker thread and the
   // accept loop, so they're atomics rather than plain integers behind a mutex --

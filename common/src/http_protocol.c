@@ -147,6 +147,30 @@ int send_http_response(connection_t *conn, http_response_t *response)
     header_len += written;
   }
 
+  // Emit the CORS origin header the middleware selected for this response. Kept
+  // here (rather than in each handler) so every response path carries it. The
+  // value is server-controlled config, but guard against CR/LF injection all
+  // the same before writing it into the header block.
+  if (response->cors_origin[0])
+  {
+    if (header_field_has_crlf(response->cors_origin))
+    {
+      return -1;
+    }
+    // "Vary: Origin" is only meaningful when the allowed origin is specific --
+    // for a wildcard the response does not depend on the request's Origin.
+    const char *vary = (strcmp(response->cors_origin, "*") == 0) ? "" : "Vary: Origin\r\n";
+    int written = snprintf(header_buffer + header_len,
+                           sizeof(header_buffer) - (size_t)header_len,
+                           "Access-Control-Allow-Origin: %s\r\n%s",
+                           response->cors_origin, vary);
+    if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
+    {
+      return -1;
+    }
+    header_len += written;
+  }
+
   // End headers
   int end_written = snprintf(header_buffer + header_len,
                              sizeof(header_buffer) - (size_t)header_len, "\r\n");

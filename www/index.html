@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codo HTTP Server — Demo</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Codo HTTP Server</h1>
+      <p class="tagline">
+        A single page served straight off the C server — static files, a JSON
+        API, CORS, and a live WebSocket echo, all from one binary.
+      </p>
+    </header>
+
+    <main>
+      <section class="card">
+        <h2>Server status</h2>
+        <p class="hint">
+          <code>GET /api/status</code> and <code>GET /api/stats</code>. The
+          <em>Access-Control-Allow-Origin</em> value is read back from the
+          response headers to prove the CORS middleware is active.
+        </p>
+        <button id="refresh-status">Refresh status</button>
+        <pre id="status-out" class="out">—</pre>
+        <p id="cors-line" class="cors">CORS header: <span>—</span></p>
+      </section>
+
+      <section class="card">
+        <h2>Hello / Echo</h2>
+        <p class="hint">
+          <code>GET /api/hello</code> and <code>POST /api/echo</code>.
+        </p>
+        <div class="row">
+          <button id="hello-btn">GET /api/hello</button>
+          <input id="echo-in" type="text" placeholder="text to echo" />
+          <button id="echo-btn">POST /api/echo</button>
+        </div>
+        <pre id="hello-out" class="out">—</pre>
+      </section>
+
+      <section class="card">
+        <h2>Todos</h2>
+        <p class="hint">
+          Full CRUD against the btree storage engine:
+          <code>GET/POST/PUT/DELETE /api/todos</code>.
+        </p>
+        <div class="row">
+          <input id="todo-title" type="text" placeholder="New todo title" />
+          <button id="todo-add">Add</button>
+          <button id="todo-refresh">Refresh</button>
+        </div>
+        <ul id="todo-list" class="todos"></ul>
+      </section>
+
+      <section class="card">
+        <h2>WebSocket echo</h2>
+        <p class="hint">
+          <code>ws://&lt;host&gt;/ws/chat</code> — messages are echoed back by
+          the server's RFC 6455 frame engine.
+        </p>
+        <div class="row">
+          <span id="ws-state" class="badge off">disconnected</span>
+          <button id="ws-connect">Connect</button>
+          <button id="ws-disconnect" disabled>Disconnect</button>
+        </div>
+        <div class="row">
+          <input id="ws-in" type="text" placeholder="Message" disabled />
+          <button id="ws-send" disabled>Send</button>
+        </div>
+        <pre id="ws-log" class="out log">—</pre>
+      </section>
+    </main>
+
+    <footer>
+      <p>Served by <code>Codo-HTTP-Server</code></p>
+    </footer>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

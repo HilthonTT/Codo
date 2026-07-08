@@ -25,6 +25,7 @@ typedef enum
 // HTTP status codes
 typedef enum
 {
+  HTTP_SWITCHING_PROTOCOLS = 101,
   HTTP_OK = 200,
   HTTP_CREATED = 201,
   HTTP_ACCEPTED = 202,
@@ -86,6 +87,12 @@ typedef struct
   bool gzip_compressed;
   time_t last_modified;
   char etag[64];
+  // When non-empty, send_http_response emits this as the
+  // Access-Control-Allow-Origin header (plus "Vary: Origin" unless it is "*").
+  // Set by the CORS middleware so a single field drives CORS on every response
+  // path -- API handlers, static files, and error replies alike -- without each
+  // handler having to add the header itself. See cors_middleware().
+  char cors_origin[256];
 } http_response_t;
 
 #endif

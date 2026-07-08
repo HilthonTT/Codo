@@ -13,6 +13,8 @@ const char *http_status_to_string(http_status_t status)
 {
   switch (status)
   {
+  case HTTP_SWITCHING_PROTOCOLS:
+    return "Switching Protocols";
   case HTTP_OK:
     return "OK";
   case HTTP_CREATED:

@@ -50,4 +50,12 @@ int run_with_middleware(connection_t *conn, http_request_t *request,
 int logging_middleware(connection_t *conn, http_request_t *request,
                        http_response_t *response, middleware_ctx_t *next);
 
+// Built-in middleware: adds CORS headers. For a preflight (OPTIONS) request it
+// short-circuits the chain with a 204 that advertises the allowed methods and
+// headers; for any other request carrying an Origin header it tags the response
+// so send_http_response emits Access-Control-Allow-Origin. The allowed origin
+// comes from g_server.cors_allow_origin ("*" unless overridden).
+int cors_middleware(connection_t *conn, http_request_t *request,
+                    http_response_t *response, middleware_ctx_t *next);
+
 #endif
