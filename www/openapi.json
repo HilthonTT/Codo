@@ -1,0 +1,528 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Codo HTTP Server API",
+    "version": "0.1.0",
+    "summary": "JSON API exposed by bin/codo — example endpoints, live server stats, and a Todo CRUD API backed by the embedded B-tree storage engine.",
+    "description": "Codo is a from-scratch multi-threaded HTTP/1.1 server written in C11.\n\n**Error bodies are HTML, not JSON.** Every failure path goes through `send_error_response()`, which emits `text/html` shaped like `<html>…<h1>404 Not Found</h1><p>Todo not found</p>…</html>` and closes the connection (`Connection: close`). Only success responses carry JSON. Clients must branch on the status code rather than attempting to parse an error body as JSON.\n\n**CORS.** The `cors_middleware` runs ahead of every route. Any `OPTIONS` request — to any path, including ones that do not exist — is answered directly with `204 No Content` plus `Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS`, an `Access-Control-Allow-Headers` value reflected from the request's `Access-Control-Request-Headers` (defaulting to `Content-Type`), and `Access-Control-Max-Age: 86400`. Requests carrying an `Origin` header get `Access-Control-Allow-Origin` set from the `CORS_ALLOW_ORIGIN` env key (default `*`). Same-origin traffic is left untagged.\n\n**Method fallthrough.** Routes are matched on path *and* method. A request whose method is not registered for a path falls through to the static file handler: `GET`/`HEAD` then attempt a file lookup under `DOCUMENT_ROOT` (typically `404`), while any other method returns `405 Method Not Allowed`. So `GET /api/echo` yields `404`, but `PUT /api/hello` yields `405`.\n\n**TLS.** When `server.crt` and `server.key` exist in the working directory and `SSL_ENABLED` is not `false`, the same endpoints are served over HTTPS on the same port.",
+    "license": {
+      "name": "See LICENSE",
+      "identifier": "MIT"
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:{port}",
+      "description": "Local server (bin/codo)",
+      "variables": {
+        "port": {
+          "default": "8080",
+          "description": "Listen port; set via the PORT env key or argv[1]."
+        }
+      }
+    },
+    {
+      "url": "http://localhost:8000",
+      "description": "Through the load balancer (bin/codo-balancer)"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Todos",
+      "description": "CRUD over the embedded B-tree storage engine (buffer pool, write-ahead log, transactions). Todos persist across restarts. These handlers are dispatched to the storage thread pool rather than running on the epoll worker loop."
+    },
+    {
+      "name": "Introspection",
+      "description": "Live server and network counters."
+    },
+    {
+      "name": "Examples",
+      "description": "Minimal demo endpoints."
+    },
+    {
+      "name": "WebSocket",
+      "description": "Upgrade handshake."
+    }
+  ],
+  "paths": {
+    "/api/todos": {
+      "get": {
+        "tags": ["Todos"],
+        "summary": "List all todos",
+        "description": "Scans the whole B-tree inside a transaction and returns every todo as a JSON array. Ordering follows the B-tree key order — keys are the todo ids rendered as decimal strings, so the sort is lexicographic, not numeric (`\"10\"` sorts before `\"9\"`). The array is empty (`[]`) when no todos exist.",
+        "operationId": "listTodos",
+        "responses": {
+          "200": {
+            "description": "The full todo collection.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": { "$ref": "#/components/schemas/Todo" }
+                },
+                "examples": {
+                  "populated": {
+                    "summary": "Two todos",
+                    "value": [
+                      { "id": 1, "title": "buy milk", "completed": false },
+                      { "id": 2, "title": "walk the dog", "completed": true }
+                    ]
+                  },
+                  "empty": { "summary": "No todos yet", "value": [] }
+                }
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "post": {
+        "tags": ["Todos"],
+        "summary": "Create a todo",
+        "description": "Creates a todo from the JSON body. `title` is required; `completed` defaults to `false` when absent or unparseable. Any `id` supplied in the body is **ignored** — the server assigns the next id from a process-wide atomic counter, seeded at startup from the highest id already on disk. The created object is returned in full.",
+        "operationId": "createTodo",
+        "requestBody": {
+          "required": true,
+          "description": "An empty or missing body is rejected with `400`.",
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TodoInput" },
+              "examples": {
+                "minimal": {
+                  "summary": "Title only",
+                  "value": { "title": "buy milk" }
+                },
+                "completed": {
+                  "summary": "Already done",
+                  "value": { "title": "walk the dog", "completed": true }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Todo created and committed to the write-ahead log.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Todo" },
+                "example": { "id": 1, "title": "buy milk", "completed": false }
+              }
+            }
+          },
+          "400": {
+            "description": "Body absent/empty, or `title` missing, not a JSON string, or 1024 bytes or longer.",
+            "content": {
+              "text/html": {
+                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Missing or invalid 'title'</p></body></html>"
+              }
+            }
+          },
+          "413": { "$ref": "#/components/responses/TodoTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/todos/{id}": {
+      "parameters": [{ "$ref": "#/components/parameters/TodoId" }],
+      "get": {
+        "tags": ["Todos"],
+        "summary": "Fetch a single todo",
+        "operationId": "getTodo",
+        "responses": {
+          "200": {
+            "description": "The matching todo.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Todo" },
+                "example": { "id": 1, "title": "buy milk", "completed": false }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/InvalidTodoId" },
+          "404": { "$ref": "#/components/responses/TodoNotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "put": {
+        "tags": ["Todos"],
+        "summary": "Replace a todo",
+        "description": "Full replacement, not a partial patch: `title` is required, and an omitted `completed` resets the field to `false` rather than preserving its stored value. The id always comes from the path — an `id` in the body is ignored. The todo must already exist; this never upserts.\n\nInternally the storage engine's `db_update` only handles same-length values, so the replacement is performed as a delete followed by an insert inside a single transaction, rolled back on failure so a committed delete can never orphan the todo.",
+        "operationId": "updateTodo",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TodoInput" },
+              "example": { "title": "buy oat milk", "completed": true }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The replaced todo.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Todo" },
+                "example": {
+                  "id": 1,
+                  "title": "buy oat milk",
+                  "completed": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Non-numeric id, absent/empty body, or missing/invalid `title`.",
+            "content": {
+              "text/html": {
+                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Missing or invalid 'title'</p></body></html>"
+              }
+            }
+          },
+          "404": { "$ref": "#/components/responses/TodoNotFound" },
+          "413": { "$ref": "#/components/responses/TodoTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      },
+      "delete": {
+        "tags": ["Todos"],
+        "summary": "Delete a todo",
+        "description": "Deletes the todo and returns an empty `204`. Deleting an id that does not exist is a `404`, not a no-op success.",
+        "operationId": "deleteTodo",
+        "responses": {
+          "204": { "description": "Deleted. Empty body." },
+          "400": { "$ref": "#/components/responses/InvalidTodoId" },
+          "404": { "$ref": "#/components/responses/TodoNotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/api/status": {
+      "get": {
+        "tags": ["Introspection"],
+        "summary": "Server counters",
+        "description": "Atomic counters held on the `http_server_t` instance.",
+        "operationId": "getStatus",
+        "responses": {
+          "200": {
+            "description": "A snapshot of server-level counters.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Status" },
+                "example": {
+                  "server": "Codo-HTTP-Server/1.0",
+                  "total_connections": 12,
+                  "total_requests": 34,
+                  "active_connections": 2
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "tags": ["Introspection"],
+        "summary": "Network counters",
+        "description": "Process-wide lock-free counters updated on the accept / read / write / close paths.",
+        "operationId": "getStats",
+        "responses": {
+          "200": {
+            "description": "A snapshot of network counters.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Stats" },
+                "example": {
+                  "bytes_sent": 926,
+                  "bytes_received": 513,
+                  "packets_sent": 4,
+                  "packets_received": 5,
+                  "connections_accepted": 5,
+                  "connections_closed": 4,
+                  "errors": 0
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The formatted counters did not fit the response buffer.",
+            "content": {
+              "text/html": {
+                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "example": "<html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>Stats too large</p></body></html>"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/hello": {
+      "get": {
+        "tags": ["Examples"],
+        "summary": "Static greeting",
+        "description": "Returns a fixed JSON document. The `timestamp` is a hard-coded literal, not the current time.",
+        "operationId": "getHello",
+        "responses": {
+          "200": {
+            "description": "The greeting.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": { "type": "string", "const": "Hello, World!" },
+                    "timestamp": {
+                      "type": "string",
+                      "description": "Hard-coded; does not reflect request time.",
+                      "const": "2026-01-01T00:00:00Z"
+                    }
+                  }
+                },
+                "example": {
+                  "message": "Hello, World!",
+                  "timestamp": "2026-01-01T00:00:00Z"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/echo": {
+      "post": {
+        "tags": ["Examples"],
+        "summary": "Echo the request body",
+        "description": "Returns the request body verbatim as `text/plain`, whatever its content type. An empty body echoes an empty string. Note that `GET /api/echo` is not routed and falls through to the static file handler, yielding `404`.",
+        "operationId": "postEcho",
+        "requestBody": {
+          "required": false,
+          "content": {
+            "text/plain": {
+              "schema": { "type": "string" },
+              "example": "hello there"
+            },
+            "application/json": { "schema": {} }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The body, echoed byte-for-byte as `text/plain`.",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" },
+                "example": "hello there"
+              }
+            }
+          },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/ws/chat": {
+      "get": {
+        "tags": ["WebSocket"],
+        "summary": "WebSocket upgrade handshake",
+        "description": "Performs the RFC 6455 opening handshake: the request must carry `Upgrade: websocket`, `Connection: Upgrade`, and a `Sec-WebSocket-Key`. The server replies `101 Switching Protocols` with `Sec-WebSocket-Accept` computed as base64(SHA-1(key + GUID)), after which the connection leaves HTTP and speaks WebSocket frames.\n\nA plain `GET` without the upgrade headers is rejected with `400`.",
+        "operationId": "websocketChat",
+        "parameters": [
+          {
+            "name": "Upgrade",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "const": "websocket" }
+          },
+          {
+            "name": "Connection",
+            "in": "header",
+            "required": true,
+            "schema": { "type": "string", "const": "Upgrade" }
+          },
+          {
+            "name": "Sec-WebSocket-Key",
+            "in": "header",
+            "required": true,
+            "description": "Base64-encoded 16-byte nonce.",
+            "schema": { "type": "string" },
+            "example": "dGhlIHNhbXBsZSBub25jZQ=="
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Protocol switched to WebSocket.",
+            "headers": {
+              "Upgrade": {
+                "schema": { "type": "string", "const": "websocket" }
+              },
+              "Connection": {
+                "schema": { "type": "string", "const": "Upgrade" }
+              },
+              "Sec-WebSocket-Accept": {
+                "description": "base64(SHA-1(Sec-WebSocket-Key + \"258EAFA5-E914-47DA-95CA-C5AB0DC85B11\"))",
+                "schema": { "type": "string" }
+              }
+            }
+          },
+          "400": {
+            "description": "Upgrade headers absent, or `Sec-WebSocket-Key` missing.",
+            "content": {
+              "text/html": {
+                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>WebSocket upgrade required</p></body></html>"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "TodoId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "Decimal digits only. Anything else — a negative sign, a leading `+`, whitespace, or letters — is rejected with `400` before the storage engine is consulted.",
+        "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+        "example": 1
+      }
+    },
+    "schemas": {
+      "Todo": {
+        "type": "object",
+        "description": "A todo as stored and returned. Persisted in the B-tree keyed by its id rendered as a decimal string.",
+        "required": ["id", "title", "completed"],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "readOnly": true,
+            "description": "Assigned by the server. Never taken from a request body.",
+            "examples": [1]
+          },
+          "title": { "type": "string", "examples": ["buy milk"] },
+          "completed": { "type": "boolean", "examples": [false] }
+        },
+        "additionalProperties": false
+      },
+      "TodoInput": {
+        "type": "object",
+        "description": "Request body for create and replace.\n\n**Size limits.** Two separate 1024-byte ceilings (`MAX_VALUE_SIZE`) apply, and they surface as different status codes. A decoded `title` of 1024 bytes or more overflows the parse buffer and is reported as `400 Missing or invalid 'title'` — the same code as a syntactically bad title. Below that, the *rendered* object `{\"id\":…,\"title\":\"…\",\"completed\":…}` must itself fit 1024 bytes after JSON-escaping, or the request fails with `413 Todo too large`. For a plain-ASCII title the 413 band therefore begins around 986 characters, since the surrounding JSON costs roughly 38 bytes.\n\nEscaping expands the title, lowering the 413 threshold further: each `\"`, `\\`, newline, tab, or carriage return costs two bytes in the stored form, and other control characters cost six (`\\u00XX`).\n\n**Encoding.** Raw UTF-8 bytes in the title are stored and returned unchanged. Only literal `\\uXXXX` escape sequences are lossy — the parser collapses each to a single `?`, so `\"caf\\u00e9\"` is stored as `caf?` while the raw bytes of `\"café\"` round-trip intact.",
+        "required": ["title"],
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "Required. Must be a JSON string; a number, `null`, or a missing key is a `400`.",
+            "examples": ["buy milk"]
+          },
+          "completed": {
+            "type": "boolean",
+            "default": false,
+            "description": "Optional. Absent or unparseable values are treated as `false`. On `PUT` this means omitting it resets a completed todo back to incomplete.",
+            "examples": [false]
+          }
+        }
+      },
+      "Status": {
+        "type": "object",
+        "required": [
+          "server",
+          "total_connections",
+          "total_requests",
+          "active_connections"
+        ],
+        "properties": {
+          "server": {
+            "type": "string",
+            "description": "Configured server name.",
+            "examples": ["Codo-HTTP-Server/1.0"]
+          },
+          "total_connections": {
+            "type": "integer",
+            "description": "Connections accepted since start."
+          },
+          "total_requests": {
+            "type": "integer",
+            "description": "Requests handled since start."
+          },
+          "active_connections": {
+            "type": "integer",
+            "description": "Connections currently open."
+          }
+        }
+      },
+      "Stats": {
+        "type": "object",
+        "required": [
+          "bytes_sent",
+          "bytes_received",
+          "packets_sent",
+          "packets_received",
+          "connections_accepted",
+          "connections_closed",
+          "errors"
+        ],
+        "properties": {
+          "bytes_sent": { "type": "integer" },
+          "bytes_received": { "type": "integer" },
+          "packets_sent": {
+            "type": "integer",
+            "description": "Counted as write() calls, not TCP segments."
+          },
+          "packets_received": {
+            "type": "integer",
+            "description": "Counted as read() calls, not TCP segments."
+          },
+          "connections_accepted": { "type": "integer" },
+          "connections_closed": { "type": "integer" },
+          "errors": { "type": "integer" }
+        }
+      },
+      "HtmlError": {
+        "type": "string",
+        "description": "Error bodies are HTML, never JSON. Served as `text/html` with `Connection: close`. Each response supplies its own example; the shape is always `<html><head><title>{status}</title></head><body><h1>{status}</h1><p>{message}</p></body></html>`."
+      }
+    },
+    "responses": {
+      "TodoNotFound": {
+        "description": "No todo with that id.",
+        "content": {
+          "text/html": {
+            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "example": "<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1><p>Todo not found</p></body></html>"
+          }
+        }
+      },
+      "InvalidTodoId": {
+        "description": "The path id was empty or contained non-digit characters.",
+        "content": {
+          "text/html": {
+            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Invalid todo id</p></body></html>"
+          }
+        }
+      },
+      "TodoTooLarge": {
+        "description": "The rendered todo exceeded the storage engine's 1024-byte value limit.",
+        "content": {
+          "text/html": {
+            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "example": "<html><head><title>413 Payload Too Large</title></head><body><h1>413 Payload Too Large</h1><p>Todo too large</p></body></html>"
+          }
+        }
+      },
+      "InternalError": {
+        "description": "Transaction, allocation, or storage failure.",
+        "content": {
+          "text/html": {
+            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "example": "<html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>Transaction failed</p></body></html>"
+          }
+        }
+      }
+    }
+  }
+}

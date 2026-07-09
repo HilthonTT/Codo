@@ -1,0 +1,642 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codo HTTP Server — API Docs</title>
+    <link rel="stylesheet" href="/style.css" />
+    <style>
+      .docs-layout {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 0 1.25rem 4rem;
+      }
+      .docs-nav {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        padding: 0.75rem 0;
+        margin-bottom: 1rem;
+        background: var(--bg);
+        border-bottom: 1px solid var(--card-border);
+      }
+      .docs-nav a {
+        color: var(--muted);
+        text-decoration: none;
+        font-size: 0.85rem;
+        padding: 0.25rem 0.6rem;
+        border: 1px solid var(--card-border);
+        border-radius: 999px;
+      }
+      .docs-nav a:hover {
+        color: var(--text);
+        border-color: var(--accent);
+      }
+      .op {
+        border: 1px solid var(--card-border);
+        border-radius: 8px;
+        margin-bottom: 0.75rem;
+        overflow: hidden;
+        background: var(--card);
+      }
+      .op > summary {
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0.7rem 0.9rem;
+        cursor: pointer;
+        list-style: none;
+      }
+      .op > summary::-webkit-details-marker {
+        display: none;
+      }
+      .op > summary:hover {
+        background: #1c2732;
+      }
+      .op[open] > summary {
+        border-bottom: 1px solid var(--card-border);
+      }
+      .badge {
+        flex: none;
+        min-width: 4.6rem;
+        text-align: center;
+        font:
+          600 0.72rem/1 ui-monospace,
+          SFMono-Regular,
+          Menlo,
+          monospace;
+        letter-spacing: 0.04em;
+        padding: 0.4rem 0.5rem;
+        border-radius: 4px;
+        color: #0b1118;
+      }
+      .badge.get {
+        background: var(--accent);
+      }
+      .badge.post {
+        background: var(--good);
+      }
+      .badge.put {
+        background: #d9a441;
+      }
+      .badge.delete {
+        background: var(--bad);
+      }
+      .op-path {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 0.95rem;
+        color: var(--text);
+        overflow-wrap: anywhere;
+        min-width: 0;
+      }
+      .op-path .param {
+        color: var(--accent);
+      }
+      /* Truncate rather than let a long summary widen the row. */
+      .op-summary {
+        color: var(--muted);
+        font-size: 0.85rem;
+        margin-left: auto;
+        text-align: right;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      @media (max-width: 640px) {
+        .op-summary {
+          display: none;
+        }
+      }
+      /* min-width:0 lets the flex/grid child shrink below its content width,
+         so a wide table scrolls in .table-wrap instead of stretching the card. */
+      .op-body {
+        padding: 0.9rem;
+        min-width: 0;
+      }
+      .op-body > section {
+        margin-bottom: 1.25rem;
+      }
+      .op-body > section:last-child {
+        margin-bottom: 0;
+      }
+      .op-body h4 {
+        margin: 0 0 0.5rem;
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.09em;
+        color: var(--muted);
+      }
+      .prose p {
+        margin: 0 0 0.6rem;
+      }
+      .prose p:last-child {
+        margin-bottom: 0;
+      }
+      code {
+        background: var(--code-bg);
+        padding: 0.1rem 0.32rem;
+        border-radius: 3px;
+        font-size: 0.86em;
+      }
+      pre {
+        background: var(--code-bg);
+        border: 1px solid var(--card-border);
+        border-radius: 6px;
+        padding: 0.7rem 0.85rem;
+        overflow-x: auto;
+        margin: 0;
+        max-width: 100%;
+      }
+      pre code {
+        background: none;
+        padding: 0;
+        font-size: 0.82rem;
+        line-height: 1.55;
+      }
+      /* Example bodies inside a cell wrap; a fixed layout cannot give them a
+         scrollbar without collapsing the neighbouring columns. */
+      td pre {
+        margin-top: 0.5rem;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+      }
+      .table-wrap {
+        overflow-x: auto;
+      }
+      .ctype {
+        margin: 0.9rem 0 0.4rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+      }
+      /* Fixed layout: columns take the declared widths instead of being sized by
+         their longest cell, which is what let long examples blow out the card. */
+      table {
+        width: 100%;
+        table-layout: fixed;
+        border-collapse: collapse;
+        font-size: 0.85rem;
+      }
+      .t-params col:nth-child(1),
+      .t-fields col:nth-child(1) {
+        width: 22%;
+      }
+      .t-params col:nth-child(2) {
+        width: 10%;
+      }
+      .t-params col:nth-child(3),
+      .t-fields col:nth-child(2) {
+        width: 16%;
+      }
+      .t-responses col:nth-child(1) {
+        width: 5.5rem;
+      }
+      .t-responses col:nth-child(2) {
+        width: 9.5rem;
+      }
+      th,
+      td {
+        text-align: left;
+        padding: 0.45rem 0.6rem;
+        border-bottom: 1px solid var(--card-border);
+        vertical-align: top;
+        overflow-wrap: anywhere;
+      }
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 0.72rem;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+      }
+      td:first-child {
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .status {
+        font-weight: 600;
+      }
+      .status.ok {
+        color: var(--good);
+      }
+      .status.err {
+        color: var(--bad);
+      }
+      .req {
+        color: var(--bad);
+        font-size: 0.7rem;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+      .tag-desc {
+        color: var(--muted);
+        font-size: 0.9rem;
+        max-width: 70ch;
+        margin: 0 0 1rem;
+      }
+      h2.tag {
+        margin: 2.25rem 0 0.35rem;
+        font-size: 1.25rem;
+        scroll-margin-top: 4rem;
+      }
+      .spec-link {
+        font-size: 0.85rem;
+        color: var(--muted);
+      }
+      .spec-link a {
+        color: var(--accent);
+      }
+      .fail {
+        color: var(--bad);
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Codo API</h1>
+      <p class="tagline" id="subtitle">Loading the OpenAPI description…</p>
+      <p class="spec-link">
+        Machine-readable spec: <a href="/openapi.json">/openapi.json</a> · Demo
+        page:
+        <a href="/">/</a>
+      </p>
+    </header>
+
+    <main class="docs-layout">
+      <nav class="docs-nav" id="nav" hidden></nav>
+      <div class="card prose" id="intro" hidden></div>
+      <div id="content"></div>
+    </main>
+
+    <script>
+      const METHODS = [
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
+      ];
+
+      const escapeHtml = (s) =>
+        String(s).replace(
+          /[&<>"']/g,
+          (c) =>
+            ({
+              "&": "&amp;",
+              "<": "&lt;",
+              ">": "&gt;",
+              '"': "&quot;",
+              "'": "&#39;",
+            })[c],
+        );
+
+      // Minimal Markdown: paragraphs, `code`, **bold**, *em*. Escaped first, so
+      // spec text can never inject markup.
+      function md(text) {
+        if (!text) return "";
+        return escapeHtml(text)
+          .split(/\n\n+/)
+          .map(
+            (para) =>
+              "<p>" +
+              para
+                .replace(/`([^`]+)`/g, "<code>$1</code>")
+                .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+                .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+                .replace(/\n/g, "<br />") +
+              "</p>",
+          )
+          .join("");
+      }
+
+      // Follow a local $ref ("#/components/schemas/Todo") one hop at a time.
+      function deref(spec, node, seen = new Set()) {
+        while (node && node.$ref) {
+          if (seen.has(node.$ref)) return {};
+          seen.add(node.$ref);
+          node = node.$ref
+            .replace(/^#\//, "")
+            .split("/")
+            .reduce(
+              (acc, key) =>
+                acc
+                  ? acc[key.replace(/~1/g, "/").replace(/~0/g, "~")]
+                  : undefined,
+              spec,
+            );
+        }
+        return node || {};
+      }
+
+      // Build a representative value for a schema, preferring values the spec
+      // states outright over ones we synthesize.
+      function sample(spec, schema, depth = 0) {
+        schema = deref(spec, schema);
+        if (depth > 6) return null;
+        if (schema.const !== undefined) return schema.const;
+        if (Array.isArray(schema.examples) && schema.examples.length)
+          return schema.examples[0];
+        if (schema.example !== undefined) return schema.example;
+        if (schema.default !== undefined) return schema.default;
+
+        switch (schema.type) {
+          case "array":
+            return [sample(spec, schema.items || {}, depth + 1)];
+          case "object": {
+            const out = {};
+            for (const [key, sub] of Object.entries(schema.properties || {})) {
+              out[key] = sample(spec, sub, depth + 1);
+            }
+            return out;
+          }
+          case "integer":
+            return 0;
+          case "number":
+            return 0;
+          case "boolean":
+            return false;
+          case "string":
+            return "string";
+          default:
+            return null;
+        }
+      }
+
+      // Pull the best example out of a media-type object.
+      function mediaExample(spec, media) {
+        if (!media) return undefined;
+        if (media.example !== undefined) return media.example;
+        const named = media.examples && Object.values(media.examples)[0];
+        if (named && named.value !== undefined) return named.value;
+        if (media.schema) return sample(spec, media.schema);
+        return undefined;
+      }
+
+      const render = (value) =>
+        typeof value === "string" ? value : JSON.stringify(value, null, 2);
+
+      function typeOf(spec, schema) {
+        schema = deref(spec, schema);
+        if (!schema.type) return "any";
+        if (schema.type === "array")
+          return `${typeOf(spec, schema.items || {})}[]`;
+        if (schema.format) return `${schema.type}<${schema.format}>`;
+        return schema.type;
+      }
+
+      const statusClass = (code) => (/^[23]/.test(code) ? "ok" : "err");
+
+      // Reconstruct a runnable curl invocation for an operation.
+      function curlFor(spec, method, path, op, origin) {
+        const filled = path.replace(/\{(\w+)\}/g, (_, name) => {
+          const param = (op.parameters || [])
+            .concat(op.__pathParams || [])
+            .map((p) => deref(spec, p))
+            .find((p) => p.name === name && p.in === "path");
+          return param && param.example !== undefined
+            ? param.example
+            : `{${name}}`;
+        });
+
+        const parts = [];
+        if (method !== "get") parts.push(`-X ${method.toUpperCase()}`);
+
+        const media = op.requestBody && deref(spec, op.requestBody).content;
+        if (media) {
+          const [ctype, obj] = Object.entries(media)[0];
+          const body = mediaExample(spec, obj);
+          if (body !== undefined) {
+            parts.push(`-H 'Content-Type: ${ctype}'`);
+            const encoded =
+              typeof body === "string" ? body : JSON.stringify(body);
+            parts.push(`-d '${encoded.replace(/'/g, "'\\''")}'`);
+          }
+        }
+
+        for (const raw of op.parameters || []) {
+          const p = deref(spec, raw);
+          if (p.in === "header" && p.example !== undefined) {
+            parts.push(`-H '${p.name}: ${p.example}'`);
+          }
+        }
+
+        const flags = parts.length ? " " + parts.join(" ") : "";
+        return `curl${flags} ${origin}${filled}`;
+      }
+
+      function paramsTable(spec, params) {
+        const rows = params
+          .map((raw) => deref(spec, raw))
+          .map(
+            (p) => `
+              <tr>
+                <td>${escapeHtml(p.name)}${p.required ? ' <span class="req">req</span>' : ""}</td>
+                <td>${escapeHtml(p.in)}</td>
+                <td>${escapeHtml(typeOf(spec, p.schema || {}))}</td>
+                <td class="prose">${md(p.description) || "—"}</td>
+              </tr>`,
+          )
+          .join("");
+
+        return `
+          <section>
+            <h4>Parameters</h4>
+            <div class="table-wrap">
+              <table class="t-params">
+                <colgroup><col /><col /><col /><col /></colgroup>
+                <thead><tr><th>Name</th><th>In</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+          </section>`;
+      }
+
+      function requestSection(spec, requestBody) {
+        const rb = deref(spec, requestBody);
+        const entries = Object.entries(rb.content || {});
+        if (!entries.length) return "";
+
+        const bodies = entries
+          .map(([ctype, media]) => {
+            const example = mediaExample(spec, media);
+            if (example === undefined) return "";
+            return `<p class="ctype"><code>${escapeHtml(ctype)}</code></p>
+              <pre><code>${escapeHtml(render(example))}</code></pre>`;
+          })
+          .join("");
+
+        const schema = deref(spec, entries[0][1].schema || {});
+        const props = Object.entries(schema.properties || {});
+        const required = new Set(schema.required || []);
+        const fields = props.length
+          ? `<div class="table-wrap">
+              <table class="t-fields">
+                <colgroup><col /><col /><col /></colgroup>
+                <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+                <tbody>${props
+                  .map(([name, sub]) => {
+                    const s = deref(spec, sub);
+                    return `<tr>
+                      <td>${escapeHtml(name)}${required.has(name) ? ' <span class="req">req</span>' : ""}</td>
+                      <td>${escapeHtml(typeOf(spec, s))}</td>
+                      <td class="prose">${md(s.description) || "—"}</td>
+                    </tr>`;
+                  })
+                  .join("")}</tbody>
+              </table>
+            </div>`
+          : "";
+
+        return `
+          <section>
+            <h4>Request body${rb.required ? " (required)" : ""}</h4>
+            <div class="prose">${md(rb.description)}${md(schema.description)}</div>
+            ${fields}
+            ${bodies}
+          </section>`;
+      }
+
+      function responsesSection(spec, responses) {
+        const rows = Object.entries(responses || {})
+          .map(([code, raw]) => {
+            const res = deref(spec, raw);
+            const entries = Object.entries(res.content || {});
+            const ctype = entries.length ? entries[0][0] : "—";
+            const example = entries.length
+              ? mediaExample(spec, entries[0][1])
+              : undefined;
+            const body =
+              example === undefined
+                ? ""
+                : `<pre><code>${escapeHtml(render(example))}</code></pre>`;
+            return `
+              <tr>
+                <td><span class="status ${statusClass(code)}">${escapeHtml(code)}</span></td>
+                <td>${escapeHtml(ctype)}</td>
+                <td class="prose">${md(res.description)}${body}</td>
+              </tr>`;
+          })
+          .join("");
+
+        return `
+          <section>
+            <h4>Responses</h4>
+            <div class="table-wrap">
+              <table class="t-responses">
+                <colgroup><col /><col /><col /></colgroup>
+                <thead><tr><th>Status</th><th>Content-Type</th><th>Description</th></tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+          </section>`;
+      }
+
+      function operation(spec, method, path, op, pathParams, origin) {
+        const params = [...pathParams, ...(op.parameters || [])];
+        op.__pathParams = pathParams;
+
+        const prettyPath = escapeHtml(path).replace(
+          /\{(\w+)\}/g,
+          '<span class="param">{$1}</span>',
+        );
+
+        return `
+          <details class="op" id="${escapeHtml(op.operationId || method + path)}">
+            <summary>
+              <span class="badge ${method}">${method.toUpperCase()}</span>
+              <span class="op-path">${prettyPath}</span>
+              <span class="op-summary">${escapeHtml(op.summary || "")}</span>
+            </summary>
+            <div class="op-body">
+              ${op.description ? `<section class="prose">${md(op.description)}</section>` : ""}
+              ${params.length ? paramsTable(spec, params) : ""}
+              ${op.requestBody ? requestSection(spec, op.requestBody) : ""}
+              ${responsesSection(spec, op.responses)}
+              <section>
+                <h4>Example request</h4>
+                <pre><code>${escapeHtml(curlFor(spec, method, path, op, origin))}</code></pre>
+              </section>
+            </div>
+          </details>`;
+      }
+
+      function build(spec) {
+        const origin = location.origin;
+
+        document.getElementById("subtitle").textContent =
+          spec.info.summary || spec.info.title;
+
+        const intro = document.getElementById("intro");
+        intro.innerHTML = md(spec.info.description);
+        intro.hidden = false;
+
+        // Group operations under their first tag, in the order tags are declared.
+        const groups = new Map((spec.tags || []).map((t) => [t.name, []]));
+        for (const [path, item] of Object.entries(spec.paths)) {
+          const pathParams = item.parameters || [];
+          for (const method of METHODS) {
+            const op = item[method];
+            if (!op) continue;
+            const tag = (op.tags && op.tags[0]) || "Other";
+            if (!groups.has(tag)) groups.set(tag, []);
+            groups.get(tag).push({ method, path, op, pathParams });
+          }
+        }
+
+        const describe = Object.fromEntries(
+          (spec.tags || []).map((t) => [t.name, t.description]),
+        );
+        const nav = document.getElementById("nav");
+        const content = document.getElementById("content");
+        const slug = (name) => name.toLowerCase().replace(/\W+/g, "-");
+
+        let navHtml = "";
+        let bodyHtml = "";
+
+        for (const [tag, ops] of groups) {
+          if (!ops.length) continue;
+          navHtml += `<a href="#${slug(tag)}">${escapeHtml(tag)}</a>`;
+          bodyHtml += `<h2 class="tag" id="${slug(tag)}">${escapeHtml(tag)}</h2>`;
+          if (describe[tag])
+            bodyHtml += `<p class="tag-desc">${escapeHtml(describe[tag])}</p>`;
+          bodyHtml += ops
+            .map((o) =>
+              operation(spec, o.method, o.path, o.op, o.pathParams, origin),
+            )
+            .join("");
+        }
+
+        nav.innerHTML = navHtml;
+        nav.hidden = false;
+        content.innerHTML = bodyHtml;
+
+        // Deep links like /docs.html#createTodo should open that operation.
+        if (location.hash) {
+          const target = document.getElementById(
+            decodeURIComponent(location.hash.slice(1)),
+          );
+          if (target && target.tagName === "DETAILS") {
+            target.open = true;
+            target.scrollIntoView();
+          }
+        }
+      }
+
+      fetch("/openapi.json")
+        .then((res) => {
+          if (!res.ok)
+            throw new Error(`GET /openapi.json returned ${res.status}`);
+          return res.json();
+        })
+        .then(build)
+        .catch((err) => {
+          document.getElementById("subtitle").innerHTML =
+            `<span class="fail">Could not load /openapi.json — ${escapeHtml(err.message)}</span>`;
+        });
+    </script>
+  </body>
+</html>
