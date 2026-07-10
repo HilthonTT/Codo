@@ -9,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/epoll.h>
+#include <sys/sendfile.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -768,6 +769,45 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     conn->write_buffer_pos += (size_t)bytes_written;
     worker->bytes_sent += (uint64_t)bytes_written;
     stats_record_bytes_sent((uint64_t)bytes_written);
+  }
+
+  // Response headers completely sent. If a static file is queued for this
+  // connection (plaintext only -- the sendfile path is set up in
+  // send_file_response), stream its body straight from the fd to the socket
+  // now. Edge-triggered, so pump until the file is drained or the socket
+  // would block; a later EPOLLOUT resumes from the saved offset.
+  if (conn->file_fd >= 0)
+  {
+    while (conn->file_offset < (off_t)conn->file_size)
+    {
+      ssize_t sent = sendfile(conn->socket_fd, conn->file_fd, &conn->file_offset,
+                              conn->file_size - (size_t)conn->file_offset);
+      if (sent < 0)
+      {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+          return 0; // socket buffer full; wait for the next EPOLLOUT
+        }
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return -1;
+      }
+      if (sent == 0)
+      {
+        break; // file shrank under us; stop rather than spin
+      }
+      worker->bytes_sent += (uint64_t)sent;
+      stats_record_bytes_sent((uint64_t)sent);
+    }
+
+    // Whole file flushed (or hit EOF): release the fd and fall through to the
+    // normal keep-alive / close handling below.
+    close(conn->file_fd);
+    conn->file_fd = -1;
+    conn->file_offset = 0;
+    conn->file_size = 0;
   }
 
   // Response completely sent.

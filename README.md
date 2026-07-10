@@ -11,8 +11,9 @@ It ships with a **Todo CRUD web API** backed by a built-in B-tree storage engine
 - Route table with per-method handlers + default static-file handler
 - Trailing-`*` wildcard routes (e.g. `/api/todos/*`) in addition to exact matches
 - Optional TLS via OpenSSL (auto-enabled when `server.crt` / `server.key` exist)
-- WebSocket upgrade handshake (`Sec-WebSocket-Accept` via SHA1 + base64)
-- gzip plumbing via zlib (scaffolded)
+- WebSocket upgrade handshake (`Sec-WebSocket-Accept` via SHA1 + base64) plus full RFC 6455 frame handling (masked client frames, ping/pong, close, echo)
+- gzip response compression via zlib, negotiated on `Accept-Encoding` for compressible content types (`Content-Encoding: gzip` + `Vary: Accept-Encoding`)
+- Zero-copy static-file streaming with `sendfile(2)` on plaintext connections (no in-memory size cap)
 - B-tree storage engine (pages + buffer pool + WAL + transactions) mounted as a JSON Todo API
 - Live network statistics (atomic counters) exposed at `GET /api/stats`
 - Example JSON endpoints: `/api/hello`, `/api/echo`, `/api/status`, `/api/stats`, `/ws/chat`
@@ -234,4 +235,18 @@ higher weight receives proportionally more connections.
 
 ## Status
 
-Work in progress. Some subsystems (gzip compression of response bodies, full WebSocket framing, file streaming with `sendfile`) are scaffolded but not fully wired into the response path.
+Work in progress, but the previously-scaffolded response-path features are now
+wired end-to-end:
+
+- **gzip compression** — `send_http_response()` compresses the body when the
+  client sends `Accept-Encoding: gzip`, the content type is compressible
+  (text/JSON/JS/XML/SVG), and the body is at least 256 bytes, emitting
+  `Content-Encoding: gzip` and `Vary: Accept-Encoding`. Static text assets are
+  read-and-compressed; binary/opaque files skip it.
+- **`sendfile` streaming** — static files on plaintext connections are streamed
+  zero-copy straight from the fd to the socket in `handle_client_write()`, with
+  no in-memory size cap. TLS connections (which can't hand a raw fd to OpenSSL)
+  and small compressible assets bound for gzip take the buffered path instead.
+- **WebSocket framing** — the RFC 6455 frame engine (`ws_process_frames()`)
+  decodes masked client frames and replies with echoes, pongs, and close frames;
+  `/ws/chat` is a working echo endpoint.

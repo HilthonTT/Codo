@@ -11,12 +11,17 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "compression.h"
 #include "config.h"
 #include "connection.h"
 #include "http_protocol.h"
 #include "http_types.h"
 #include "mime.h"
 #include "util.h"
+
+// Bodies below this many bytes aren't worth gzipping: the ~20-byte gzip framing
+// plus the CPU cost outweigh the savings on tiny payloads.
+#define GZIP_MIN_SIZE 256
 
 int http_parse_content_length(const char *value, size_t *out)
 {
@@ -94,12 +99,97 @@ static void strip_crlf_inplace(char *s)
   *dst = '\0';
 }
 
+// True if the client advertised gzip in Accept-Encoding. We don't parse q-values
+// -- a bare presence of the "gzip" token is enough for our purposes.
+static bool client_accepts_gzip(const http_request_t *request)
+{
+  for (int i = 0; i < request->header_count; i++)
+  {
+    if (strcasecmp(request->headers[i].name, "Accept-Encoding") == 0)
+    {
+      return strcasestr(request->headers[i].value, "gzip") != NULL;
+    }
+  }
+  return false;
+}
+
+// Only compress content types that actually shrink: text, JSON, JS, XML, SVG.
+// Already-compressed formats (images, video, archives) would just waste CPU.
+static bool mime_type_compressible(const char *v)
+{
+  return strncasecmp(v, "text/", 5) == 0 || strcasestr(v, "json") != NULL ||
+         strcasestr(v, "javascript") != NULL || strcasestr(v, "xml") != NULL ||
+         strcasestr(v, "svg") != NULL;
+}
+
+static bool content_type_compressible(const http_response_t *response)
+{
+  for (int i = 0; i < response->header_count; i++)
+  {
+    if (strcasecmp(response->headers[i].name, "Content-Type") == 0)
+    {
+      return mime_type_compressible(response->headers[i].value);
+    }
+  }
+  return false;
+}
+
+// Decide whether this response body should be gzip-compressed: the client must
+// accept it, the body must be present and worth compressing, the content type
+// must be compressible, and we must not double-encode.
+static bool response_should_gzip(connection_t *conn, http_response_t *response)
+{
+  if (response->gzip_compressed)
+  {
+    return false;
+  }
+  if (!response->body || response->body_length < GZIP_MIN_SIZE)
+  {
+    return false;
+  }
+  return content_type_compressible(response) && client_accepts_gzip(&conn->request);
+}
+
 int send_http_response(connection_t *conn, http_response_t *response)
 {
   if (!conn || !response)
   {
     return -1;
   }
+
+  // Body actually placed in the write buffer. gzip may swap in a compressed copy
+  // (freed before we return). A queued static file (conn->file_fd >= 0) is
+  // streamed separately by the write path via sendfile, so here it contributes
+  // only its length to Content-Length -- no bytes are copied into the buffer.
+  const char *out_body = response->body;
+  size_t out_body_len = response->body_length;
+  unsigned char *gzip_buf = NULL;
+  bool gzipped = false;
+  bool streaming_file = (conn->file_fd >= 0);
+
+  if (!streaming_file && response_should_gzip(conn, response))
+  {
+    unsigned char *compressed = NULL;
+    size_t compressed_len = 0;
+    if (gzip_compress_buffer(response->body, response->body_length, &compressed,
+                             &compressed_len) == 0)
+    {
+      // Only adopt the compressed copy if it actually shrank the payload.
+      if (compressed_len < response->body_length)
+      {
+        gzip_buf = compressed;
+        out_body = (const char *)compressed;
+        out_body_len = compressed_len;
+        gzipped = true;
+      }
+      else
+      {
+        free(compressed);
+      }
+    }
+  }
+
+  size_t content_length = streaming_file ? conn->file_size : out_body_len;
 
   char date_buf[64];
   format_http_date(time(NULL), date_buf, sizeof(date_buf));
@@ -117,12 +207,29 @@ int send_http_response(connection_t *conn, http_response_t *response)
                             http_status_to_string(response->status),
                             http_server_name(),
                             date_buf,
-                            response->body_length,
+                            content_length,
                             response->keep_alive ? "keep-alive" : "close");
 
   if (header_len < 0 || (size_t)header_len >= sizeof(header_buffer))
   {
+    free(gzip_buf);
     return -1;
+  }
+
+  // Announce the gzip encoding (and vary on Accept-Encoding so caches key the
+  // compressed and plain representations separately).
+  if (gzipped)
+  {
+    int written = snprintf(header_buffer + header_len,
+                           sizeof(header_buffer) - (size_t)header_len,
+                           "Content-Encoding: gzip\r\n"
+                           "Vary: Accept-Encoding\r\n");
+    if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
+    {
+      free(gzip_buf);
+      return -1;
+    }
+    header_len += written;
   }
 
   // Add custom headers
@@ -133,6 +240,7 @@ int send_http_response(connection_t *conn, http_response_t *response)
     if (header_field_has_crlf(response->headers[i].name) ||
         header_field_has_crlf(response->headers[i].value))
     {
+      free(gzip_buf);
       return -1;
     }
     int written = snprintf(header_buffer + header_len,
@@ -142,6 +250,7 @@ int send_http_response(connection_t *conn, http_response_t *response)
                            response->headers[i].value);
     if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
     {
+      free(gzip_buf);
       return -1;
     }
     header_len += written;
@@ -155,6 +264,7 @@ int send_http_response(connection_t *conn, http_response_t *response)
   {
     if (header_field_has_crlf(response->cors_origin))
     {
+      free(gzip_buf);
       return -1;
     }
     // "Vary: Origin" is only meaningful when the allowed origin is specific --
@@ -166,6 +276,7 @@ int send_http_response(connection_t *conn, http_response_t *response)
                            response->cors_origin, vary);
     if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
     {
+      free(gzip_buf);
       return -1;
     }
     header_len += written;
@@ -176,22 +287,29 @@ int send_http_response(connection_t *conn, http_response_t *response)
                              sizeof(header_buffer) - (size_t)header_len, "\r\n");
   if (end_written < 0 || (size_t)(header_len + end_written) >= sizeof(header_buffer))
   {
+    free(gzip_buf);
     return -1;
   }
   header_len += end_written;
 
-  // Copy headers and body to write buffer
-  size_t total_size = (size_t)header_len + response->body_length;
+  // Copy headers (and, unless a file is being streamed, the body) to the write
+  // buffer. For a streamed file only the headers are staged here; the body bytes
+  // are pumped from the fd by the write path, so they don't count toward the
+  // in-memory response cap.
+  size_t body_in_buffer = streaming_file ? 0 : out_body_len;
+  size_t total_size = (size_t)header_len + body_in_buffer;
   if (total_size > MAX_RESPONSE_SIZE)
   {
+    free(gzip_buf);
     return -1; // Response too large
   }
 
   memcpy(conn->write_buffer, header_buffer, (size_t)header_len);
-  if (response->body && response->body_length > 0)
+  if (body_in_buffer > 0 && out_body)
   {
-    memcpy(conn->write_buffer + header_len, response->body, response->body_length);
+    memcpy(conn->write_buffer + header_len, out_body, body_in_buffer);
   }
+  free(gzip_buf);
 
   conn->write_buffer_pos = 0;
   conn->write_buffer_size = total_size;
@@ -260,6 +378,62 @@ int send_file_response(connection_t *conn, const char *file_path)
     return send_error_response(conn, HTTP_FORBIDDEN, "Not a regular file");
   }
 
+  const char *mime = get_mime_type(file_path);
+  bool fits_buffer = (size_t)st.st_size <= (size_t)(MAX_RESPONSE_SIZE - MAX_HEADERS_SIZE);
+
+  // A compressible asset the client accepts gzip for is worth reading into
+  // memory and compressing (browsers expect gzipped HTML/CSS/JS). Everything
+  // else -- binary/media, oversized files, or clients that didn't ask -- takes
+  // the zero-copy sendfile path instead. Files too large to buffer always
+  // sendfile, compressible or not, rather than being rejected.
+  bool want_gzip = !conn->ssl_enabled && fits_buffer &&
+                   (size_t)st.st_size >= GZIP_MIN_SIZE &&
+                   mime_type_compressible(mime) &&
+                   client_accepts_gzip(&conn->request);
+
+  // Plaintext connections stream the file straight from the fd to the socket
+  // with sendfile(2): zero-copy, and no in-memory size cap. TLS connections
+  // can't hand a raw fd to the OpenSSL layer, and a response we intend to gzip
+  // must be buffered first, so both fall through to the read path below.
+  if (!conn->ssl_enabled && !want_gzip)
+  {
+    if (conn->response.body)
+    {
+      free(conn->response.body);
+      conn->response.body = NULL;
+    }
+
+    // Hand the open fd to the connection; the write path streams it and closes
+    // it when done (cleanup_connection also closes it if the connection dies).
+    conn->file_fd = fd;
+    conn->file_offset = 0;
+    conn->file_size = (size_t)st.st_size;
+
+    conn->response.status = HTTP_OK;
+    strcpy(conn->response.version, "HTTP/1.1");
+    conn->response.body = NULL;
+    conn->response.body_length = 0;
+    conn->response.keep_alive = conn->request.keep_alive;
+    conn->response.last_modified = st.st_mtime;
+
+    strcpy(conn->response.headers[0].name, "Content-Type");
+    strncpy(conn->response.headers[0].value, mime,
+            sizeof(conn->response.headers[0].value) - 1);
+    conn->response.headers[0].value[sizeof(conn->response.headers[0].value) - 1] = '\0';
+    conn->response.header_count = 1;
+
+    // send_http_response sees conn->file_fd >= 0 and stages only the headers
+    // (Content-Length = file_size); handle_client_write sendfile()s the body.
+    if (send_http_response(conn, &conn->response) != 0)
+    {
+      close(conn->file_fd);
+      conn->file_fd = -1;
+      conn->file_size = 0;
+      return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Response too large");
+    }
+    return 0;
+  }
+
   // Bound the file size to what the write buffer can hold along with headers.
   if ((size_t)st.st_size > MAX_RESPONSE_SIZE - MAX_HEADERS_SIZE)
   {
@@ -315,7 +489,6 @@ int send_file_response(connection_t *conn, const char *file_path)
   conn->response.keep_alive = conn->request.keep_alive;
   conn->response.last_modified = st.st_mtime;
 
-  const char *mime = get_mime_type(file_path);
   strcpy(conn->response.headers[0].name, "Content-Type");
   strncpy(conn->response.headers[0].value, mime, sizeof(conn->response.headers[0].value) - 1);
   conn->response.headers[0].value[sizeof(conn->response.headers[0].value) - 1] = '\0';
