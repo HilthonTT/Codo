@@ -130,6 +130,9 @@ int main(int argc, char *argv[])
   http_server_stop(&g_server);
   http_server_cleanup(&g_server);
 
+  // No handler can be running now, so the read cache is safe to tear down.
+  todo_api_shutdown();
+
   // Flush and close the storage engine (final checkpoint).
   cleanup_storage_engine();
 

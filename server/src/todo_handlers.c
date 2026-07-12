@@ -8,8 +8,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "env.h"
 #include "http_protocol.h"
 #include "http_types.h"
+#include "lru.h"
 #include "route.h"
 #include "server.h"
 #include "storage.h"
@@ -20,6 +22,17 @@
 // Ids are handed out from a process-wide counter that is seeded at startup
 // from the highest id already on disk.
 static _Atomic uint64_t g_next_todo_id = 1;
+
+// Read-through cache in front of the btree, keyed by the same todo id and
+// holding the same canonical JSON. A single-todo GET is the hot path of this
+// API and otherwise costs a transaction plus a btree descent through the buffer
+// pool; a hit skips all of it. Writes keep the cache in step: create and update
+// store the new JSON, delete drops the entry.
+//
+// Only single-todo reads are cached. The collection GET is a full scan whose
+// result any write would invalidate, so caching it would trade a scan for a
+// near-permanent miss.
+static lru_cache_t *g_todo_cache = NULL;
 
 static const char TODO_COLLECTION[] = "/api/todos";
 static const char TODO_ITEM_PREFIX[] = "/api/todos/";
@@ -456,6 +469,10 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Insert failed");
   }
 
+  // A just-created todo is very likely to be read back, so seed it rather than
+  // waiting for the first GET to miss.
+  lru_put(g_todo_cache, key, value, (size_t)value_len);
+
   return send_json(conn, request, response, HTTP_CREATED, value);
 }
 
@@ -470,12 +487,28 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
   char value[MAX_VALUE_SIZE + 1];
   size_t value_len = MAX_VALUE_SIZE;
 
+  if (lru_get(g_todo_cache, key, value, &value_len))
+  {
+    if (value_len > MAX_VALUE_SIZE)
+    {
+      value_len = MAX_VALUE_SIZE;
+    }
+    value[value_len] = '\0';
+    return send_json(conn, request, response, HTTP_OK, value);
+  }
+
+  // Miss. Snapshot the cache generation *before* going to storage: if a write
+  // for this key commits while we are reading, the fill below is dropped rather
+  // than overwriting the writer's fresher value with what we are about to read.
+  uint64_t generation = lru_generation(g_todo_cache);
+
   transaction_t *txn = begin_transaction();
   if (!txn)
   {
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
   }
 
+  value_len = MAX_VALUE_SIZE;
   int rc = db_search(txn, key, strlen(key), value, &value_len);
   commit_transaction(txn);
   free(txn);
@@ -490,6 +523,8 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
     value_len = MAX_VALUE_SIZE;
   }
   value[value_len] = '\0';
+
+  lru_fill(g_todo_cache, key, value, value_len, generation);
 
   return send_json(conn, request, response, HTTP_OK, value);
 }
@@ -566,6 +601,10 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   commit_transaction(txn);
   free(txn);
 
+  // The write is durable, so the cache can now be moved to the new value. (The
+  // abort path above leaves storage untouched, and with it the cached entry.)
+  lru_put(g_todo_cache, key, value, (size_t)value_len);
+
   return send_json(conn, request, response, HTTP_OK, value);
 }
 
@@ -598,7 +637,35 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
   commit_transaction(txn);
   free(txn);
 
+  lru_invalidate(g_todo_cache, key);
+
   return send_json(conn, request, response, HTTP_NO_CONTENT, "");
+}
+
+// GET /api/cache -- hit/miss counters for the todo cache. Runs inline on the
+// event loop: it reads atomics and never touches storage.
+int todo_cache_stats_handler(connection_t *conn, http_request_t *request, http_response_t *response)
+{
+  uint64_t hits = 0, misses = 0, evictions = 0, size = 0;
+  lru_stats(g_todo_cache, &hits, &misses, &evictions, &size);
+
+  uint64_t lookups = hits + misses;
+  double hit_rate = lookups ? (double)hits / (double)lookups : 0.0;
+
+  char json[256];
+  int n = snprintf(json, sizeof(json),
+                   "{\"entries\":%llu,\"capacity\":%d,\"hits\":%llu,\"misses\":%llu,"
+                   "\"evictions\":%llu,\"hit_rate\":%.4f}",
+                   (unsigned long long)size,
+                   g_todo_cache ? g_todo_cache->list->capacity : 0,
+                   (unsigned long long)hits, (unsigned long long)misses,
+                   (unsigned long long)evictions, hit_rate);
+  if (n < 0 || (size_t)n >= sizeof(json))
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Stats too large");
+  }
+
+  return send_json(conn, request, response, HTTP_OK, json);
 }
 
 static int seed_id_scan_cb(const char *key, size_t key_length,
@@ -634,16 +701,33 @@ void todo_api_init(void)
   }
 
   atomic_store(&g_next_todo_id, max_id + 1);
+
+  // A NULL cache is not fatal: every lru_* call tolerates it and the handlers
+  // fall back to going straight to storage.
+  g_todo_cache = lru_cache_create(env_int("TODO_CACHE_CAPACITY", 1024));
+  if (!g_todo_cache)
+  {
+    fprintf(stderr, "todo cache disabled (allocation failed)\n");
+  }
+}
+
+void todo_api_shutdown(void)
+{
+  lru_cache_destroy(g_todo_cache);
+  g_todo_cache = NULL;
 }
 
 void todo_api_register_routes(http_server_t *server)
 {
   // Every todo handler goes through the btree storage engine (transactions,
   // WAL fsync, page reads/writes), so mark them for thread-pool offload to
-  // keep the epoll workers responsive under storage load.
+  // keep the epoll workers responsive under storage load. A cached GET returns
+  // without any of that, but the route still has to be able to miss.
   add_route_offloaded(server, TODO_COLLECTION, HTTP_GET, todo_list_handler);
   add_route_offloaded(server, TODO_COLLECTION, HTTP_POST, todo_create_handler);
   add_route_offloaded(server, "/api/todos/*", HTTP_GET, todo_get_handler);
   add_route_offloaded(server, "/api/todos/*", HTTP_PUT, todo_update_handler);
   add_route_offloaded(server, "/api/todos/*", HTTP_DELETE, todo_delete_handler);
+
+  add_route(server, "/api/cache", HTTP_GET, todo_cache_stats_handler);
 }
