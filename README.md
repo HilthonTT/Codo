@@ -1,252 +1,237 @@
 # Codo
 
-Codo is a from-scratch multi-threaded HTTP/1.1 server written in C11, built directly on top of POSIX sockets and `epoll`. It uses an acceptor + worker-pool model: the main thread accepts connections and round-robins them to a fixed pool of worker threads, each running its own private `epoll` loop over a linked list of connections.
+Codo is a from-scratch HTTP/1.1 server written in C11 on top of POSIX sockets and `epoll` — no web framework, no external HTTP library. It ships with a persistent Todo REST API backed by its own B-tree storage engine (buffer pool, write-ahead log, transactions), and a companion TCP load balancer that can front several instances.
 
-It ships with a **Todo CRUD web API** backed by a built-in B-tree storage engine (buffer pool, write-ahead log, transactions, checkpointing), so todos persist across restarts.
+Everything except TLS (OpenSSL) and gzip (zlib) is implemented in-tree: the HTTP parser, the router, the middleware chain, the thread pool, the LRU cache, the WebSocket framing, and the storage engine.
+
+```
+make && ./bin/codo
+# HTTP server starting on port 8080
+```
+
+Linux only — the hot paths use `epoll(7)` and `sendfile(2)`.
+
+## How a request flows
+
+Codo splits work across three thread groups so that a slow disk never stalls the network.
+
+1. **Accept loop** (main thread) — accepts connections and round-robins them across the workers.
+2. **Workers** (8 threads, `WORKER_THREADS`) — each owns a private edge-triggered `epoll` loop over its own connections. It parses the request, matches a route, and either runs the handler inline or hands it off.
+3. **Storage pool** (16 threads, `STORAGE_POOL_THREADS`) — runs the *blocking* handlers.
+
+The handoff is the interesting part. A handler that touches the storage engine (any Todo route) or the disk (the static-file handler) is registered with `add_route_offloaded()`. When one of those matches, the worker drops the connection out of its `epoll` interest set, flags it `offloaded`, and submits the handler to the pool; the pool thread runs it and re-arms `EPOLLOUT` when the response is ready. The worker's loop is never blocked on an `fsync` or a page read.
+
+The pool has **two priority levels**: reads are queued above writes (`STORAGE_PRIORITY_READ` > `STORAGE_PRIORITY_WRITE`), so a `GET` doesn't wait behind a burst of WAL-fsyncing writes. It is deliberately oversubscribed relative to the core count — those threads spend most of their life parked in `fsync`/`pread`, so extra threads keep the CPU busy rather than idle.
+
+Every handler runs inside a **middleware chain** (`logging` → `cors` → handler). Middleware is registered in `main.c` and wraps every route, including the default file handler.
 
 ## Features
 
-- HTTP/1.1 with keep-alive
-- Edge-triggered `epoll` per worker
-- Route table with per-method handlers + default static-file handler
-- Trailing-`*` wildcard routes (e.g. `/api/todos/*`) in addition to exact matches
-- Optional TLS via OpenSSL (auto-enabled when `server.crt` / `server.key` exist)
-- WebSocket upgrade handshake (`Sec-WebSocket-Accept` via SHA1 + base64) plus full RFC 6455 frame handling (masked client frames, ping/pong, close, echo)
-- gzip response compression via zlib, negotiated on `Accept-Encoding` for compressible content types (`Content-Encoding: gzip` + `Vary: Accept-Encoding`)
-- Zero-copy static-file streaming with `sendfile(2)` on plaintext connections (no in-memory size cap)
-- B-tree storage engine (pages + buffer pool + WAL + transactions) mounted as a JSON Todo API
-- Live network statistics (atomic counters) exposed at `GET /api/stats`
-- Example JSON endpoints: `/api/hello`, `/api/echo`, `/api/status`, `/api/stats`, `/ws/chat`
+**HTTP**
+- HTTP/1.1 with keep-alive and a 30s idle timeout
+- Edge-triggered `epoll`, one loop per worker thread
+- Route table with per-method handlers, trailing-`*` wildcards (`/api/todos/*`), and a default static-file handler
+- Composable middleware chain — request logging (with timing) and CORS, including `OPTIONS` preflight
+- Optional TLS via OpenSSL, auto-enabled when the cert and key exist
+- WebSocket upgrade + full RFC 6455 frame handling (masked frames, ping/pong, close) — `/ws/chat` is a working echo endpoint
 
-## Todo API
+**Performance**
+- Thread-pool offload of blocking handlers, with read-over-write priority queueing
+- Zero-copy static-file streaming via `sendfile(2)` on plaintext connections, no in-memory size cap
+- gzip compression negotiated on `Accept-Encoding`, for compressible content types over 256 bytes
+- Read-through LRU cache in front of the storage engine for single-todo reads
+- Lock-free atomic counters on the accept/read/write/close paths
 
-A todo is a JSON object: `{"id": <number>, "title": <string>, "completed": <bool>}`.
-On `POST`/`PUT`, the body must supply `title` (required) and may supply `completed`
-(defaults to `false`); `id` is assigned by the server. Ids are numeric and are
-seeded from the highest id already on disk at startup.
+**Storage**
+- Embedded B-tree engine: pages, buffer pool, write-ahead log, transactions, checkpointing
+- Final checkpoint on `SIGINT`/`SIGTERM`, so todos survive a restart
 
-| Method   | Path              | Description                       | Success      |
-| -------- | ----------------- | --------------------------------- | ------------ |
-| `GET`    | `/api/todos`      | List all todos (JSON array)       | `200`        |
-| `POST`   | `/api/todos`      | Create a todo from the JSON body  | `201`        |
-| `GET`    | `/api/todos/{id}` | Fetch a single todo               | `200`        |
-| `PUT`    | `/api/todos/{id}` | Replace a todo                    | `200`        |
-| `DELETE` | `/api/todos/{id}` | Delete a todo                     | `204`        |
+## Build
 
-Error responses: `400` (missing/invalid `title` or non-numeric id), `404` (no such todo).
+Shared code compiles once into `libcommon.a`, the storage engine into `libstorage.a`, and each binary links what it needs (the server links both; the balancer only needs `libcommon.a`).
 
-```bash
-# Create
+```sh
+make              # both binaries -> bin/codo + bin/codo-balancer
+make server       # just the HTTP server
+make balancer     # just the load balancer
+make debug        # -g -O0 -DDEBUG with ASan + UBSan
+make release      # -O2 -DNDEBUG
+make run          # build, then run ./bin/codo
+make run-balancer # build, then run ./bin/codo-balancer
+make clean
+```
+
+Requires `gcc`, OpenSSL and zlib headers (`libssl-dev`, `zlib1g-dev` on Debian/Ubuntu). Links against `-lssl -lcrypto -lz -lpthread`.
+
+## Run
+
+```sh
+./bin/codo [port] [document_root]
+```
+
+Configuration is read from `.env` (override the path with `ENV_FILE`), then overridden by the real environment, then by CLI args. TLS turns on automatically when `SSL_ENABLED` is set and both the cert and key files exist.
+
+| Key                  | Default          | Purpose                                                     |
+| -------------------- | ---------------- | ----------------------------------------------------------- |
+| `PORT`               | `8080`           | Listen port                                                  |
+| `DOCUMENT_ROOT`      | `/var/www/html`  | Static file root (the bundled `.env` points it at `www`)      |
+| `SSL_ENABLED`        | `true`           | Enable TLS when the cert and key are present                 |
+| `SSL_CERT_FILE`      | `server.crt`     | TLS certificate                                              |
+| `SSL_KEY_FILE`       | `server.key`     | TLS private key                                              |
+| `CORS_ALLOW_ORIGIN`  | `*`              | Value echoed in `Access-Control-Allow-Origin`                |
+| `DB_FILE`            | `codo.db`        | B-tree data file                                             |
+| `WAL_FILE`           | `codo.wal`       | Write-ahead log                                              |
+| `TODO_CACHE_CAPACITY`| `1024`           | Max entries in the todo read cache                           |
+| `BALANCER_PORT`      | `8000`           | Listen port for `codo-balancer`                              |
+| `BALANCER_BACKENDS`  | `127.0.0.1:8080` | Backends to front: `host:port[:weight]`, comma-separated     |
+
+Compile-time limits (thread counts, buffer sizes, connection caps) live in `common/include/config.h`.
+
+## Endpoints
+
+| Method   | Path              | Description                                    |
+| -------- | ----------------- | ---------------------------------------------- |
+| `GET`    | `/api/hello`      | Hello-world JSON                               |
+| `POST`   | `/api/echo`       | Echoes the request body back                   |
+| `GET`    | `/api/status`     | Server status                                  |
+| `GET`    | `/api/stats`      | Network counters (see below)                   |
+| `GET`    | `/api/cache`      | Todo cache hit/miss counters                   |
+| `GET`    | `/ws/chat`        | WebSocket echo endpoint                        |
+| —        | `/api/todos[/id]` | Todo CRUD — see below                          |
+| `GET`    | `/*`              | Static files from `DOCUMENT_ROOT`              |
+
+### Todo API
+
+A todo is `{"id": <number>, "title": <string>, "completed": <bool>}`. On `POST`/`PUT` the body must supply `title`; `completed` defaults to `false`. Ids are assigned by the server and seeded at startup from the highest id already on disk.
+
+| Method   | Path              | Description                      | Success |
+| -------- | ----------------- | -------------------------------- | ------- |
+| `GET`    | `/api/todos`      | List all todos (JSON array)      | `200`   |
+| `POST`   | `/api/todos`      | Create a todo from the JSON body | `201`   |
+| `GET`    | `/api/todos/{id}` | Fetch a single todo              | `200`   |
+| `PUT`    | `/api/todos/{id}` | Replace a todo                   | `200`   |
+| `DELETE` | `/api/todos/{id}` | Delete a todo                    | `204`   |
+
+Errors: `400` (missing/invalid `title`, or a non-numeric id), `404` (no such todo), `413` (todo too large).
+
+```sh
 curl -X POST localhost:8080/api/todos -d '{"title":"buy milk","completed":false}'
-# -> 201 {"id":1,"title":"buy milk","completed":false}
+# 201 {"id":1,"title":"buy milk","completed":false}
 
-# List / fetch / update / delete
 curl localhost:8080/api/todos
 curl localhost:8080/api/todos/1
 curl -X PUT localhost:8080/api/todos/1 -d '{"title":"buy oat milk","completed":true}'
 curl -X DELETE localhost:8080/api/todos/1
 ```
 
-### Helper scripts
+**Caching.** A single-todo `GET` otherwise costs a transaction plus a B-tree descent through the buffer pool, so it reads through a fixed-capacity LRU cache instead. Writes keep the cache in step: create and update store the new JSON, delete drops the entry. A cache fill that races a concurrent write is discarded rather than resurrecting a stale value — the cache carries a generation counter that every write bumps, and a fill whose snapshot is stale is dropped.
 
-The `scripts/` folder wraps each CRUD operation in a small `curl` script so you can
-drive the API without typing `curl` by hand. Each script targets `http://localhost:8080`
-by default; set the `BASE_URL` environment variable to point somewhere else. They
-require `bash` and `curl` (on Windows, run them from WSL or Git Bash).
+The collection `GET` is deliberately **not** cached: it's a full scan that any write would invalidate, so caching it would trade a scan for a near-permanent miss.
 
-| Script             | Endpoint                | Arguments                          | Notes                                                     |
-| ------------------ | ----------------------- | ---------------------------------- | --------------------------------------------------------- |
-| `create_todo.sh`   | `POST /api/todos`       | `"<title>" [completed]`            | `completed` defaults to `false`; prints the created todo  |
-| `list_todos.sh`    | `GET /api/todos`        | _(none)_                           | Prints the JSON array of all todos                        |
-| `get_todo.sh`      | `GET /api/todos/{id}`   | `<id>`                             | Prints the matching todo (or a `404` error body)          |
-| `update_todo.sh`   | `PUT /api/todos/{id}`   | `<id> "<title>" [completed]`       | Replaces the todo; prints the updated todo                |
-| `delete_todo.sh`   | `DELETE /api/todos/{id}`| `<id>`                             | Prints the HTTP status (`204` on success, `404` if absent)|
-
-`create_todo.sh` and `update_todo.sh` JSON-escape the title for you, so titles with
-spaces or quotes are safe to pass as a single argument.
-
-```bash
-# Make them executable once
-chmod +x scripts/*.sh
-
-scripts/create_todo.sh "buy milk"             # -> 201 {"id":1,"title":"buy milk","completed":false}
-scripts/create_todo.sh "walk the dog" true    # title + completed
-scripts/list_todos.sh                         # [ ...all todos... ]
-scripts/get_todo.sh 1                         # {"id":1,...}
-scripts/update_todo.sh 1 "buy oat milk" true  # {"id":1,"title":"buy oat milk","completed":true}
-scripts/delete_todo.sh 1                      # HTTP 204
-
-# Point the scripts at a different host/port
-BASE_URL=http://localhost:9000 scripts/list_todos.sh
+```sh
+curl localhost:8080/api/cache
+# {"entries":3,"capacity":1024,"hits":41,"misses":7,"evictions":0,"hit_rate":0.8542}
 ```
 
-## Network stats
+### Network stats
 
-`GET /api/stats` returns a snapshot of process-wide network counters (lock-free
-atomics updated on the accept / read / write / close paths):
+`GET /api/stats` snapshots process-wide atomic counters updated on the accept / read / write / close paths (`common/src/stats.c`, which also carries `diagnose_network_issue` and `debug_packet_dump` for debugging).
 
-```bash
+```sh
 curl localhost:8080/api/stats
 # {"bytes_sent":926,"bytes_received":513,"packets_sent":4,"packets_received":5,
 #  "connections_accepted":5,"connections_closed":4,"errors":0}
 ```
 
-The counters live in `src/stats.c` (`include/stats.h`), which also carries socket
-diagnostics helpers (`diagnose_network_issue`, `debug_packet_dump`) for debugging.
+### Helper scripts
 
-## Build
+`scripts/` wraps each CRUD operation in a small `curl` script. They target `http://localhost:8080` unless you set `BASE_URL`, and need `bash` + `curl` (on Windows: WSL or Git Bash).
 
-The repo is a small workspace: shared code is compiled once into a static
-`libcommon.a`, the storage engine into `libstorage.a`, and each binary links
-what it needs (the server links both; the balancer only `libcommon.a`).
+| Script             | Arguments                    | Notes                                          |
+| ------------------ | ---------------------------- | ---------------------------------------------- |
+| `create_todo.sh`   | `"<title>" [completed]`      | Prints the created todo                        |
+| `list_todos.sh`    | _(none)_                     | Prints the JSON array of all todos             |
+| `get_todo.sh`      | `<id>`                       | Prints the matching todo, or a `404` body      |
+| `update_todo.sh`   | `<id> "<title>" [completed]` | Replaces the todo, prints the result           |
+| `delete_todo.sh`   | `<id>`                       | Prints the status (`204`, or `404` if absent)  |
 
-```
-make             # build both binaries (bin/codo + bin/codo-balancer)
-make server      # build only the HTTP server
-make balancer    # build only the load balancer
-make debug       # both, -g -O0 -DDEBUG with ASan + UBSan
-make release     # both, -O2 -DNDEBUG
-make run         # build then run ./bin/codo
-make run-balancer# build then run ./bin/codo-balancer
-make clean
-```
+`create_todo.sh` and `update_todo.sh` JSON-escape the title, so titles with spaces or quotes are safe to pass as one argument.
 
-Output binaries: `bin/codo` (server) and `bin/codo-balancer` (balancer).
-Link deps: `-lssl -lcrypto -lz -lpthread`.
-
-## Run
-
-```
-./bin/codo [port] [document_root]
+```sh
+chmod +x scripts/*.sh
+scripts/create_todo.sh "buy milk"              # 201 {"id":1,...}
+scripts/update_todo.sh 1 "buy oat milk" true   # {"id":1,"title":"buy oat milk","completed":true}
+BASE_URL=http://localhost:9000 scripts/list_todos.sh
 ```
 
-Defaults: port `8080`, document root `/var/www/html`. If `server.crt` and `server.key` are present in the working directory, TLS is enabled automatically.
+## Demo site
 
-Configuration is read from a `.env` file (override the path with `ENV_FILE`), then overridden by CLI args. Relevant keys:
+`www/` is a small self-hosted demo served straight out of the document root: `index.html` exercises the Todo API from the browser, `docs.html` renders the API reference, and `openapi.json` is the OpenAPI description. The bundled `.env` already sets `DOCUMENT_ROOT=www`, so `make run` and then <http://localhost:8080> gives you a working UI.
 
-| Key             | Default          | Purpose                              |
-| --------------- | ---------------- | ------------------------------------ |
-| `PORT`          | `8080`           | Listen port                          |
-| `DOCUMENT_ROOT` | `/var/www/html`  | Static file root                     |
-| `SSL_ENABLED`   | `true`           | Enable TLS when cert/key exist       |
-| `DB_FILE`       | `codo.db`        | B-tree data file (Todo storage)      |
-| `WAL_FILE`      | `codo.wal`       | Write-ahead log file                 |
-| `BALANCER_PORT` | `8000`           | Listen port for `codo-balancer`      |
-| `BALANCER_BACKENDS` | `127.0.0.1:8080` | Backends fronted by `codo-balancer` (`host:port[:weight]`, comma-separated) |
+## Load balancer
 
-The storage engine runs a final checkpoint on shutdown (`SIGINT`/`SIGTERM`), so todos written in one run are visible on the next.
+`bin/codo-balancer` is a TCP load balancer that fronts one or more `codo` instances. It runs a single-threaded `epoll` loop: it accepts a client, picks a backend, opens a non-blocking connection to it, and proxies bytes in both directions, pausing reads on one side when the other side isn't writable yet. Each fd registers an `io_ctx_t` as its epoll `data.ptr`, so the loop knows which connection and which side (`IO_CLIENT` / `IO_BACKEND` / `IO_LISTEN`) an event belongs to.
 
-## Layout
-
-The codebase is split into four components, each with its own `include/` +
-`src/`. `common/` and `storage/` are libraries; `server/` and `balancer/` are
-the two binaries built on top of them.
-
-```
-common/     shared infrastructure compiled into libcommon.a
-  include/  config, http_types, env, util, stats, connection,
-            compression, http_protocol, mime
-  src/      env, util, stats, mime, compression, http_protocol,
-            connection (cleanup + socket helpers)
-storage/    embedded B-tree storage engine compiled into libstorage.a
-  include/  storage.h — the public API (engine lifecycle, transactions,
-            db_insert/search/update/delete/scan)
-  src/      storage_internal.h (private structs, shared by the .c files below)
-            engine   — singleton, init/cleanup, checkpoint, statistics
-            wal      — write-ahead log append + flush
-            pager    — buffer pool, page IO, free-page management, checksums
-            btree    — page-level key search/insert/delete
-            txn      — transaction begin/commit/abort
-            db       — CRUD/scan API (tree descent over the layers above)
-server/     the HTTP/1.1 server (bin/codo)
-  include/  server, worker, route, handlers, todo_handlers,
-            ssl_util, websocket, middleware
-  src/      main, server, worker, connection_pool, route, handlers,
-            todo_handlers, ssl_util, websocket, middleware
-balancer/   epoll TCP load balancer (bin/codo-balancer)
-  include/  balancer, types, selection, hash
-  src/      main, balancer, selection, hash
-build/      .o + .d files per component + libcommon.a + libstorage.a
-bin/        output binaries (codo, codo-balancer)
-scripts/    bash + curl helpers for the Todo API (create/list/get/update/delete)
-tests/      reserved (no test harness yet)
-```
-
-The Todo API lives in `server/src/todo_handlers.c` (HTTP/JSON layer) on top of
-the storage engine's public API (`storage/include/storage.h`). The engine's
-internals — pages, buffer pool, WAL records, locking — are private to
-`storage/src/`. `server/src/main.c` initializes the engine, seeds the id
-counter, and registers the routes.
-
-### What is shared vs. server-only
-
-`common/` holds everything that does not depend on `http_server_t`: config and
-env loading, the HTTP request parser / response writer (`http_protocol.c`),
-generic socket helpers and per-connection teardown (`connection.c`), network
-stats, MIME lookup, and gzip plumbing. The server adds the pieces bound to its
-own state: the connection pool (`connection_pool.c`, which tracks live
-connections in `http_server_t`), TLS context setup (`ssl_util.c`), the
-worker/epoll loop, routing, and the Todo API.
-
-Two deliberate seams keep `common/` free of server types:
-
-- `http_protocol.c` fills the `Server:` response header via `http_server_name()`,
-  a hook each binary defines for itself (the server returns its configured name).
-- `connection.c` provides `cleanup_connection()` + socket helpers (no server
-  state); `allocate_connection()` / `free_connection()`, which touch the pool,
-  live in the server's `connection_pool.c`.
-
-## Balancer
-
-`balancer/` is a TCP load balancer (`bin/codo-balancer`) that fronts one or
-more `codo` instances. It runs a single-threaded `epoll` event loop:
-`load_balancer_init()` binds the listen socket and creates the epoll instance,
-`lb_handle_new_connection()` accepts a client, picks a backend, and opens a
-non-blocking connection to it, and the loop then proxies bytes in both
-directions (`client -> backend` via `client_buffer`, `backend -> client` via
-`backend_buffer`), pausing reads on one side when the other side's socket is not
-yet writable.
-
-Backend selection uses smooth weighted round-robin (`select_backend()`),
-skipping any backend whose `health_status` is not healthy. Each fd registers an
-`io_ctx_t` as its epoll `data.ptr`, so the loop knows which connection and which
-side (`IO_CLIENT` / `IO_BACKEND` / `IO_LISTEN`) every event belongs to.
-
-### Configuration
-
-The balancer reads the same `.env` file as the server (override with
-`ENV_FILE`). CLI args override the environment: `argv[1]` is the listen port and
-`argv[2]` is the backend list.
-
-| Key                 | Default          | Purpose                                          |
-| ------------------- | ---------------- | ------------------------------------------------ |
-| `BALANCER_PORT`     | `8000`           | Listen port for `codo-balancer`                  |
-| `BALANCER_BACKENDS` | `127.0.0.1:8080` | Comma-separated backend list: `host:port[:weight]` |
+Four selection strategies are implemented — smooth weighted round-robin (nginx-style, the default), least-connections, IP hash, and random — chosen by the `strategy` field on the balancer. Health checking is **passive**: a backend is marked unhealthy after 3 consecutive failures (connect refused, read/write errors, `EPOLLERR`/`HUP`) and re-admitted 30s later to prove itself again. Unhealthy backends are skipped during selection.
 
 ```sh
 make balancer
-BALANCER_PORT=8000 BALANCER_BACKENDS=127.0.0.1:8080,127.0.0.1:8081:2 ./bin/codo-balancer
-# or override on the command line:
 ./bin/codo-balancer 8000 127.0.0.1:8080,127.0.0.1:8081:2
+# or from the environment:
+BALANCER_PORT=8000 BALANCER_BACKENDS=127.0.0.1:8080,127.0.0.1:8081:2 ./bin/codo-balancer
 ```
 
-Each backend is `host:port` with an optional `:weight` suffix (default `1`); a
-higher weight receives proportionally more connections.
+It reads the same `.env` as the server. CLI args override it: `argv[1]` is the listen port, `argv[2]` the backend list. Each backend is `host:port` with an optional `:weight` suffix (default `1`); a higher weight takes proportionally more connections.
 
-## Status
+## Layout
 
-Work in progress, but the previously-scaffolded response-path features are now
-wired end-to-end:
+Four components, each with its own `include/` + `src/`. `common/` and `storage/` are libraries; `server/` and `balancer/` are the binaries built on top of them.
 
-- **gzip compression** — `send_http_response()` compresses the body when the
-  client sends `Accept-Encoding: gzip`, the content type is compressible
-  (text/JSON/JS/XML/SVG), and the body is at least 256 bytes, emitting
-  `Content-Encoding: gzip` and `Vary: Accept-Encoding`. Static text assets are
-  read-and-compressed; binary/opaque files skip it.
-- **`sendfile` streaming** — static files on plaintext connections are streamed
-  zero-copy straight from the fd to the socket in `handle_client_write()`, with
-  no in-memory size cap. TLS connections (which can't hand a raw fd to OpenSSL)
-  and small compressible assets bound for gzip take the buffered path instead.
-- **WebSocket framing** — the RFC 6455 frame engine (`ws_process_frames()`)
-  decodes masked client frames and replies with echoes, pongs, and close frames;
-  `/ws/chat` is a working echo endpoint.
+```
+common/     shared infrastructure -> libcommon.a
+  config, env, util, stats, mime, connection (socket helpers + teardown),
+  http_protocol (request parser + response writer), compression (gzip),
+  thread_pool (priority task queues; work stealing exists but is off),
+  lru (the read cache), lockfree (queue/hashtable/skiplist -- see note below)
+storage/    embedded B-tree engine -> libstorage.a
+  storage.h  public API: engine lifecycle, transactions, insert/search/update/delete/scan
+  engine     singleton init/cleanup, checkpoint, statistics
+  wal        write-ahead log append + flush
+  pager      buffer pool, page IO, free-page management, checksums
+  btree      page-level key search/insert/delete
+  txn        transaction begin/commit/abort
+  db         CRUD/scan API (tree descent over the layers above)
+server/     the HTTP/1.1 server -> bin/codo
+  main, server (accept loop), worker (epoll loop + offload), connection_pool,
+  route, middleware, handlers, todo_handlers, ssl_util, websocket
+balancer/   epoll TCP load balancer -> bin/codo-balancer
+  main, balancer (event loop + proxying), selection (strategies), hash
+www/        bundled demo site + OpenAPI description
+scripts/    bash + curl helpers for the Todo API
+build/      objects, dep files, libcommon.a, libstorage.a
+bin/        output binaries
+```
+
+The Todo API lives in `server/src/todo_handlers.c` (the HTTP/JSON layer) on top of the storage engine's public API. The engine's internals — pages, buffer pool, WAL records, locking — are private to `storage/src/storage_internal.h`.
+
+### What is shared vs. server-only
+
+`common/` holds everything that doesn't depend on `http_server_t`. Two deliberate seams keep it free of server types:
+
+- `http_protocol.c` fills the `Server:` response header via `http_server_name()`, a hook each binary defines for itself.
+- `connection.c` provides `cleanup_connection()` and socket helpers (no server state); `allocate_connection()` / `free_connection()`, which touch the pool, live in the server's `connection_pool.c`.
+
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and PR to `main`:
+
+- **Build & smoke test** — builds, boots the server on a throwaway port, and asserts that a static file serves, `/api/hello` returns `200`, an unknown path `404`s, and the logging middleware recorded both.
+- **Sanitizer build** — compiles the whole tree with ASan + UBSan (`make debug`).
+
+## Notes and limitations
+
+- **Linux only.** `epoll` and `sendfile` are used directly; there's no portability layer.
+- **No test suite.** Correctness is currently covered only by the CI smoke test and the sanitizer build.
+- **`common/src/lockfree.c` is not wired up.** It implements a lock-free queue, hash table and skip list with hazard-pointer reclamation, and compiles into `libcommon.a`, but nothing links against it yet — it's groundwork, not a load-bearing part of the request path.
+- `db_update()` only handles same-length values, so a todo update is implemented as a delete + insert inside one transaction.
+- The JSON parser is hand-rolled and object-shaped: it reads top-level string and boolean fields, and collapses `\uXXXX` escapes to `?`.
