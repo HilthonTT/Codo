@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include "config.h"
@@ -30,6 +31,7 @@ typedef enum
   HTTP_CREATED = 201,
   HTTP_ACCEPTED = 202,
   HTTP_NO_CONTENT = 204,
+  HTTP_PARTIAL_CONTENT = 206,
   HTTP_MOVED_PERMANENTLY = 301,
   HTTP_FOUND = 302,
   HTTP_NOT_MODIFIED = 304,
@@ -40,6 +42,7 @@ typedef enum
   HTTP_METHOD_NOT_ALLOWED = 405,
   HTTP_REQUEST_TIMEOUT = 408,
   HTTP_PAYLOAD_TOO_LARGE = 413,
+  HTTP_RANGE_NOT_SATISFIABLE = 416,
   HTTP_INTERNAL_SERVER_ERROR = 500,
   HTTP_NOT_IMPLEMENTED = 501,
   HTTP_BAD_GATEWAY = 502,
@@ -66,6 +69,23 @@ typedef struct
   char *body;
   size_t body_length;
   size_t content_length;
+  // Body arrived with Transfer-Encoding: chunked (body/body_length hold the
+  // already-decoded bytes; content_length stays 0).
+  bool chunked;
+  // Conditional-request validators. if_modified_since is 0 when the header is
+  // absent or unparseable.
+  char if_none_match[512];
+  char if_range[128];
+  time_t if_modified_since;
+  // Single byte range from a "Range: bytes=..." header. has_range is only set
+  // for a syntactically valid single range ("N-M", "N-", or "-N"); multiple or
+  // malformed ranges are ignored (full response). For the suffix form ("-N"),
+  // range_suffix is set and range_start holds the suffix length. range_end is
+  // -1 for an open-ended range.
+  bool has_range;
+  bool range_suffix;
+  off_t range_start;
+  off_t range_end;
   bool keep_alive;
   bool expect_continue;
   bool is_websocket_upgrade;

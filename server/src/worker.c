@@ -330,16 +330,42 @@ void *worker_thread_function(void *arg)
   return NULL;
 }
 
+// Copy a header value (sans surrounding whitespace) into tmp. Returns -1 when
+// it doesn't fit.
+static int copy_header_value(const char *v, const char *v_end, char *tmp, size_t tmp_size)
+{
+  while (v < v_end && (*v == ' ' || *v == '\t'))
+  {
+    v++;
+  }
+  while (v_end > v && (v_end[-1] == ' ' || v_end[-1] == '\t'))
+  {
+    v_end--;
+  }
+  size_t vl = (size_t)(v_end - v);
+  if (vl >= tmp_size)
+  {
+    return -1;
+  }
+  memcpy(tmp, v, vl);
+  tmp[vl] = '\0';
+  return 0;
+}
+
 // Decide whether a full request (headers plus any declared body) has arrived in
-// the read buffer, without mutating it. Content-Length may only be known after
-// the header terminator, and body bytes can straggle in over several reads, so
-// this is checked before every dispatch. Returns:
+// the read buffer, without mutating it. The body's framing (Content-Length or
+// chunked) is only known after the header terminator, and body bytes can
+// straggle in over several reads, so this is checked before every dispatch.
+// *expect_100 is set when the headers are complete and carry
+// "Expect: 100-continue" -- on a 0 return the caller should send the interim
+// response so the client releases the body. Returns:
 //   1  request fully received
 //   0  incomplete, keep reading
-//  -1  malformed Content-Length -> 400
-//  -2  Transfer-Encoding present (chunked unsupported) -> 501
-//  -3  declared body exceeds max_body -> 413
-static int check_request_frame(connection_t *conn, size_t max_body)
+//  -1  malformed framing (bad Content-Length, bad chunking, or both
+//      Content-Length and Transfer-Encoding present) -> 400
+//  -2  unsupported (non-chunked) Transfer-Encoding -> 501
+//  -3  body exceeds max_body -> 413
+static int check_request_frame(connection_t *conn, size_t max_body, bool *expect_100)
 {
   const char *buf = conn->read_buffer;
 
@@ -357,10 +383,12 @@ static int check_request_frame(connection_t *conn, size_t max_body)
 
   size_t header_len = (size_t)(hdr_end - buf) + term_len;
 
-  // Walk the header lines (request line first, then fields) looking for
-  // Content-Length / Transfer-Encoding. Non-mutating so a later real parse
-  // still sees an intact buffer.
+  // Walk the header lines (request line first, then fields) looking for the
+  // framing headers. Non-mutating so a later real parse still sees an intact
+  // buffer.
   size_t content_length = 0;
+  bool saw_content_length = false;
+  bool chunked = false;
   const char *line = buf;
   while (line < hdr_end)
   {
@@ -376,26 +404,39 @@ static int check_request_frame(connection_t *conn, size_t max_body)
     if (colon)
     {
       size_t name_len = (size_t)(colon - line);
+      const char *v = colon + 1;
+      const char *v_end = line + line_len;
       if (name_len == 14 && strncasecmp(line, "Content-Length", 14) == 0)
       {
-        const char *v = colon + 1;
-        const char *v_end = line + line_len;
         char tmp[32];
-        size_t vl = (size_t)(v_end - v);
-        if (vl >= sizeof(tmp))
+        if (copy_header_value(v, v_end, tmp, sizeof(tmp)) != 0)
         {
           return -1; // implausibly long value
         }
-        memcpy(tmp, v, vl);
-        tmp[vl] = '\0';
         if (http_parse_content_length(tmp, &content_length) != 0)
         {
           return -1;
         }
+        saw_content_length = true;
       }
       else if (name_len == 17 && strncasecmp(line, "Transfer-Encoding", 17) == 0)
       {
-        return -2; // chunked (or any coding) decoding is not implemented
+        char tmp[32];
+        if (copy_header_value(v, v_end, tmp, sizeof(tmp)) != 0 ||
+            strcasecmp(tmp, "chunked") != 0)
+        {
+          return -2; // only the chunked coding is implemented
+        }
+        chunked = true;
+      }
+      else if (name_len == 6 && strncasecmp(line, "Expect", 6) == 0)
+      {
+        char tmp[32];
+        if (copy_header_value(v, v_end, tmp, sizeof(tmp)) == 0 &&
+            strcasecmp(tmp, "100-continue") == 0 && expect_100)
+        {
+          *expect_100 = true;
+        }
       }
     }
 
@@ -404,6 +445,27 @@ static int check_request_frame(connection_t *conn, size_t max_body)
       break;
     }
     line = nl + 1;
+  }
+
+  if (chunked)
+  {
+    // Both framings on one message is a request-smuggling vector; refuse.
+    if (saw_content_length)
+    {
+      return -1;
+    }
+    size_t decoded = 0;
+    int r = http_chunked_decode(buf + header_len,
+                                conn->read_buffer_pos - header_len, NULL, &decoded);
+    if (r < 0)
+    {
+      return -1;
+    }
+    if (decoded > max_body)
+    {
+      return -3;
+    }
+    return r; // 1 = terminal chunk seen, 0 = still arriving
   }
 
   if (content_length > max_body)
@@ -416,6 +478,58 @@ static int check_request_frame(connection_t *conn, size_t max_body)
   }
 
   return 1;
+}
+
+// Push the interim "HTTP/1.1 100 Continue" line straight to the socket -- it
+// precedes (and is separate from) the buffered final response. Partial-write
+// progress is kept in conn->continue_pos so a retry resumes mid-line;
+// conn->continue_sent marks completion. Returns 0 on progress (sent or
+// would-block), -1 on a fatal socket error.
+static int send_100_continue(connection_t *conn)
+{
+  static const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+  const size_t len = sizeof(interim) - 1;
+
+  while (conn->continue_pos < len)
+  {
+    ssize_t n;
+    if (conn->ssl_enabled && conn->ssl)
+    {
+      n = SSL_write(conn->ssl, interim + conn->continue_pos,
+                    (int)(len - conn->continue_pos));
+      if (n <= 0)
+      {
+        int ssl_error = SSL_get_error(conn->ssl, (int)n);
+        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
+        {
+          return 0;
+        }
+        return -1;
+      }
+    }
+    else
+    {
+      n = write(conn->socket_fd, interim + conn->continue_pos,
+                len - conn->continue_pos);
+      if (n < 0)
+      {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+          return 0;
+        }
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return -1;
+      }
+    }
+    conn->continue_pos += (size_t)n;
+    stats_record_bytes_sent((uint64_t)n);
+  }
+
+  conn->continue_sent = true;
+  return 0;
 }
 
 // Drive an established WebSocket connection: drain readable bytes, decode the
@@ -601,16 +715,23 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     conn->last_activity = time(NULL);
   }
 
-  // Wait until the full request -- headers plus any Content-Length body -- has
+  // Wait until the full request -- headers plus any declared body -- has
   // arrived before dispatching. A body can straggle in over several reads.
-  int frame = check_request_frame(conn, g_server.max_request_size);
+  bool expect_100 = false;
+  int frame = check_request_frame(conn, g_server.max_request_size, &expect_100);
   if (frame == 0)
   {
+    // Headers complete but the body still in flight: honor Expect:
+    // 100-continue (once) so a waiting client releases the body.
+    if (expect_100 && !conn->continue_sent && send_100_continue(conn) != 0)
+    {
+      return -1;
+    }
     return 0; // need more data
   }
   if (frame == -2)
   {
-    send_error_response(conn, HTTP_NOT_IMPLEMENTED, "Transfer-Encoding not supported");
+    send_error_response(conn, HTTP_NOT_IMPLEMENTED, "Unsupported Transfer-Encoding");
     return finalize_response(worker, conn);
   }
   if (frame == -3)
@@ -622,6 +743,17 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   {
     send_error_response(conn, HTTP_BAD_REQUEST, "Bad Request");
     return finalize_response(worker, conn);
+  }
+
+  // A half-written interim "100 Continue" must be flushed before any final
+  // response bytes, or the two would interleave mid-line. If the socket still
+  // can't take 25 bytes, the connection is wedged -- drop it.
+  if (conn->continue_pos > 0 && !conn->continue_sent)
+  {
+    if (send_100_continue(conn) != 0 || !conn->continue_sent)
+    {
+      return -1;
+    }
   }
 
   conn->state = CONN_STATE_PROCESSING;
@@ -844,6 +976,8 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     conn->read_buffer_pos = 0;
     conn->write_buffer_pos = 0;
     conn->write_buffer_size = 0;
+    conn->continue_pos = 0;
+    conn->continue_sent = false;
 
     if (conn->request.body)
     {

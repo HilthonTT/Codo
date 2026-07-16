@@ -18,4 +18,8 @@ bool is_valid_uri(const char *uri);
 // RFC 1123 / HTTP-date formatter.
 void format_http_date(time_t t, char *buf, size_t buf_size);
 
+// RFC 1123 HTTP-date parser (the format format_http_date emits). Returns
+// (time_t)-1 when the value doesn't parse.
+time_t parse_http_date(const char *value);
+
 #endif

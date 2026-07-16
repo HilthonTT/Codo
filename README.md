@@ -30,6 +30,10 @@ Every handler runs inside a **middleware chain** (`logging` → `cors` → handl
 **HTTP**
 - HTTP/1.1 with keep-alive and a 30s idle timeout
 - Edge-triggered `epoll`, one loop per worker thread
+- Conditional requests on static files: strong `ETag` (mtime + size) and `Last-Modified` on every file response, answered with `304 Not Modified` on a matching `If-None-Match` / `If-Modified-Since` (gzipped responses carry a weak `W/` etag, since the encoded bytes differ)
+- Byte ranges: a single `Range: bytes=` (including `N-`, `-N` suffix forms) returns `206 Partial Content` with `Content-Range`, validated against `If-Range`, `416` when unsatisfiable — served through the same zero-copy `sendfile` window
+- Chunked request bodies: `Transfer-Encoding: chunked` is decoded (extensions and trailers tolerated); a message carrying both `Content-Length` and `Transfer-Encoding` is refused with `400` as a request-smuggling guard, and any non-chunked coding gets `501`
+- `Expect: 100-continue`: the interim `100 Continue` is written as soon as the headers arrive, so clients that wait before sending a large body aren't stuck for their retry timeout
 - Route table with per-method handlers, trailing-`*` wildcards (`/api/todos/*`), and a default static-file handler
 - Composable middleware chain — request logging (with timing) and CORS, including `OPTIONS` preflight
 - Optional TLS via OpenSSL, auto-enabled when the cert and key exist

@@ -52,6 +52,13 @@ typedef struct connection
   // reaping) -- the pool thread owns it until it re-arms the socket for output.
   _Atomic(bool) offloaded;
 
+  // Expect: 100-continue progress for the current request: bytes of the
+  // interim "100 Continue" line already written to the socket, and whether it
+  // has fully flushed. Both reset when the connection is reused for the next
+  // request.
+  size_t continue_pos;
+  bool continue_sent;
+
   // Timing
   time_t last_activity;
   time_t connection_time;

@@ -15,6 +15,14 @@ const char *http_server_name(void);
 // request parsing and by the worker's message-framing check.
 int http_parse_content_length(const char *value, size_t *out);
 
+// Decode (or, with out == NULL, just validate and measure) a chunked-encoded
+// message body. `in` points at the first chunk-size line; `out`, when given,
+// must have room for at least in_len bytes (decoded data is always a subset of
+// the input). *out_len receives the decoded length. Returns 1 when a complete
+// message (terminal 0-chunk plus trailer section) was consumed, 0 when more
+// input is needed, -1 when the encoding is malformed.
+int http_chunked_decode(const char *in, size_t in_len, char *out, size_t *out_len);
+
 int parse_http_request(connection_t *conn, http_request_t *request);
 int generate_http_response(connection_t *conn, http_response_t *response);
 int send_http_response(connection_t *conn, http_response_t *response);
