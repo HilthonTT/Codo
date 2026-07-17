@@ -5,8 +5,11 @@
 #include <stdlib.h>
 #include <unistd.h>
 
+#include "auth.h"
 #include "handlers.h"
+#include "metrics.h"
 #include "middleware.h"
+#include "rate_limit.h"
 #include "route.h"
 #include "server.h"
 #include "ssl_util.h"
@@ -80,16 +83,31 @@ int main(int argc, char *argv[])
   }
   todo_api_init();
 
+  // Initialize the request-metrics epoch and load the rate-limit / auth config
+  // from the environment before any request can run through the middleware.
+  metrics_init();
+  rate_limit_init();
+  auth_init();
+
   // Store the CORS policy where the middleware can reach it.
   snprintf(g_server.cors_allow_origin, sizeof(g_server.cors_allow_origin),
            "%s", cors_origin);
 
-  // Register middleware first -- it wraps every route handler below. The
-  // logging middleware is registered first so it times the whole chain
-  // (including CORS). CORS runs next so it can answer preflight requests before
-  // they reach any route or the default file handler.
+  // Register middleware first -- it wraps every route handler below, running in
+  // registration order (first registered = outermost). The ordering is
+  // deliberate:
+  //   logging     outermost, so it times the entire chain
+  //   metrics     records the final status + latency of every request, even
+  //               those a later stage short-circuits (429/401)
+  //   cors        answers OPTIONS preflight here, so preflights are never
+  //               rate-limited or auth-blocked below
+  //   rate_limit  sheds excess load before the server does auth work
+  //   auth        guards mutating routes, closest to the handler
   add_middleware(&g_server, logging_middleware);
+  add_middleware(&g_server, metrics_middleware);
   add_middleware(&g_server, cors_middleware);
+  add_middleware(&g_server, rate_limit_middleware);
+  add_middleware(&g_server, auth_middleware);
 
   // Add example routes
   add_route(&g_server, "/api/hello", HTTP_GET, api_hello_handler);
@@ -97,6 +115,13 @@ int main(int argc, char *argv[])
   add_route(&g_server, "/api/status", HTTP_GET, api_status_handler);
   add_route(&g_server, "/api/stats", HTTP_GET, api_stats_handler);
   add_route(&g_server, "/ws/chat", HTTP_GET, websocket_chat_handler);
+
+  // Observability endpoints. /metrics and /healthz only read atomics, so they
+  // run inline; /readyz proves the storage engine can serve a transaction, so
+  // it is offloaded to the storage pool like the Todo routes.
+  add_route(&g_server, "/metrics", HTTP_GET, api_metrics_handler);
+  add_route(&g_server, "/healthz", HTTP_GET, api_healthz_handler);
+  add_route_offloaded(&g_server, "/readyz", HTTP_GET, api_readyz_handler);
 
   // Mount the Todo CRUD web API on top of the storage engine.
   todo_api_register_routes(&g_server);

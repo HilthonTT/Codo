@@ -16,6 +16,7 @@
 #include "server.h"
 #include "storage.h"
 #include "todo_handlers.h"
+#include "util.h"
 
 // Todos are stored in the btree keyed by their decimal id (e.g. "42"); the
 // value is the canonical JSON object {"id":..,"title":..,"completed":..}.
@@ -343,12 +344,26 @@ static int send_json(connection_t *conn, http_request_t *request,
   return send_http_response(conn, response);
 }
 
+// Parsed GET /api/todos query parameters. Any subset may be present; an absent
+// field leaves filtering/pagination on that axis disabled.
+typedef struct
+{
+  bool have_completed;
+  bool completed_want;
+  bool have_q;
+  char q[256]; // case-insensitive substring matched against the title
+  long offset; // items to skip (>= 0)
+  long limit;  // max items to return; < 0 means unlimited
+} todo_filter_t;
+
 typedef struct
 {
   char *buf;
   size_t len;
   size_t cap;
-  int count;
+  int count;          // items appended to buf (after pagination)
+  long matched;       // items passing the filter (before pagination)
+  const todo_filter_t *filter;
   bool error;
 } list_ctx_t;
 
@@ -382,6 +397,41 @@ static int list_scan_cb(const char *key, size_t key_length,
   (void)key;
   (void)key_length;
   list_ctx_t *list = (list_ctx_t *)ctx;
+  const todo_filter_t *f = list->filter;
+
+  // Apply the filters against the stored JSON before this row counts as a match.
+  if (f->have_completed)
+  {
+    bool completed = false;
+    parse_json_bool(value, value_length, "completed", &completed);
+    if (completed != f->completed_want)
+    {
+      return 0;
+    }
+  }
+  if (f->have_q)
+  {
+    char title[MAX_VALUE_SIZE];
+    if (!parse_json_string(value, value_length, "title", title, sizeof(title)) ||
+        !strcasestr(title, f->q))
+    {
+      return 0;
+    }
+  }
+
+  // Matched. Its 0-based position within the matched set drives pagination; the
+  // running total keeps climbing past the page so X-Total-Count is exact.
+  long index = list->matched;
+  list->matched++;
+
+  if (index < f->offset)
+  {
+    return 0; // before the requested page
+  }
+  if (f->limit >= 0 && list->count >= f->limit)
+  {
+    return 0; // page already full -- keep scanning only to finish the count
+  }
 
   if (list->count > 0 && list_append(list, ",", 1) != 0)
   {
@@ -395,9 +445,83 @@ static int list_scan_cb(const char *key, size_t key_length,
   return 0;
 }
 
+// Parse the GET /api/todos query string into a filter. Unknown or malformed
+// parameters are ignored, so a bad ?limit= just falls back to "no limit".
+static void parse_todo_filter(const char *query, todo_filter_t *f)
+{
+  f->have_completed = false;
+  f->completed_want = false;
+  f->have_q = false;
+  f->q[0] = '\0';
+  f->offset = 0;
+  f->limit = -1;
+
+  if (!query || !*query)
+  {
+    return;
+  }
+
+  http_header_t params[MAX_HEADERS];
+  int count = 0;
+  parse_query_string(query, params, &count);
+
+  for (int i = 0; i < count; i++)
+  {
+    const char *name = params[i].name;
+    const char *val = params[i].value;
+
+    if (strcmp(name, "completed") == 0)
+    {
+      if (strcmp(val, "true") == 0)
+      {
+        f->have_completed = true;
+        f->completed_want = true;
+      }
+      else if (strcmp(val, "false") == 0)
+      {
+        f->have_completed = true;
+        f->completed_want = false;
+      }
+    }
+    else if (strcmp(name, "q") == 0)
+    {
+      char *decoded = url_decode(val);
+      if (decoded)
+      {
+        strncpy(f->q, decoded, sizeof(f->q) - 1);
+        f->q[sizeof(f->q) - 1] = '\0';
+        f->have_q = f->q[0] != '\0';
+        free(decoded);
+      }
+    }
+    else if (strcmp(name, "limit") == 0)
+    {
+      char *end = NULL;
+      long n = strtol(val, &end, 10);
+      if (end != val && n >= 0)
+      {
+        f->limit = n;
+      }
+    }
+    else if (strcmp(name, "offset") == 0)
+    {
+      char *end = NULL;
+      long n = strtol(val, &end, 10);
+      if (end != val && n >= 0)
+      {
+        f->offset = n;
+      }
+    }
+  }
+}
+
 int todo_list_handler(connection_t *conn, http_request_t *request, http_response_t *response)
 {
+  todo_filter_t filter;
+  parse_todo_filter(request->query_string, &filter);
+
   list_ctx_t list = {0};
+  list.filter = &filter;
   if (list_append(&list, "[", 1) != 0)
   {
     free(list.buf);
@@ -421,9 +545,28 @@ int todo_list_handler(connection_t *conn, http_request_t *request, http_response
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
   }
 
-  int rc = send_json(conn, request, response, HTTP_OK, list.buf);
-  free(list.buf);
-  return rc;
+  // The body stays a bare JSON array (paginated), so the demo UI and existing
+  // clients keep working; the pre-pagination match count rides in a header.
+  response->status = HTTP_OK;
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
+  if (response->body)
+  {
+    free(response->body);
+  }
+  response->body = list.buf; // hand off ownership; send frees it via cleanup
+  response->body_length = list.len;
+  response->keep_alive = request->keep_alive;
+
+  int h = 0;
+  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "Content-Type");
+  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "application/json");
+  h++;
+  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "X-Total-Count");
+  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "%ld", list.matched);
+  h++;
+  response->header_count = h;
+
+  return send_http_response(conn, response);
 }
 
 int todo_create_handler(connection_t *conn, http_request_t *request, http_response_t *response)

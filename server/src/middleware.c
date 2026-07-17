@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "http_protocol.h"
+#include "metrics.h"
 #include "middleware.h"
 #include "server.h"
 #include "util.h"
@@ -106,6 +107,26 @@ int logging_middleware(connection_t *conn, http_request_t *request,
          elapsed_ms);
   fflush(stdout);
 
+  return rc;
+}
+
+int metrics_middleware(connection_t *conn, http_request_t *request,
+                       http_response_t *response, middleware_ctx_t *next)
+{
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  int rc = middleware_next(conn, request, response, next);
+
+  struct timespec end;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  double elapsed = (end.tv_sec - start.tv_sec) +
+                   (end.tv_nsec - start.tv_nsec) / 1e9;
+
+  // response->status is fully resolved once the chain returns -- including any
+  // short-circuit reply (a 429 from rate limiting, a 401 from auth), so those
+  // are counted too.
+  metrics_record_request(request->method, response->status, elapsed);
   return rc;
 }
 

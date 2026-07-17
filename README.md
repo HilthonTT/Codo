@@ -23,7 +23,7 @@ The handoff is the interesting part. A handler that touches the storage engine (
 
 The pool has **two priority levels**: reads are queued above writes (`STORAGE_PRIORITY_READ` > `STORAGE_PRIORITY_WRITE`), so a `GET` doesn't wait behind a burst of WAL-fsyncing writes. It is deliberately oversubscribed relative to the core count — those threads spend most of their life parked in `fsync`/`pread`, so extra threads keep the CPU busy rather than idle.
 
-Every handler runs inside a **middleware chain** (`logging` → `cors` → handler). Middleware is registered in `main.c` and wraps every route, including the default file handler.
+Every handler runs inside a **middleware chain** (`logging` → `metrics` → `cors` → `rate_limit` → `auth` → handler). Middleware is registered in `main.c` and wraps every route, including the default file handler. The order is deliberate: logging (outermost) times the whole chain; metrics records the final status and latency of every request, including ones a later stage short-circuits; CORS answers `OPTIONS` preflight before rate limiting or auth can reject it; rate limiting sheds excess load before the server spends effort on auth; auth (innermost) guards mutating routes right before the handler.
 
 ## Features
 
@@ -35,9 +35,15 @@ Every handler runs inside a **middleware chain** (`logging` → `cors` → handl
 - Chunked request bodies: `Transfer-Encoding: chunked` is decoded (extensions and trailers tolerated); a message carrying both `Content-Length` and `Transfer-Encoding` is refused with `400` as a request-smuggling guard, and any non-chunked coding gets `501`
 - `Expect: 100-continue`: the interim `100 Continue` is written as soon as the headers arrive, so clients that wait before sending a large body aren't stuck for their retry timeout
 - Route table with per-method handlers, trailing-`*` wildcards (`/api/todos/*`), and a default static-file handler
-- Composable middleware chain — request logging (with timing) and CORS, including `OPTIONS` preflight
+- Composable middleware chain — request logging (with timing), metrics, CORS (including `OPTIONS` preflight), rate limiting, and API-key auth
 - Optional TLS via OpenSSL, auto-enabled when the cert and key exist
 - WebSocket upgrade + full RFC 6455 frame handling (masked frames, ping/pong, close) — `/ws/chat` is a working echo endpoint
+
+**Middleware & policy**
+- Token-bucket **rate limiting** per client IP, refilled at `RATE_LIMIT_RPS`/s up to a `RATE_LIMIT_BURST` allowance; over-limit requests get `429 Too Many Requests` with `Retry-After`. Buckets live in a fixed open-addressing table with bounded, LRU-evicting probes, so the check stays O(1) and the memory footprint is constant
+- **API-key auth** on mutating verbs (`POST`/`PUT`/`DELETE`/`PATCH`): keys come from `API_KEYS`, presented as `X-API-Key` or `Authorization: Bearer`, checked in constant time; reads stay public and auth is off entirely when no keys are set
+- **Prometheus metrics** at `/metrics` — per-method/status request counters, a request-latency histogram, and process gauges (uptime, active/total connections) in the text exposition format
+- **Health endpoints** — `/healthz` (liveness, inline) and `/readyz` (readiness, proves the storage engine can serve a transaction)
 
 **Performance**
 - Thread-pool offload of blocking handlers, with read-over-write priority queueing
@@ -83,6 +89,10 @@ Configuration is read from `.env` (override the path with `ENV_FILE`), then over
 | `SSL_CERT_FILE`      | `server.crt`     | TLS certificate                                              |
 | `SSL_KEY_FILE`       | `server.key`     | TLS private key                                              |
 | `CORS_ALLOW_ORIGIN`  | `*`              | Value echoed in `Access-Control-Allow-Origin`                |
+| `RATE_LIMIT_ENABLED` | `true`           | Enable per-IP token-bucket rate limiting                     |
+| `RATE_LIMIT_RPS`     | `100`            | Sustained refill rate (tokens/sec per client IP)             |
+| `RATE_LIMIT_BURST`   | `200`            | Bucket size — the largest instantaneous burst allowed        |
+| `API_KEYS`           | _(empty)_        | Comma-separated keys guarding writes; empty disables auth    |
 | `DB_FILE`            | `codo.db`        | B-tree data file                                             |
 | `WAL_FILE`           | `codo.wal`       | Write-ahead log                                              |
 | `TODO_CACHE_CAPACITY`| `1024`           | Max entries in the todo read cache                           |
@@ -100,6 +110,9 @@ Compile-time limits (thread counts, buffer sizes, connection caps) live in `comm
 | `GET`    | `/api/status`     | Server status                                  |
 | `GET`    | `/api/stats`      | Network counters (see below)                   |
 | `GET`    | `/api/cache`      | Todo cache hit/miss counters                   |
+| `GET`    | `/metrics`        | Prometheus metrics (see below)                 |
+| `GET`    | `/healthz`        | Liveness probe — `{"status":"ok"}`             |
+| `GET`    | `/readyz`         | Readiness probe (checks the storage engine)    |
 | `GET`    | `/ws/chat`        | WebSocket echo endpoint                        |
 | —        | `/api/todos[/id]` | Todo CRUD — see below                          |
 | `GET`    | `/*`              | Static files from `DOCUMENT_ROOT`              |
@@ -110,13 +123,29 @@ A todo is `{"id": <number>, "title": <string>, "completed": <bool>}`. On `POST`/
 
 | Method   | Path              | Description                      | Success |
 | -------- | ----------------- | -------------------------------- | ------- |
-| `GET`    | `/api/todos`      | List all todos (JSON array)      | `200`   |
+| `GET`    | `/api/todos`      | List todos (JSON array, filterable — see below) | `200`   |
 | `POST`   | `/api/todos`      | Create a todo from the JSON body | `201`   |
 | `GET`    | `/api/todos/{id}` | Fetch a single todo              | `200`   |
 | `PUT`    | `/api/todos/{id}` | Replace a todo                   | `200`   |
 | `DELETE` | `/api/todos/{id}` | Delete a todo                    | `204`   |
 
-Errors: `400` (missing/invalid `title`, or a non-numeric id), `404` (no such todo), `413` (todo too large).
+Errors: `400` (missing/invalid `title`, or a non-numeric id), `404` (no such todo), `413` (todo too large). With auth enabled, a write with no key is `401` and a write with a wrong key is `403`; over the rate limit, any request is `429`.
+
+**Filtering & pagination.** `GET /api/todos` accepts query parameters, applied during the scan:
+
+| Param       | Example              | Effect                                             |
+| ----------- | -------------------- | -------------------------------------------------- |
+| `completed` | `?completed=true`    | Keep only todos with that completed state          |
+| `q`         | `?q=milk`            | Case-insensitive substring match on the title      |
+| `offset`    | `?offset=20`         | Skip the first N matches                            |
+| `limit`     | `?limit=10`          | Return at most N matches                            |
+
+The response body stays a bare JSON array (so existing clients and the demo UI are unaffected); the count of matches *before* pagination is returned in an `X-Total-Count` header.
+
+```sh
+curl -i "localhost:8080/api/todos?completed=false&q=buy&limit=10&offset=0"
+# 200, X-Total-Count: 7, body is the first 10 matching todos
+```
 
 ```sh
 curl -X POST localhost:8080/api/todos -d '{"title":"buy milk","completed":false}'
@@ -145,6 +174,47 @@ curl localhost:8080/api/cache
 curl localhost:8080/api/stats
 # {"bytes_sent":926,"bytes_received":513,"packets_sent":4,"packets_received":5,
 #  "connections_accepted":5,"connections_closed":4,"errors":0}
+```
+
+### Metrics & health
+
+`GET /metrics` renders the Prometheus text exposition format: a request counter labelled by method and status class, a latency histogram (`codo_request_duration_seconds`) over the classic bucket ladder, and process gauges. The `metrics` middleware records every request as the chain unwinds, so short-circuited replies (a `429`, a `401`) are counted too.
+
+```sh
+curl localhost:8080/metrics
+# codo_requests_total{method="GET",status="2xx"} 41
+# codo_requests_total{method="POST",status="4xx"} 2
+# codo_request_duration_seconds_bucket{le="0.01"} 38
+# codo_request_duration_seconds_bucket{le="+Inf"} 43
+# codo_request_duration_seconds_sum 0.184392
+# codo_request_duration_seconds_count 43
+# codo_uptime_seconds 128
+# codo_active_connections 1
+```
+
+`GET /healthz` is a cheap liveness check answered inline. `GET /readyz` is a readiness check that begins and commits a storage transaction, so it only returns `200` once the engine can actually serve traffic (`503` otherwise) — point a load balancer's health check at it.
+
+### Rate limiting
+
+Each client IP gets a token bucket, refilled at `RATE_LIMIT_RPS` tokens/second up to `RATE_LIMIT_BURST`; every request spends one token. When the bucket is empty the request is rejected with `429 Too Many Requests` and a `Retry-After` telling the client how many seconds until a token frees up. Buckets live in a fixed-size table, so the limiter adds constant memory and an O(1) check on the request path. Preflight `OPTIONS` is answered by the CORS middleware before the limiter runs, so browsers aren't penalized for it. Set `RATE_LIMIT_ENABLED=false` to turn it off.
+
+```sh
+# with RATE_LIMIT_BURST=2, the third rapid request is shed:
+curl -i localhost:8080/healthz   # 200
+curl -i localhost:8080/healthz   # 200
+curl -i localhost:8080/healthz   # 429 Too Many Requests, Retry-After: 1
+```
+
+### Auth
+
+Set `API_KEYS` to a comma-separated list to lock down mutating requests (`POST`/`PUT`/`DELETE`/`PATCH`); reads stay public. The key is presented as `X-API-Key: <key>` or `Authorization: Bearer <key>` and compared in constant time. A protected request with no key is `401`; a wrong key is `403`. With `API_KEYS` empty (the default), auth is disabled and every route is open.
+
+```sh
+# API_KEYS=secret123
+curl -X POST localhost:8080/api/todos -d '{"title":"buy milk"}'
+# 401 {"error":"missing API key"}
+curl -X POST -H 'X-API-Key: secret123' localhost:8080/api/todos -d '{"title":"buy milk"}'
+# 201 {"id":1,"title":"buy milk","completed":false}
 ```
 
 ### Helper scripts
@@ -193,10 +263,11 @@ Four components, each with its own `include/` + `src/`. `common/` and `storage/`
 
 ```
 common/     shared infrastructure -> libcommon.a
-  config, env, util, stats, mime, connection (socket helpers + teardown),
-  http_protocol (request parser + response writer), compression (gzip),
-  thread_pool (priority task queues; work stealing exists but is off),
-  lru (the read cache), lockfree (queue/hashtable/skiplist -- see note below)
+  config, env, util, stats, metrics (Prometheus request counters + histogram),
+  mime, connection (socket helpers + teardown), http_protocol (request parser +
+  response writer), compression (gzip), thread_pool (priority task queues; work
+  stealing exists but is off), lru (the read cache), lockfree (queue/hashtable/
+  skiplist -- see note below)
 storage/    embedded B-tree engine -> libstorage.a
   storage.h  public API: engine lifecycle, transactions, insert/search/update/delete/scan
   engine     singleton init/cleanup, checkpoint, statistics
@@ -207,7 +278,8 @@ storage/    embedded B-tree engine -> libstorage.a
   db         CRUD/scan API (tree descent over the layers above)
 server/     the HTTP/1.1 server -> bin/codo
   main, server (accept loop), worker (epoll loop + offload), connection_pool,
-  route, middleware, handlers, todo_handlers, ssl_util, websocket
+  route, middleware, rate_limit (token-bucket limiter), auth (API-key guard),
+  handlers, todo_handlers, ssl_util, websocket
 balancer/   epoll TCP load balancer -> bin/codo-balancer
   main, balancer (event loop + proxying), selection (strategies), hash
 www/        bundled demo site + OpenAPI description

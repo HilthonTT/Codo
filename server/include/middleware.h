@@ -50,6 +50,13 @@ int run_with_middleware(connection_t *conn, http_request_t *request,
 int logging_middleware(connection_t *conn, http_request_t *request,
                        http_response_t *response, middleware_ctx_t *next);
 
+// Built-in middleware: records Prometheus request metrics (a per-method/status
+// counter and a latency histogram) after the rest of the chain returns, so it
+// captures the final status of every request -- handled or short-circuited.
+// Register it near the top of the chain so its timing spans the real work.
+int metrics_middleware(connection_t *conn, http_request_t *request,
+                       http_response_t *response, middleware_ctx_t *next);
+
 // Built-in middleware: adds CORS headers. For a preflight (OPTIONS) request it
 // short-circuits the chain with a 204 that advertises the allowed methods and
 // headers; for any other request carrying an Origin header it tags the response

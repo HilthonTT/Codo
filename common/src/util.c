@@ -47,6 +47,8 @@ const char *http_status_to_string(http_status_t status)
     return "Payload Too Large";
   case HTTP_RANGE_NOT_SATISFIABLE:
     return "Range Not Satisfiable";
+  case HTTP_TOO_MANY_REQUESTS:
+    return "Too Many Requests";
   case HTTP_INTERNAL_SERVER_ERROR:
     return "Internal Server Error";
   case HTTP_NOT_IMPLEMENTED:
