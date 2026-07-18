@@ -1,13 +1,33 @@
 #ifndef CRYPTO_H
 #define CRYPTO_H
 
+#define _POSIX_C_SOURCE 200112L
+
 #include <stdint.h>
 #include <stddef.h>
 #include <time.h>
+#include <stdbool.h>
 #include <pthread.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/random.h>
+#include <string.h>
 
-#include <openssl/crypto.h>
+#include <openssl/evp.h>
+#include <openssl/aes.h>
+#include <openssl/rsa.h>
+#include <openssl/ec.h>
+#include <openssl/ecdh.h>
+#include <openssl/ecdsa.h>
+#include <openssl/rand.h>
+#include <openssl/kdf.h>
+#include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/pkcs12.h>
+#include <openssl/err.h>
 
 #define MAX_KEY_SIZE 4096
 #define MAX_BLOCK_SIZE 64
@@ -121,8 +141,9 @@ void cleanup_crypto_framework(void);
 int init_secure_memory_pool(void);
 void cleanup_secure_memory_pool(void);
 void *secure_malloc(size_t size);
-void secure_free(void *ptr, size_t);
+void secure_free(void *ptr, size_t size);
 int secure_random_bytes(uint8_t *buffer, size_t size);
+// Secure random number generation
 int init_hardware_rng(void);
 
 #endif
