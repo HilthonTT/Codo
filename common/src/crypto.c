@@ -3,7 +3,7 @@
 static key_management_system_t kms = {0};
 
 // Key generation functions
-static int generation_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_t *key_size)
+int generation_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_t *key_size)
 {
   size_t size;
 
@@ -37,7 +37,7 @@ static int generation_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_
   return 0;
 }
 
-static EVP_PKEY *generate_rsa_keypair(int key_size)
+EVP_PKEY *generate_rsa_keypair(int key_size)
 {
   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
   if (!ctx)
@@ -68,7 +68,7 @@ static EVP_PKEY *generate_rsa_keypair(int key_size)
   return pkey;
 }
 
-static EVP_PKEY *generate_ec_keypair(int curve_nid)
+EVP_PKEY *generate_ec_keypair(int curve_nid)
 {
   EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_EC, NULL);
   if (!ctx)
@@ -100,7 +100,7 @@ static EVP_PKEY *generate_ec_keypair(int curve_nid)
 }
 
 // Key management functions
-static secure_key_t *create_secure_key(key_type_t type, crypto_algorithm_t algorithm)
+secure_key_t *create_secure_key(key_type_t type, crypto_algorithm_t algorithm)
 {
   secure_key_t *key = secure_malloc(sizeof(secure_key_t));
   if (!key)
@@ -227,7 +227,7 @@ static secure_key_t *create_secure_key(key_type_t type, crypto_algorithm_t algor
   return key;
 }
 
-static void destroy_secure_key(secure_key_t *key)
+void destroy_secure_key(secure_key_t *key)
 {
   if (!key)
     return;
@@ -245,7 +245,7 @@ static void destroy_secure_key(secure_key_t *key)
   secure_free(key, sizeof(secure_key_t));
 }
 
-static int store_key(secure_key_t *key)
+int store_key(secure_key_t *key)
 {
   pthread_rwlock_wrlock(&kms.keys_lock);
 
@@ -263,7 +263,7 @@ static int store_key(secure_key_t *key)
   return -1; // No space
 }
 
-static secure_key_t *find_key(uint32_t key_id)
+secure_key_t *find_key(uint32_t key_id)
 {
   pthread_rwlock_rdlock(&kms.keys_lock);
 
@@ -279,6 +279,108 @@ static secure_key_t *find_key(uint32_t key_id)
 
   pthread_rwlock_unlock(&kms.keys_lock);
   return key;
+}
+
+int aes_gcm_encrypt(const uint8_t *key, size_t key_size,
+                    const uint8_t *iv, size_t iv_size,
+                    const uint8_t *plaintext, size_t plaintext_size,
+                    const uint8_t *aad, size_t aad_size,
+                    uint8_t **ciphertext, size_t *ciphertext_size,
+                    uint8_t *tag, size_t *tag_size)
+{
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (!ctx)
+  {
+    return -1;
+  }
+
+  const EVP_CIPHER *cipher;
+  switch (key_size)
+  {
+  case 16:
+    cipher = EVP_aes_128_gcm();
+    break;
+  case 32:
+    cipher = EVP_aes_256_gcm();
+    break;
+  default:
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Initialize encryption
+  if (EVP_EncryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Set IV Length
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, iv_size, NULL) != 1)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Set key and IV
+  if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  *ciphertext = secure_malloc(plaintext_size);
+  if (!*ciphertext)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  int len;
+  int ciphertext_len = 0;
+
+  // Add AAD if present
+  if (aad && aad_size > 0)
+  {
+    if (EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_size) != 1)
+    {
+      secure_free(*ciphertext, plaintext_size);
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+  }
+
+  // Encrypt plaintext
+  if (EVP_EncryptUpdate(ctx, *ciphertext, &len, plaintext, plaintext_size) != 1)
+  {
+    secure_free(*ciphertext, plaintext_size);
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+  ciphertext_len = len;
+
+  // Finalize encryption
+  if (EVP_EncryptFinal_ex(ctx, *ciphertext + len, &len) != 1)
+  {
+    secure_free(*ciphertext, plaintext_size);
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+  ciphertext_len += len;
+
+  // Get authentication tag
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, 16, tag) != 1)
+  {
+    secure_free(*ciphertext, plaintext_size);
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  *ciphertext_size = ciphertext_len;
+  *tag_size = 16;
+
+  EVP_CIPHER_CTX_free(ctx);
+  return 0;
 }
 
 int init_crypto_framework(void)
