@@ -146,18 +146,25 @@ int secure_random_bytes(uint8_t *buffer, size_t size);
 // Secure random number generation
 int init_hardware_rng(void);
 
-int generation_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_t *key_size);
+int generate_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_t *key_size);
 EVP_PKEY *generate_rsa_keypair(int key_size);
 EVP_PKEY *generate_ec_keypair(int curve_nid);
 secure_key_t *create_secure_key(key_type_t type, crypto_algorithm_t algorithm);
 void destroy_secure_key(secure_key_t *key);
 int store_key(secure_key_t *key);
 secure_key_t *find_key(uint32_t key_id);
+
 int aes_gcm_encrypt(const uint8_t *key, size_t key_size,
                     const uint8_t *iv, size_t iv_size,
                     const uint8_t *plaintext, size_t plaintext_size,
                     const uint8_t *aad, size_t aad_size,
                     uint8_t **ciphertext, size_t *ciphertext_size,
                     uint8_t *tag, size_t *tag_size);
+int aes_gcm_decrypt(const uint8_t *key, size_t key_size,
+                    const uint8_t *iv, size_t iv_size,
+                    const uint8_t *ciphertext, size_t ciphertext_size,
+                    const uint8_t *aad, size_t aad_size,
+                    const uint8_t *tag, size_t tag_size,
+                    uint8_t **plaintext, size_t *plaintext_size);
 
 #endif

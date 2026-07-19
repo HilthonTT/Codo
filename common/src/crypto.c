@@ -3,7 +3,7 @@
 static key_management_system_t kms = {0};
 
 // Key generation functions
-int generation_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_t *key_size)
+int generate_aes_key(crypto_algorithm_t algorithm, uint8_t **key, size_t *key_size)
 {
   size_t size;
 
@@ -479,6 +479,9 @@ void *secure_malloc(size_t size)
       }
     }
   }
+
+  pthread_mutex_unlock(&kms.secure_memory.pool_lock);
+  return NULL; // No free blocks
 }
 
 void secure_free(void *ptr, size_t size)
@@ -500,7 +503,7 @@ void secure_free(void *ptr, size_t size)
   // Mark blocks as free
   for (size_t i = 0; i < blocks_to_free; i++)
   {
-    kms.secure_memory.allocation_map[blocks_to_free + i] = false;
+    kms.secure_memory.allocation_map[start_block + i] = false;
   }
 
   kms.secure_memory.allocated -= blocks_to_free * kms.secure_memory.block_size;
@@ -573,5 +576,109 @@ int init_hardware_rng(void)
   // Fallback to /dev/urandom
   printf("Using software RNG\n");
 
+  return 0;
+}
+
+int aes_gcm_decrypt(const uint8_t *key, size_t key_size,
+                    const uint8_t *iv, size_t iv_size,
+                    const uint8_t *ciphertext, size_t ciphertext_size,
+                    const uint8_t *aad, size_t aad_size,
+                    const uint8_t *tag, size_t tag_size,
+                    uint8_t **plaintext, size_t *plaintext_size)
+{
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  if (!ctx)
+  {
+    return -1;
+  }
+
+  const EVP_CIPHER *cipher;
+  switch (key_size)
+  {
+  case 16:
+    cipher = EVP_aes_128_gcm();
+    break;
+  case 32:
+    cipher = EVP_aes_256_gcm();
+    break;
+  default:
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Initialize decryption
+  if (EVP_DecryptInit_ex(ctx, cipher, NULL, NULL, NULL) != 1)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Set IV length
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, iv_size, NULL) != 1)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Set key and IV
+  if (EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  *plaintext = secure_malloc(ciphertext_size);
+  if (!*plaintext)
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  int len;
+  int plaintext_len = 0;
+
+  // Add AAD if present
+  if (aad && aad_size > 0)
+  {
+    if (EVP_DecryptUpdate(ctx, NULL, &len, aad, aad_size) != 1)
+    {
+      secure_free(*plaintext, ciphertext_size);
+      EVP_CIPHER_CTX_free(ctx);
+      return -1;
+    }
+  }
+
+  // Decrypt cipher text
+  if (EVP_DecryptUpdate(ctx, *plaintext, &len, ciphertext, ciphertext_size) != 1)
+  {
+    secure_free(*plaintext, ciphertext_size);
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  plaintext_len = len;
+
+  // Set expected authentication tag
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, tag_size, (void *)tag) != 1)
+  {
+    secure_free(*plaintext, ciphertext_size);
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+
+  // Finalize decryption and verify authentication
+  int ret = EVP_DecryptFinal_ex(ctx, *plaintext + len, &len);
+  if (ret <= 0)
+  {
+    // Authentication failed
+    secure_free(*plaintext, ciphertext_size);
+    EVP_CIPHER_CTX_free(ctx);
+    return -1;
+  }
+  plaintext_len += len;
+
+  *plaintext_size = plaintext_len;
+
+  EVP_CIPHER_CTX_free(ctx);
   return 0;
 }
