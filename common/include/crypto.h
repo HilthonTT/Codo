@@ -167,4 +167,46 @@ int aes_gcm_decrypt(const uint8_t *key, size_t key_size,
                     const uint8_t *tag, size_t tag_size,
                     uint8_t **plaintext, size_t *plaintext_size);
 
+int rsa_sign(EVP_PKEY *private_key, const uint8_t *data, size_t data_size, uint8_t **signature, size_t *signature_size);
+int rsa_verify(EVP_PKEY *public_key, const uint8_t *data, size_t data_size,
+               const uint8_t *signature, size_t signature_size);
+
+int pbkdf2_derive_key(const char *password, size_t password_len,
+                      const uint8_t *salt, size_t salt_len,
+                      int iterations, size_t key_len,
+                      uint8_t **derived_key);
+
+int hkdf_derive_key(const uint8_t *ikm, size_t ikm_len,
+                    const uint8_t *salt, size_t salt_len,
+                    const uint8_t *info, size_t info_len,
+                    size_t key_len, uint8_t **derived_key);
+
+uint32_t crypto_generate_key(crypto_algorithm_t algorithm);
+
+int crypto_encrypt(uint32_t key_id, const uint8_t *plaintext, size_t plaintext_size,
+                   const uint8_t *aad, size_t aad_size,
+                   uint8_t **ciphertext, size_t *ciphertext_size,
+                   uint8_t *iv, size_t *iv_size,
+                   uint8_t *tag, size_t *tag_size);
+
+int crypto_decrypt(uint32_t key_id, const uint8_t *ciphertext, size_t ciphertext_size,
+                   const uint8_t *aad, size_t aad_size,
+                   const uint8_t *iv, size_t iv_size,
+                   const uint8_t *tag, size_t tag_size,
+                   uint8_t **plaintext, size_t *plaintext_size);
+
+int crypto_sign(uint32_t key_id, const uint8_t *data, size_t data_size,
+                uint8_t **signature, size_t *signature_size);
+
+int crypto_verify(uint32_t key_id, const uint8_t *data, size_t data_size,
+                  const uint8_t *signature, size_t signature_size);
+
+void crypto_revoke_key(uint32_t key_id);
+
+int crypto_hash_sha256(const uint8_t *data, size_t data_size, uint8_t hash[32]);
+
+int crypto_hmac_sha256(const uint8_t *key, size_t key_size,
+                       const uint8_t *data, size_t data_size,
+                       uint8_t hmac[32]);
+
 #endif
