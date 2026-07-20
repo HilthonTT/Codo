@@ -73,14 +73,96 @@ async function doEcho() {
   }
 }
 
+// Auth ----------------------------------------------------------------------
+
+// The token lives in sessionStorage so a reload keeps you logged in but
+// closing the tab logs you out. All todo requests go through authFetch.
+function getToken() {
+  return sessionStorage.getItem("token") || "";
+}
+
+function authFetch(url, options = {}) {
+  const token = getToken();
+  const headers = { ...(options.headers || {}) };
+  if (token) {
+    headers["Authorization"] = "Bearer " + token;
+  }
+  return fetch(url, { ...options, headers });
+}
+
+function setAuthState(username) {
+  const badge = $("auth-state");
+  const loggedIn = !!username;
+  badge.textContent = loggedIn ? username : "logged out";
+  badge.className = "badge " + (loggedIn ? "on" : "off");
+  $("auth-logout").disabled = !loggedIn;
+  $("auth-login").disabled = loggedIn;
+  $("auth-register").disabled = loggedIn;
+  $("auth-user").disabled = loggedIn;
+  $("auth-pass").disabled = loggedIn;
+}
+
+async function doAuth(path) {
+  const out = $("auth-out");
+  const username = $("auth-user").value.trim();
+  const password = $("auth-pass").value;
+  if (!username || !password) {
+    out.textContent = "Enter a username and password.";
+    return;
+  }
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password }),
+    });
+    showCors(res);
+    const body = await res.json();
+    if (!res.ok) {
+      out.textContent = "Error " + res.status + ": " + (body.error || "?");
+      return;
+    }
+    sessionStorage.setItem("token", body.token);
+    const user = body.user || body; // login nests the user; register doesn't
+    sessionStorage.setItem("username", user.username);
+    setAuthState(user.username);
+    $("auth-pass").value = "";
+    out.textContent = "Logged in as " + user.username +
+      " (token expires in " + body.expires_in + "s)";
+    await refreshTodos();
+  } catch (err) {
+    out.textContent = "Error: " + err;
+  }
+}
+
+function doLogout() {
+  sessionStorage.removeItem("token");
+  sessionStorage.removeItem("username");
+  setAuthState(null);
+  $("auth-out").textContent = "Logged out.";
+  refreshTodos();
+}
+
 // Todos ---------------------------------------------------------------------
 
 async function refreshTodos() {
   const list = $("todo-list");
   list.innerHTML = "";
+  if (!getToken()) {
+    const li = document.createElement("li");
+    li.className = "empty";
+    li.textContent = "Log in to see your todos.";
+    list.appendChild(li);
+    return;
+  }
   try {
-    const res = await fetch("/api/todos");
+    const res = await authFetch("/api/todos");
     showCors(res);
+    if (res.status === 401) {
+      // Token expired or was signed by a previous server run.
+      doLogout();
+      return;
+    }
     const todos = await res.json();
     if (!Array.isArray(todos) || todos.length === 0) {
       const li = document.createElement("li");
@@ -131,7 +213,7 @@ async function addTodo() {
     return;
   }
   try {
-    const res = await fetch("/api/todos", {
+    const res = await authFetch("/api/todos", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title, completed: false }),
@@ -146,7 +228,7 @@ async function addTodo() {
 
 async function toggleTodo(todo) {
   try {
-    const res = await fetch("/api/todos/" + todo.id, {
+    const res = await authFetch("/api/todos/" + todo.id, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: todo.title, completed: !todo.completed }),
@@ -160,7 +242,7 @@ async function toggleTodo(todo) {
 
 async function deleteTodo(id) {
   try {
-    const res = await fetch("/api/todos/" + id, { method: "DELETE" });
+    const res = await authFetch("/api/todos/" + id, { method: "DELETE" });
     showCors(res);
     await refreshTodos();
   } catch (err) {
@@ -240,6 +322,14 @@ window.addEventListener("DOMContentLoaded", () => {
   $("echo-in").addEventListener("keydown", (e) => {
     if (e.key === "Enter") doEcho();
   });
+
+  $("auth-login").addEventListener("click", () => doAuth("/api/auth/login"));
+  $("auth-register").addEventListener("click", () => doAuth("/api/auth/register"));
+  $("auth-logout").addEventListener("click", doLogout);
+  $("auth-pass").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doAuth("/api/auth/login");
+  });
+  setAuthState(getToken() ? sessionStorage.getItem("username") : null);
 
   $("todo-add").addEventListener("click", addTodo);
   $("todo-refresh").addEventListener("click", refreshTodos);

@@ -74,6 +74,16 @@ static bool method_is_protected(http_method_t method)
          method == HTTP_DELETE || method == HTTP_PATCH;
 }
 
+// Paths owned by the JWT layer (see jwt_middleware): the todo API is guarded
+// per-user by bearer tokens, and the auth endpoints must stay reachable
+// without credentials or nobody could ever obtain a token. Requiring an API
+// key on top would demand two Authorization mechanisms on one request.
+static bool path_uses_jwt(const char *uri)
+{
+  return strncmp(uri, "/api/todos", 10) == 0 ||
+         strncmp(uri, "/api/auth/", 10) == 0;
+}
+
 // Length-agnostic constant-time equality: the loop always runs over the longer
 // of the two strings so a caller can't learn the key length or its matching
 // prefix from response timing.
@@ -145,7 +155,8 @@ static int send_auth_error(connection_t *conn, http_request_t *request,
 int auth_middleware(connection_t *conn, http_request_t *request,
                     http_response_t *response, middleware_ctx_t *next)
 {
-  if (g_key_count == 0 || !method_is_protected(request->method))
+  if (g_key_count == 0 || !method_is_protected(request->method) ||
+      path_uses_jwt(request->uri))
   {
     return middleware_next(conn, request, response, next);
   }

@@ -11,6 +11,7 @@
 #include "env.h"
 #include "http_protocol.h"
 #include "http_types.h"
+#include "json_util.h"
 #include "lru.h"
 #include "route.h"
 #include "server.h"
@@ -19,9 +20,15 @@
 #include "util.h"
 
 // Todos are stored in the btree keyed by their decimal id (e.g. "42"); the
-// value is the canonical JSON object {"id":..,"title":..,"completed":..}.
-// Ids are handed out from a process-wide counter that is seeded at startup
-// from the highest id already on disk.
+// value is the canonical JSON object
+// {"id":..,"user_id":..,"title":..,"completed":..}. Ids are handed out from a
+// process-wide counter that is seeded at startup from the highest id already
+// on disk.
+//
+// Every todo belongs to the user who created it. The jwt_middleware runs
+// before these handlers and publishes the verified identity in
+// conn->auth_user_id; each handler filters or checks ownership against it,
+// answering 404 for another user's todo so ids can't be probed.
 static _Atomic uint64_t g_next_todo_id = 1;
 
 // Read-through cache in front of the btree, keyed by the same todo id and
@@ -38,74 +45,29 @@ static lru_cache_t *g_todo_cache = NULL;
 static const char TODO_COLLECTION[] = "/api/todos";
 static const char TODO_ITEM_PREFIX[] = "/api/todos/";
 
-// Escape src into dst as a JSON string body (without surrounding quotes).
-// Returns the written length, or -1 if dst is too small.
-static int json_escape(char *dst, size_t dst_size, const char *src, size_t src_len)
+// Todo rows are keyed by a bare decimal id. Other record types share the same
+// btree under prefixed keys (e.g. "user:<name>"), so any scan over todos must
+// skip keys that are not purely numeric.
+static bool key_is_todo(const char *key, size_t key_length)
 {
-  size_t out = 0;
-  for (size_t i = 0; i < src_len; i++)
+  if (key_length == 0)
   {
-    unsigned char c = (unsigned char)src[i];
-    char unicode[8];
-    const char *rep = NULL;
-
-    switch (c)
+    return false;
+  }
+  for (size_t i = 0; i < key_length; i++)
+  {
+    if (key[i] < '0' || key[i] > '9')
     {
-    case '"':
-      rep = "\\\"";
-      break;
-    case '\\':
-      rep = "\\\\";
-      break;
-    case '\n':
-      rep = "\\n";
-      break;
-    case '\r':
-      rep = "\\r";
-      break;
-    case '\t':
-      rep = "\\t";
-      break;
-    default:
-      if (c < 0x20)
-      {
-        snprintf(unicode, sizeof(unicode), "\\u%04x", c);
-        rep = unicode;
-      }
-      break;
-    }
-
-    if (rep)
-    {
-      size_t len = strlen(rep);
-      if (out + len >= dst_size)
-      {
-        return -1;
-      }
-      memcpy(dst + out, rep, len);
-      out += len;
-    }
-    else
-    {
-      if (out + 1 >= dst_size)
-      {
-        return -1;
-      }
-      dst[out++] = (char)c;
+      return false;
     }
   }
-
-  if (out >= dst_size)
-  {
-    return -1;
-  }
-  dst[out] = '\0';
-  return (int)out;
+  return true;
 }
 
 // Render a complete todo object into dst. Returns length or -1 on overflow.
 static int build_todo_json(char *dst, size_t dst_size, uint64_t id,
-                           const char *title, size_t title_len, bool completed)
+                           uint64_t user_id, const char *title,
+                           size_t title_len, bool completed)
 {
   char escaped[MAX_VALUE_SIZE];
   if (json_escape(escaped, sizeof(escaped), title, title_len) < 0)
@@ -114,8 +76,9 @@ static int build_todo_json(char *dst, size_t dst_size, uint64_t id,
   }
 
   int n = snprintf(dst, dst_size,
-                   "{\"id\":%llu,\"title\":\"%s\",\"completed\":%s}",
-                   (unsigned long long)id, escaped, completed ? "true" : "false");
+                   "{\"id\":%llu,\"user_id\":%llu,\"title\":\"%s\",\"completed\":%s}",
+                   (unsigned long long)id, (unsigned long long)user_id,
+                   escaped, completed ? "true" : "false");
   if (n < 0 || (size_t)n >= dst_size)
   {
     return -1;
@@ -123,163 +86,13 @@ static int build_todo_json(char *dst, size_t dst_size, uint64_t id,
   return n;
 }
 
-static const char *skip_ws(const char *p, const char *end)
+// True when the stored todo JSON belongs to the given user. A row without a
+// user_id (created before accounts existed) belongs to nobody.
+static bool todo_owned_by(const char *value, size_t value_len, uint64_t user_id)
 {
-  while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-  {
-    p++;
-  }
-  return p;
-}
-
-// Locate the value that follows "field": in a JSON object body. Returns a
-// pointer to the first non-whitespace value character, or NULL if not found.
-static const char *find_field(const char *body, size_t len, const char *field)
-{
-  size_t field_len = strlen(field);
-  const char *end = body + len;
-  const char *p = body;
-
-  // Walk the object one JSON string at a time so that "field" is only matched
-  // when it appears as an object key (its closing quote is followed by ':'),
-  // never when it appears inside a string value.
-  while (p < end)
-  {
-    if (*p != '"')
-    {
-      p++;
-      continue;
-    }
-
-    // p is at a string's opening quote; scan to its unescaped closing quote.
-    const char *str = p + 1;
-    const char *q = str;
-    while (q < end && *q != '"')
-    {
-      if (*q == '\\' && q + 1 < end)
-      {
-        q++; // skip the escaped character
-      }
-      q++;
-    }
-    if (q >= end)
-    {
-      return NULL; // unterminated string
-    }
-
-    // A key is a string immediately followed (after whitespace) by ':'.
-    const char *after = skip_ws(q + 1, end);
-    if (after < end && *after == ':')
-    {
-      if ((size_t)(q - str) == field_len && memcmp(str, field, field_len) == 0)
-      {
-        return skip_ws(after + 1, end);
-      }
-    }
-
-    // Not our key: advance past this string; a following value string is thus
-    // skipped rather than being mistaken for a key.
-    p = q + 1;
-  }
-  return NULL;
-}
-
-// Extract a string field, unescaping the common JSON escapes. Returns false if
-// the field is missing, not a string, or does not fit in out.
-static bool parse_json_string(const char *body, size_t len, const char *field,
-                              char *out, size_t out_size)
-{
-  const char *p = find_field(body, len, field);
-  const char *end = body + len;
-  if (!p || p >= end || *p != '"')
-  {
-    return false;
-  }
-  p++;
-
-  size_t out_len = 0;
-  while (p < end && *p != '"')
-  {
-    char c = *p;
-    if (c == '\\' && p + 1 < end)
-    {
-      p++;
-      switch (*p)
-      {
-      case 'n':
-        c = '\n';
-        break;
-      case 'r':
-        c = '\r';
-        break;
-      case 't':
-        c = '\t';
-        break;
-      case 'b':
-        c = '\b';
-        break;
-      case 'f':
-        c = '\f';
-        break;
-      case '/':
-        c = '/';
-        break;
-      case '"':
-        c = '"';
-        break;
-      case '\\':
-        c = '\\';
-        break;
-      case 'u':
-        // Non-ASCII escapes are collapsed to '?'; skip the 4 hex digits.
-        if (p + 4 < end)
-        {
-          p += 4;
-        }
-        c = '?';
-        break;
-      default:
-        c = *p;
-        break;
-      }
-    }
-
-    if (out_len + 1 >= out_size)
-    {
-      return false; // value too long
-    }
-    out[out_len++] = c;
-    p++;
-  }
-
-  if (p >= end || *p != '"')
-  {
-    return false; // unterminated string
-  }
-  out[out_len] = '\0';
-  return true;
-}
-
-// Extract a boolean field. Returns false if absent; *out is set on success.
-static bool parse_json_bool(const char *body, size_t len, const char *field, bool *out)
-{
-  const char *p = find_field(body, len, field);
-  const char *end = body + len;
-  if (!p)
-  {
-    return false;
-  }
-  if (p + 4 <= end && memcmp(p, "true", 4) == 0)
-  {
-    *out = true;
-    return true;
-  }
-  if (p + 5 <= end && memcmp(p, "false", 5) == 0)
-  {
-    *out = false;
-    return true;
-  }
-  return false;
+  uint64_t owner = 0;
+  return json_get_uint64(value, value_len, "user_id", &owner) &&
+         owner == user_id;
 }
 
 // Pull a numeric id out of "/api/todos/{id}". Returns false for missing,
@@ -363,6 +176,7 @@ typedef struct
   size_t cap;
   int count;          // items appended to buf (after pagination)
   long matched;       // items passing the filter (before pagination)
+  uint64_t user_id;   // only this user's todos are visible
   const todo_filter_t *filter;
   bool error;
 } list_ctx_t;
@@ -394,16 +208,22 @@ static int list_append(list_ctx_t *ctx, const char *data, size_t n)
 static int list_scan_cb(const char *key, size_t key_length,
                         const char *value, size_t value_length, void *ctx)
 {
-  (void)key;
-  (void)key_length;
   list_ctx_t *list = (list_ctx_t *)ctx;
   const todo_filter_t *f = list->filter;
+
+  // Skip rows that are not todos (user records share the btree) and todos
+  // that belong to somebody else.
+  if (!key_is_todo(key, key_length) ||
+      !todo_owned_by(value, value_length, list->user_id))
+  {
+    return 0;
+  }
 
   // Apply the filters against the stored JSON before this row counts as a match.
   if (f->have_completed)
   {
     bool completed = false;
-    parse_json_bool(value, value_length, "completed", &completed);
+    json_get_bool(value, value_length, "completed", &completed);
     if (completed != f->completed_want)
     {
       return 0;
@@ -412,7 +232,7 @@ static int list_scan_cb(const char *key, size_t key_length,
   if (f->have_q)
   {
     char title[MAX_VALUE_SIZE];
-    if (!parse_json_string(value, value_length, "title", title, sizeof(title)) ||
+    if (!json_get_string(value, value_length, "title", title, sizeof(title)) ||
         !strcasestr(title, f->q))
     {
       return 0;
@@ -522,6 +342,7 @@ int todo_list_handler(connection_t *conn, http_request_t *request, http_response
 
   list_ctx_t list = {0};
   list.filter = &filter;
+  list.user_id = conn->auth_user_id;
   if (list_append(&list, "[", 1) != 0)
   {
     free(list.buf);
@@ -577,13 +398,13 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
   }
 
   char title[MAX_VALUE_SIZE];
-  if (!parse_json_string(request->body, request->body_length, "title", title, sizeof(title)))
+  if (!json_get_string(request->body, request->body_length, "title", title, sizeof(title)))
   {
     return send_error_response(conn, HTTP_BAD_REQUEST, "Missing or invalid 'title'");
   }
 
   bool completed = false;
-  parse_json_bool(request->body, request->body_length, "completed", &completed);
+  json_get_bool(request->body, request->body_length, "completed", &completed);
 
   uint64_t id = atomic_fetch_add(&g_next_todo_id, 1);
 
@@ -591,7 +412,8 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
   int key_len = snprintf(key, sizeof(key), "%llu", (unsigned long long)id);
 
   char value[MAX_VALUE_SIZE];
-  int value_len = build_todo_json(value, sizeof(value), id, title, strlen(title), completed);
+  int value_len = build_todo_json(value, sizeof(value), id, conn->auth_user_id,
+                                  title, strlen(title), completed);
   if (value_len < 0)
   {
     return send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Todo too large");
@@ -637,6 +459,12 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
       value_len = MAX_VALUE_SIZE;
     }
     value[value_len] = '\0';
+    // The cache is shared across users; a hit on someone else's todo is
+    // answered exactly like a missing row so ids can't be probed.
+    if (!todo_owned_by(value, value_len, conn->auth_user_id))
+    {
+      return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+    }
     return send_json(conn, request, response, HTTP_OK, value);
   }
 
@@ -667,8 +495,14 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
   }
   value[value_len] = '\0';
 
+  // Fill the cache regardless of who asked -- the row is valid -- but only
+  // reveal it to its owner.
   lru_fill(g_todo_cache, key, value, value_len, generation);
 
+  if (!todo_owned_by(value, value_len, conn->auth_user_id))
+  {
+    return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
   return send_json(conn, request, response, HTTP_OK, value);
 }
 
@@ -686,13 +520,13 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   }
 
   char title[MAX_VALUE_SIZE];
-  if (!parse_json_string(request->body, request->body_length, "title", title, sizeof(title)))
+  if (!json_get_string(request->body, request->body_length, "title", title, sizeof(title)))
   {
     return send_error_response(conn, HTTP_BAD_REQUEST, "Missing or invalid 'title'");
   }
 
   bool completed = false;
-  parse_json_bool(request->body, request->body_length, "completed", &completed);
+  json_get_bool(request->body, request->body_length, "completed", &completed);
 
   size_t key_len = strlen(key);
   errno = 0;
@@ -704,7 +538,8 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   }
 
   char value[MAX_VALUE_SIZE];
-  int value_len = build_todo_json(value, sizeof(value), id, title, strlen(title), completed);
+  int value_len = build_todo_json(value, sizeof(value), id, conn->auth_user_id,
+                                  title, strlen(title), completed);
   if (value_len < 0)
   {
     return send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Todo too large");
@@ -720,6 +555,16 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   char existing[MAX_VALUE_SIZE + 1];
   size_t existing_len = MAX_VALUE_SIZE;
   if (db_search(txn, key, key_len, existing, &existing_len) != 0)
+  {
+    commit_transaction(txn);
+    free(txn);
+    return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
+  if (existing_len > MAX_VALUE_SIZE)
+  {
+    existing_len = MAX_VALUE_SIZE;
+  }
+  if (!todo_owned_by(existing, existing_len, conn->auth_user_id))
   {
     commit_transaction(txn);
     free(txn);
@@ -775,6 +620,16 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
     free(txn);
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
+  if (existing_len > MAX_VALUE_SIZE)
+  {
+    existing_len = MAX_VALUE_SIZE;
+  }
+  if (!todo_owned_by(existing, existing_len, conn->auth_user_id))
+  {
+    commit_transaction(txn);
+    free(txn);
+    return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
 
   db_delete(txn, key, key_len);
   commit_transaction(txn);
@@ -817,6 +672,11 @@ static int seed_id_scan_cb(const char *key, size_t key_length,
   (void)value;
   (void)value_length;
   uint64_t *max_id = (uint64_t *)ctx;
+
+  if (!key_is_todo(key, key_length))
+  {
+    return 0; // user records and other namespaces don't consume todo ids
+  }
 
   char buf[32];
   size_t n = key_length < sizeof(buf) - 1 ? key_length : sizeof(buf) - 1;

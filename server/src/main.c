@@ -15,6 +15,7 @@
 #include "ssl_util.h"
 #include "storage.h"
 #include "todo_handlers.h"
+#include "user_auth.h"
 #include "env.h"
 
 // Global server instance and shutdown flag, shared across translation units
@@ -83,6 +84,16 @@ int main(int argc, char *argv[])
   }
   todo_api_init();
 
+  // Bring up the crypto framework, JWT secret, and user accounts. Fatal on
+  // failure: without it passwords can't be hashed and tokens can't be signed.
+  if (user_api_init() != 0)
+  {
+    fprintf(stderr, "Failed to initialize user auth\n");
+    cleanup_storage_engine();
+    http_server_cleanup(&g_server);
+    return 1;
+  }
+
   // Initialize the request-metrics epoch and load the rate-limit / auth config
   // from the environment before any request can run through the middleware.
   metrics_init();
@@ -102,12 +113,16 @@ int main(int argc, char *argv[])
   //   cors        answers OPTIONS preflight here, so preflights are never
   //               rate-limited or auth-blocked below
   //   rate_limit  sheds excess load before the server does auth work
-  //   auth        guards mutating routes, closest to the handler
+  //   auth        API-key guard for mutating routes outside the JWT paths
+  //   jwt         verifies bearer tokens for /api/todos* and /api/auth/me and
+  //               publishes the user identity to the handlers, so it sits
+  //               innermost, right against the handler
   add_middleware(&g_server, logging_middleware);
   add_middleware(&g_server, metrics_middleware);
   add_middleware(&g_server, cors_middleware);
   add_middleware(&g_server, rate_limit_middleware);
   add_middleware(&g_server, auth_middleware);
+  add_middleware(&g_server, jwt_middleware);
 
   // Add example routes
   add_route(&g_server, "/api/hello", HTTP_GET, api_hello_handler);
@@ -123,8 +138,10 @@ int main(int argc, char *argv[])
   add_route(&g_server, "/healthz", HTTP_GET, api_healthz_handler);
   add_route_offloaded(&g_server, "/readyz", HTTP_GET, api_readyz_handler);
 
-  // Mount the Todo CRUD web API on top of the storage engine.
+  // Mount the Todo CRUD web API on top of the storage engine, and the user
+  // account / login endpoints that issue the tokens guarding it.
   todo_api_register_routes(&g_server);
+  user_api_register_routes(&g_server);
 
   // Enable SSL if requested and certificates are available
   if (ssl_enabled &&
@@ -160,6 +177,9 @@ int main(int argc, char *argv[])
 
   // Flush and close the storage engine (final checkpoint).
   cleanup_storage_engine();
+
+  // Crypto framework last: nothing above needs it during teardown.
+  user_api_shutdown();
 
   printf("HTTP server stopped\n");
 

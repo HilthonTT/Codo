@@ -12,9 +12,11 @@
 void auth_init(void);
 
 // Middleware: require a valid API key on mutating requests (POST/PUT/DELETE/
-// PATCH). Safe methods (GET/HEAD/OPTIONS) always pass. The key may be supplied
-// as `X-API-Key: <key>` or `Authorization: Bearer <key>`. A protected request
-// with no credentials is answered 401; one with a wrong key, 403.
+// PATCH). Safe methods (GET/HEAD/OPTIONS) always pass, as do the paths owned
+// by the JWT layer (/api/todos*, /api/auth/*) -- those are guarded per-user by
+// jwt_middleware instead. The key may be supplied as `X-API-Key: <key>` or
+// `Authorization: Bearer <key>`. A protected request with no credentials is
+// answered 401; one with a wrong key, 403.
 int auth_middleware(connection_t *conn, http_request_t *request,
                     http_response_t *response, middleware_ctx_t *next);
 

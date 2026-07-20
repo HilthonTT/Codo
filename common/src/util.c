@@ -43,6 +43,8 @@ const char *http_status_to_string(http_status_t status)
     return "Method Not Allowed";
   case HTTP_REQUEST_TIMEOUT:
     return "Request Timeout";
+  case HTTP_CONFLICT:
+    return "Conflict";
   case HTTP_PAYLOAD_TOO_LARGE:
     return "Payload Too Large";
   case HTTP_RANGE_NOT_SATISFIABLE:
