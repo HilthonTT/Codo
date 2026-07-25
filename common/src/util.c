@@ -23,6 +23,8 @@ const char *http_status_to_string(http_status_t status)
     return "Accepted";
   case HTTP_NO_CONTENT:
     return "No Content";
+  case HTTP_PARTIAL_CONTENT:
+    return "Partial Content";
   case HTTP_MOVED_PERMANENTLY:
     return "Moved Permanently";
   case HTTP_FOUND:
@@ -41,8 +43,14 @@ const char *http_status_to_string(http_status_t status)
     return "Method Not Allowed";
   case HTTP_REQUEST_TIMEOUT:
     return "Request Timeout";
+  case HTTP_CONFLICT:
+    return "Conflict";
   case HTTP_PAYLOAD_TOO_LARGE:
     return "Payload Too Large";
+  case HTTP_RANGE_NOT_SATISFIABLE:
+    return "Range Not Satisfiable";
+  case HTTP_TOO_MANY_REQUESTS:
+    return "Too Many Requests";
   case HTTP_INTERNAL_SERVER_ERROR:
     return "Internal Server Error";
   case HTTP_NOT_IMPLEMENTED:
@@ -229,4 +237,19 @@ void format_http_date(time_t t, char *buf, size_t buf_size)
   struct tm gmt;
   gmtime_r(&t, &gmt);
   strftime(buf, buf_size, "%a, %d %b %Y %H:%M:%S GMT", &gmt);
+}
+
+time_t parse_http_date(const char *value)
+{
+  if (!value)
+  {
+    return (time_t)-1;
+  }
+  struct tm tm;
+  memset(&tm, 0, sizeof(tm));
+  if (!strptime(value, "%a, %d %b %Y %H:%M:%S GMT", &tm))
+  {
+    return (time_t)-1;
+  }
+  return timegm(&tm);
 }

@@ -1,8 +1,18 @@
 [
   {
     "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/auth.c -o build/server/auth.o",
+    "file": "server/src/auth.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
     "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/connection_pool.c -o build/server/connection_pool.o",
     "file": "server/src/connection_pool.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/jwt.c -o build/server/jwt.o",
+    "file": "server/src/jwt.c"
   },
   {
     "directory": "/mnt/d/Repos/Codo",
@@ -13,6 +23,11 @@
     "directory": "/mnt/d/Repos/Codo",
     "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/middleware.c -o build/server/middleware.o",
     "file": "server/src/middleware.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/rate_limit.c -o build/server/rate_limit.o",
+    "file": "server/src/rate_limit.c"
   },
   {
     "directory": "/mnt/d/Repos/Codo",
@@ -33,6 +48,11 @@
     "directory": "/mnt/d/Repos/Codo",
     "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/ssl_util.c -o build/server/ssl_util.o",
     "file": "server/src/ssl_util.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -Istorage/include -Iserver/include -Iapi/include -MMD -MP -c server/src/user_auth.c -o build/server/user_auth.o",
+    "file": "server/src/user_auth.c"
   },
   {
     "directory": "/mnt/d/Repos/Codo",
@@ -101,6 +121,11 @@
   },
   {
     "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/crypto.c -o build/common/crypto.o",
+    "file": "common/src/crypto.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
     "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/env.c -o build/common/env.o",
     "file": "common/src/env.c"
   },
@@ -111,6 +136,11 @@
   },
   {
     "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/json_util.c -o build/common/json_util.o",
+    "file": "common/src/json_util.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
     "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/lockfree.c -o build/common/lockfree.o",
     "file": "common/src/lockfree.c"
   },
@@ -118,6 +148,11 @@
     "directory": "/mnt/d/Repos/Codo",
     "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/lru.c -o build/common/lru.o",
     "file": "common/src/lru.c"
+  },
+  {
+    "directory": "/mnt/d/Repos/Codo",
+    "command": "gcc -Wall -Wextra -Wpedantic -std=c11 -Icommon/include -MMD -MP -c common/src/metrics.c -o build/common/metrics.o",
+    "file": "common/src/metrics.c"
   },
   {
     "directory": "/mnt/d/Repos/Codo",

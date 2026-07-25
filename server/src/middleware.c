@@ -7,9 +7,13 @@
 #include <strings.h>
 #include <time.h>
 
+#include "auth.h"
 #include "http_protocol.h"
+#include "metrics.h"
 #include "middleware.h"
+#include "rate_limit.h"
 #include "server.h"
+#include "user_auth.h"
 #include "util.h"
 
 // Look up a request header value by name (case-insensitive). Returns NULL when
@@ -38,8 +42,30 @@ void register_default_middleware(http_server_t *server,
   snprintf(server->cors_allow_origin, sizeof(server->cors_allow_origin), "%s",
            cors_allow_origin ? cors_allow_origin : "*");
 
+  // Initialize the request-metrics epoch and load the rate-limit / auth config
+  // from the environment before any request can run through the chain.
+  metrics_init();
+  rate_limit_init();
+  auth_init();
+
+  // Middlewares run in registration order (first registered = outermost). The
+  // ordering is deliberate:
+  //   logging     outermost, so it times the entire chain
+  //   metrics     records the final status + latency of every request, even
+  //               those a later stage short-circuits (429/401)
+  //   cors        answers OPTIONS preflight here, so preflights are never
+  //               rate-limited or auth-blocked below
+  //   rate_limit  sheds excess load before the server does auth work
+  //   auth        API-key guard for mutating routes outside the JWT paths
+  //   jwt         verifies bearer tokens for /api/todos* and /api/auth/me and
+  //               publishes the user identity to the handlers, so it sits
+  //               innermost, right against the handler
   add_middleware(server, logging_middleware);
+  add_middleware(server, metrics_middleware);
   add_middleware(server, cors_middleware);
+  add_middleware(server, rate_limit_middleware);
+  add_middleware(server, auth_middleware);
+  add_middleware(server, jwt_middleware);
 }
 
 int add_middleware(http_server_t *server, middleware_fn_t fn)
@@ -122,6 +148,26 @@ int logging_middleware(connection_t *conn, http_request_t *request,
          elapsed_ms);
   fflush(stdout);
 
+  return rc;
+}
+
+int metrics_middleware(connection_t *conn, http_request_t *request,
+                       http_response_t *response, middleware_ctx_t *next)
+{
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+
+  int rc = middleware_next(conn, request, response, next);
+
+  struct timespec end;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  double elapsed = (end.tv_sec - start.tv_sec) +
+                   (end.tv_nsec - start.tv_nsec) / 1e9;
+
+  // response->status is fully resolved once the chain returns -- including any
+  // short-circuit reply (a 429 from rate limiting, a 401 from auth), so those
+  // are counted too.
+  metrics_record_request(request->method, response->status, elapsed);
   return rc;
 }
 

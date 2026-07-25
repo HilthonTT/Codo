@@ -28,8 +28,12 @@
   ],
   "tags": [
     {
+      "name": "Auth",
+      "description": "User accounts and JWT issuance. Passwords are hashed with PBKDF2-HMAC-SHA256 (100k iterations, per-user salt); tokens are HS256 JWTs carrying `sub` (username), `uid` (user id), `iat`, and `exp`. Present the token as `Authorization: Bearer <token>` on every /api/todos request."
+    },
+    {
       "name": "Todos",
-      "description": "CRUD over the embedded B-tree storage engine (buffer pool, write-ahead log, transactions). Todos persist across restarts. These handlers are dispatched to the storage thread pool rather than running on the epoll worker loop."
+      "description": "CRUD over the embedded B-tree storage engine (buffer pool, write-ahead log, transactions). Todos persist across restarts. These handlers are dispatched to the storage thread pool rather than running on the epoll worker loop. All routes require a Bearer JWT (see Auth), and each user only ever sees their own todos: another user's todo answers 404, indistinguishable from one that doesn't exist."
     },
     {
       "name": "Introspection",
@@ -45,11 +49,266 @@
     }
   ],
   "paths": {
+    "/api/auth/register": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Register a user",
+        "description": "Creates a user and immediately returns a signed JWT, so a fresh account can call the todo API without a separate login. The username is unique; the password is salted and hashed with PBKDF2-HMAC-SHA256 before anything touches disk. Runs on the storage thread pool (the KDF is deliberately slow).",
+        "operationId": "registerUser",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "User created; the returned token is ready to use.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "username",
+                    "token",
+                    "token_type",
+                    "expires_in"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "integer",
+                      "format": "int64",
+                      "examples": [
+                        1
+                      ]
+                    },
+                    "username": {
+                      "type": "string",
+                      "examples": [
+                        "alice"
+                      ]
+                    },
+                    "token": {
+                      "type": "string",
+                      "description": "The signed JWT.",
+                      "examples": [
+                        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSJ9.sig"
+                      ]
+                    },
+                    "token_type": {
+                      "type": "string",
+                      "examples": [
+                        "Bearer"
+                      ]
+                    },
+                    "expires_in": {
+                      "type": "integer",
+                      "description": "Token lifetime in seconds (JWT_TTL_SECONDS).",
+                      "examples": [
+                        3600
+                      ]
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing body, missing/invalid field, bad username, or short password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonError"
+                },
+                "examples": {
+                  "username": {
+                    "value": {
+                      "error": "username must be 3-63 characters of [A-Za-z0-9_.-]"
+                    }
+                  },
+                  "password": {
+                    "value": {
+                      "error": "password must be at least 8 characters"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The username is already taken.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonError"
+                },
+                "examples": {
+                  "taken": {
+                    "value": {
+                      "error": "username already exists"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/auth/login": {
+      "post": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Log in",
+        "description": "Verifies the password against the stored PBKDF2 hash and returns a signed JWT. The KDF runs even for unknown usernames and the hash comparison is constant-time, so neither timing nor the response body reveals whether the username exists.",
+        "operationId": "login",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Credentials"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Credentials accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "token",
+                    "token_type",
+                    "expires_in",
+                    "user"
+                  ],
+                  "properties": {
+                    "token": {
+                      "type": "string",
+                      "description": "The signed JWT.",
+                      "examples": [
+                        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhbGljZSJ9.sig"
+                      ]
+                    },
+                    "token_type": {
+                      "type": "string",
+                      "examples": [
+                        "Bearer"
+                      ]
+                    },
+                    "expires_in": {
+                      "type": "integer",
+                      "description": "Token lifetime in seconds (JWT_TTL_SECONDS).",
+                      "examples": [
+                        3600
+                      ]
+                    },
+                    "user": {
+                      "$ref": "#/components/schemas/User"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing body, missing/invalid field, bad username, or short password.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonError"
+                },
+                "examples": {
+                  "username": {
+                    "value": {
+                      "error": "username must be 3-63 characters of [A-Za-z0-9_.-]"
+                    }
+                  },
+                  "password": {
+                    "value": {
+                      "error": "password must be at least 8 characters"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unknown username or wrong password — deliberately the same answer for both.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JsonError"
+                },
+                "examples": {
+                  "bad": {
+                    "value": {
+                      "error": "invalid username or password"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/api/auth/me": {
+      "get": {
+        "tags": [
+          "Auth"
+        ],
+        "summary": "Current user",
+        "description": "Echoes the identity carried by the presented token. Answered inline from the verified claims — no storage round-trip.",
+        "operationId": "getCurrentUser",
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The authenticated user.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/User"
+                }
+              }
+            }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          }
+        }
+      }
+    },
     "/api/todos": {
       "get": {
-        "tags": ["Todos"],
-        "summary": "List all todos",
-        "description": "Scans the whole B-tree inside a transaction and returns every todo as a JSON array. Ordering follows the B-tree key order — keys are the todo ids rendered as decimal strings, so the sort is lexicographic, not numeric (`\"10\"` sorts before `\"9\"`). The array is empty (`[]`) when no todos exist.",
+        "tags": [
+          "Todos"
+        ],
+        "summary": "List the authenticated user's todos",
+        "description": "Scans the whole B-tree inside a transaction and returns the authenticated user's todos as a JSON array. Ordering follows the B-tree key order — keys are the todo ids rendered as decimal strings, so the sort is lexicographic, not numeric (`\"10\"` sorts before `\"9\"`). The array is empty (`[]`) when no todos exist.",
         "operationId": "listTodos",
         "responses": {
           "200": {
@@ -58,26 +317,53 @@
               "application/json": {
                 "schema": {
                   "type": "array",
-                  "items": { "$ref": "#/components/schemas/Todo" }
+                  "items": {
+                    "$ref": "#/components/schemas/Todo"
+                  }
                 },
                 "examples": {
                   "populated": {
                     "summary": "Two todos",
                     "value": [
-                      { "id": 1, "title": "buy milk", "completed": false },
-                      { "id": 2, "title": "walk the dog", "completed": true }
+                      {
+                        "id": 1,
+                        "user_id": 1,
+                        "title": "buy milk",
+                        "completed": false
+                      },
+                      {
+                        "id": 2,
+                        "user_id": 1,
+                        "title": "walk the dog",
+                        "completed": true
+                      }
                     ]
                   },
-                  "empty": { "summary": "No todos yet", "value": [] }
+                  "empty": {
+                    "summary": "No todos yet",
+                    "value": []
+                  }
                 }
               }
             }
           },
-          "500": { "$ref": "#/components/responses/InternalError" }
-        }
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       },
       "post": {
-        "tags": ["Todos"],
+        "tags": [
+          "Todos"
+        ],
         "summary": "Create a todo",
         "description": "Creates a todo from the JSON body. `title` is required; `completed` defaults to `false` when absent or unparseable. Any `id` supplied in the body is **ignored** — the server assigns the next id from a process-wide atomic counter, seeded at startup from the highest id already on disk. The created object is returned in full.",
         "operationId": "createTodo",
@@ -86,15 +372,22 @@
           "description": "An empty or missing body is rejected with `400`.",
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/TodoInput" },
+              "schema": {
+                "$ref": "#/components/schemas/TodoInput"
+              },
               "examples": {
                 "minimal": {
                   "summary": "Title only",
-                  "value": { "title": "buy milk" }
+                  "value": {
+                    "title": "buy milk"
+                  }
                 },
                 "completed": {
                   "summary": "Already done",
-                  "value": { "title": "walk the dog", "completed": true }
+                  "value": {
+                    "title": "walk the dog",
+                    "completed": true
+                  }
                 }
               }
             }
@@ -105,8 +398,15 @@
             "description": "Todo created and committed to the write-ahead log.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Todo" },
-                "example": { "id": 1, "title": "buy milk", "completed": false }
+                "schema": {
+                  "$ref": "#/components/schemas/Todo"
+                },
+                "example": {
+                  "id": 1,
+                  "user_id": 1,
+                  "title": "buy milk",
+                  "completed": false
+                }
               }
             }
           },
@@ -114,20 +414,40 @@
             "description": "Body absent/empty, or `title` missing, not a JSON string, or 1024 bytes or longer.",
             "content": {
               "text/html": {
-                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "schema": {
+                  "$ref": "#/components/schemas/HtmlError"
+                },
                 "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Missing or invalid 'title'</p></body></html>"
               }
             }
           },
-          "413": { "$ref": "#/components/responses/TodoTooLarge" },
-          "500": { "$ref": "#/components/responses/InternalError" }
-        }
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "413": {
+            "$ref": "#/components/responses/TodoTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/api/todos/{id}": {
-      "parameters": [{ "$ref": "#/components/parameters/TodoId" }],
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/TodoId"
+        }
+      ],
       "get": {
-        "tags": ["Todos"],
+        "tags": [
+          "Todos"
+        ],
         "summary": "Fetch a single todo",
         "operationId": "getTodo",
         "responses": {
@@ -135,18 +455,41 @@
             "description": "The matching todo.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Todo" },
-                "example": { "id": 1, "title": "buy milk", "completed": false }
+                "schema": {
+                  "$ref": "#/components/schemas/Todo"
+                },
+                "example": {
+                  "id": 1,
+                  "user_id": 1,
+                  "title": "buy milk",
+                  "completed": false
+                }
               }
             }
           },
-          "400": { "$ref": "#/components/responses/InvalidTodoId" },
-          "404": { "$ref": "#/components/responses/TodoNotFound" },
-          "500": { "$ref": "#/components/responses/InternalError" }
-        }
+          "400": {
+            "$ref": "#/components/responses/InvalidTodoId"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/TodoNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       },
       "put": {
-        "tags": ["Todos"],
+        "tags": [
+          "Todos"
+        ],
         "summary": "Replace a todo",
         "description": "Full replacement, not a partial patch: `title` is required, and an omitted `completed` resets the field to `false` rather than preserving its stored value. The id always comes from the path — an `id` in the body is ignored. The todo must already exist; this never upserts.\n\nInternally the storage engine's `db_update` only handles same-length values, so the replacement is performed as a delete followed by an insert inside a single transaction, rolled back on failure so a committed delete can never orphan the todo.",
         "operationId": "updateTodo",
@@ -154,8 +497,13 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/TodoInput" },
-              "example": { "title": "buy oat milk", "completed": true }
+              "schema": {
+                "$ref": "#/components/schemas/TodoInput"
+              },
+              "example": {
+                "title": "buy oat milk",
+                "completed": true
+              }
             }
           }
         },
@@ -164,9 +512,12 @@
             "description": "The replaced todo.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Todo" },
+                "schema": {
+                  "$ref": "#/components/schemas/Todo"
+                },
                 "example": {
                   "id": 1,
+                  "user_id": 1,
                   "title": "buy oat milk",
                   "completed": true
                 }
@@ -177,32 +528,68 @@
             "description": "Non-numeric id, absent/empty body, or missing/invalid `title`.",
             "content": {
               "text/html": {
-                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "schema": {
+                  "$ref": "#/components/schemas/HtmlError"
+                },
                 "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Missing or invalid 'title'</p></body></html>"
               }
             }
           },
-          "404": { "$ref": "#/components/responses/TodoNotFound" },
-          "413": { "$ref": "#/components/responses/TodoTooLarge" },
-          "500": { "$ref": "#/components/responses/InternalError" }
-        }
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/TodoNotFound"
+          },
+          "413": {
+            "$ref": "#/components/responses/TodoTooLarge"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       },
       "delete": {
-        "tags": ["Todos"],
+        "tags": [
+          "Todos"
+        ],
         "summary": "Delete a todo",
         "description": "Deletes the todo and returns an empty `204`. Deleting an id that does not exist is a `404`, not a no-op success.",
         "operationId": "deleteTodo",
         "responses": {
-          "204": { "description": "Deleted. Empty body." },
-          "400": { "$ref": "#/components/responses/InvalidTodoId" },
-          "404": { "$ref": "#/components/responses/TodoNotFound" },
-          "500": { "$ref": "#/components/responses/InternalError" }
-        }
+          "204": {
+            "description": "Deleted. Empty body."
+          },
+          "400": {
+            "$ref": "#/components/responses/InvalidTodoId"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "404": {
+            "$ref": "#/components/responses/TodoNotFound"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ]
       }
     },
     "/api/status": {
       "get": {
-        "tags": ["Introspection"],
+        "tags": [
+          "Introspection"
+        ],
         "summary": "Server counters",
         "description": "Atomic counters held on the `http_server_t` instance.",
         "operationId": "getStatus",
@@ -211,7 +598,9 @@
             "description": "A snapshot of server-level counters.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Status" },
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                },
                 "example": {
                   "server": "Codo-HTTP-Server/1.0",
                   "total_connections": 12,
@@ -226,7 +615,9 @@
     },
     "/api/stats": {
       "get": {
-        "tags": ["Introspection"],
+        "tags": [
+          "Introspection"
+        ],
         "summary": "Network counters",
         "description": "Process-wide lock-free counters updated on the accept / read / write / close paths.",
         "operationId": "getStats",
@@ -235,7 +626,9 @@
             "description": "A snapshot of network counters.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/Stats" },
+                "schema": {
+                  "$ref": "#/components/schemas/Stats"
+                },
                 "example": {
                   "bytes_sent": 926,
                   "bytes_received": 513,
@@ -252,7 +645,9 @@
             "description": "The formatted counters did not fit the response buffer.",
             "content": {
               "text/html": {
-                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "schema": {
+                  "$ref": "#/components/schemas/HtmlError"
+                },
                 "example": "<html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>Stats too large</p></body></html>"
               }
             }
@@ -262,7 +657,9 @@
     },
     "/api/hello": {
       "get": {
-        "tags": ["Examples"],
+        "tags": [
+          "Examples"
+        ],
         "summary": "Static greeting",
         "description": "Returns a fixed JSON document. The `timestamp` is a hard-coded literal, not the current time.",
         "operationId": "getHello",
@@ -274,7 +671,10 @@
                 "schema": {
                   "type": "object",
                   "properties": {
-                    "message": { "type": "string", "const": "Hello, World!" },
+                    "message": {
+                      "type": "string",
+                      "const": "Hello, World!"
+                    },
                     "timestamp": {
                       "type": "string",
                       "description": "Hard-coded; does not reflect request time.",
@@ -294,7 +694,9 @@
     },
     "/api/echo": {
       "post": {
-        "tags": ["Examples"],
+        "tags": [
+          "Examples"
+        ],
         "summary": "Echo the request body",
         "description": "Returns the request body verbatim as `text/plain`, whatever its content type. An empty body echoes an empty string. Note that `GET /api/echo` is not routed and falls through to the static file handler, yielding `404`.",
         "operationId": "postEcho",
@@ -302,10 +704,14 @@
           "required": false,
           "content": {
             "text/plain": {
-              "schema": { "type": "string" },
+              "schema": {
+                "type": "string"
+              },
               "example": "hello there"
             },
-            "application/json": { "schema": {} }
+            "application/json": {
+              "schema": {}
+            }
           }
         },
         "responses": {
@@ -313,18 +719,24 @@
             "description": "The body, echoed byte-for-byte as `text/plain`.",
             "content": {
               "text/plain": {
-                "schema": { "type": "string" },
+                "schema": {
+                  "type": "string"
+                },
                 "example": "hello there"
               }
             }
           },
-          "500": { "$ref": "#/components/responses/InternalError" }
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
         }
       }
     },
     "/ws/chat": {
       "get": {
-        "tags": ["WebSocket"],
+        "tags": [
+          "WebSocket"
+        ],
         "summary": "WebSocket upgrade handshake",
         "description": "Performs the RFC 6455 opening handshake: the request must carry `Upgrade: websocket`, `Connection: Upgrade`, and a `Sec-WebSocket-Key`. The server replies `101 Switching Protocols` with `Sec-WebSocket-Accept` computed as base64(SHA-1(key + GUID)), after which the connection leaves HTTP and speaks WebSocket frames.\n\nA plain `GET` without the upgrade headers is rejected with `400`.",
         "operationId": "websocketChat",
@@ -333,20 +745,28 @@
             "name": "Upgrade",
             "in": "header",
             "required": true,
-            "schema": { "type": "string", "const": "websocket" }
+            "schema": {
+              "type": "string",
+              "const": "websocket"
+            }
           },
           {
             "name": "Connection",
             "in": "header",
             "required": true,
-            "schema": { "type": "string", "const": "Upgrade" }
+            "schema": {
+              "type": "string",
+              "const": "Upgrade"
+            }
           },
           {
             "name": "Sec-WebSocket-Key",
             "in": "header",
             "required": true,
             "description": "Base64-encoded 16-byte nonce.",
-            "schema": { "type": "string" },
+            "schema": {
+              "type": "string"
+            },
             "example": "dGhlIHNhbXBsZSBub25jZQ=="
           }
         ],
@@ -355,14 +775,22 @@
             "description": "Protocol switched to WebSocket.",
             "headers": {
               "Upgrade": {
-                "schema": { "type": "string", "const": "websocket" }
+                "schema": {
+                  "type": "string",
+                  "const": "websocket"
+                }
               },
               "Connection": {
-                "schema": { "type": "string", "const": "Upgrade" }
+                "schema": {
+                  "type": "string",
+                  "const": "Upgrade"
+                }
               },
               "Sec-WebSocket-Accept": {
                 "description": "base64(SHA-1(Sec-WebSocket-Key + \"258EAFA5-E914-47DA-95CA-C5AB0DC85B11\"))",
-                "schema": { "type": "string" }
+                "schema": {
+                  "type": "string"
+                }
               }
             }
           },
@@ -370,7 +798,9 @@
             "description": "Upgrade headers absent, or `Sec-WebSocket-Key` missing.",
             "content": {
               "text/html": {
-                "schema": { "$ref": "#/components/schemas/HtmlError" },
+                "schema": {
+                  "$ref": "#/components/schemas/HtmlError"
+                },
                 "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>WebSocket upgrade required</p></body></html>"
               }
             }
@@ -386,7 +816,11 @@
         "in": "path",
         "required": true,
         "description": "Decimal digits only. Anything else — a negative sign, a leading `+`, whitespace, or letters — is rejected with `400` before the storage engine is consulted.",
-        "schema": { "type": "integer", "format": "int64", "minimum": 1 },
+        "schema": {
+          "type": "integer",
+          "format": "int64",
+          "minimum": 1
+        },
         "example": 1
       }
     },
@@ -394,35 +828,67 @@
       "Todo": {
         "type": "object",
         "description": "A todo as stored and returned. Persisted in the B-tree keyed by its id rendered as a decimal string.",
-        "required": ["id", "title", "completed"],
+        "required": [
+          "id",
+          "user_id",
+          "title",
+          "completed"
+        ],
         "properties": {
           "id": {
             "type": "integer",
             "format": "int64",
             "readOnly": true,
             "description": "Assigned by the server. Never taken from a request body.",
-            "examples": [1]
+            "examples": [
+              1
+            ]
           },
-          "title": { "type": "string", "examples": ["buy milk"] },
-          "completed": { "type": "boolean", "examples": [false] }
+          "user_id": {
+            "type": "integer",
+            "format": "int64",
+            "readOnly": true,
+            "description": "Id of the owning user. Always the authenticated caller; never taken from a request body.",
+            "examples": [
+              1
+            ]
+          },
+          "title": {
+            "type": "string",
+            "examples": [
+              "buy milk"
+            ]
+          },
+          "completed": {
+            "type": "boolean",
+            "examples": [
+              false
+            ]
+          }
         },
         "additionalProperties": false
       },
       "TodoInput": {
         "type": "object",
         "description": "Request body for create and replace.\n\n**Size limits.** Two separate 1024-byte ceilings (`MAX_VALUE_SIZE`) apply, and they surface as different status codes. A decoded `title` of 1024 bytes or more overflows the parse buffer and is reported as `400 Missing or invalid 'title'` — the same code as a syntactically bad title. Below that, the *rendered* object `{\"id\":…,\"title\":\"…\",\"completed\":…}` must itself fit 1024 bytes after JSON-escaping, or the request fails with `413 Todo too large`. For a plain-ASCII title the 413 band therefore begins around 986 characters, since the surrounding JSON costs roughly 38 bytes.\n\nEscaping expands the title, lowering the 413 threshold further: each `\"`, `\\`, newline, tab, or carriage return costs two bytes in the stored form, and other control characters cost six (`\\u00XX`).\n\n**Encoding.** Raw UTF-8 bytes in the title are stored and returned unchanged. Only literal `\\uXXXX` escape sequences are lossy — the parser collapses each to a single `?`, so `\"caf\\u00e9\"` is stored as `caf?` while the raw bytes of `\"café\"` round-trip intact.",
-        "required": ["title"],
+        "required": [
+          "title"
+        ],
         "properties": {
           "title": {
             "type": "string",
             "description": "Required. Must be a JSON string; a number, `null`, or a missing key is a `400`.",
-            "examples": ["buy milk"]
+            "examples": [
+              "buy milk"
+            ]
           },
           "completed": {
             "type": "boolean",
             "default": false,
             "description": "Optional. Absent or unparseable values are treated as `false`. On `PUT` this means omitting it resets a completed todo back to incomplete.",
-            "examples": [false]
+            "examples": [
+              false
+            ]
           }
         }
       },
@@ -438,7 +904,9 @@
           "server": {
             "type": "string",
             "description": "Configured server name.",
-            "examples": ["Codo-HTTP-Server/1.0"]
+            "examples": [
+              "Codo-HTTP-Server/1.0"
+            ]
           },
           "total_connections": {
             "type": "integer",
@@ -466,8 +934,12 @@
           "errors"
         ],
         "properties": {
-          "bytes_sent": { "type": "integer" },
-          "bytes_received": { "type": "integer" },
+          "bytes_sent": {
+            "type": "integer"
+          },
+          "bytes_received": {
+            "type": "integer"
+          },
           "packets_sent": {
             "type": "integer",
             "description": "Counted as write() calls, not TCP segments."
@@ -476,14 +948,87 @@
             "type": "integer",
             "description": "Counted as read() calls, not TCP segments."
           },
-          "connections_accepted": { "type": "integer" },
-          "connections_closed": { "type": "integer" },
-          "errors": { "type": "integer" }
+          "connections_accepted": {
+            "type": "integer"
+          },
+          "connections_closed": {
+            "type": "integer"
+          },
+          "errors": {
+            "type": "integer"
+          }
         }
       },
       "HtmlError": {
         "type": "string",
         "description": "Error bodies are HTML, never JSON. Served as `text/html` with `Connection: close`. Each response supplies its own example; the shape is always `<html><head><title>{status}</title></head><body><h1>{status}</h1><p>{message}</p></body></html>`."
+      },
+      "Credentials": {
+        "type": "object",
+        "description": "Register/login request body.",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "username": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 63,
+            "pattern": "^[A-Za-z0-9_.-]+$",
+            "examples": [
+              "alice"
+            ]
+          },
+          "password": {
+            "type": "string",
+            "minLength": 8,
+            "maxLength": 128,
+            "format": "password",
+            "examples": [
+              "wonderland123"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "User": {
+        "type": "object",
+        "description": "A user, as returned by the API. The password hash never leaves the server.",
+        "required": [
+          "id",
+          "username"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "readOnly": true,
+            "examples": [
+              1
+            ]
+          },
+          "username": {
+            "type": "string",
+            "examples": [
+              "alice"
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "JsonError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false,
+        "description": "JSON error body used by the auth endpoints and JWT middleware."
       }
     },
     "responses": {
@@ -491,7 +1036,9 @@
         "description": "No todo with that id.",
         "content": {
           "text/html": {
-            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "schema": {
+              "$ref": "#/components/schemas/HtmlError"
+            },
             "example": "<html><head><title>404 Not Found</title></head><body><h1>404 Not Found</h1><p>Todo not found</p></body></html>"
           }
         }
@@ -500,7 +1047,9 @@
         "description": "The path id was empty or contained non-digit characters.",
         "content": {
           "text/html": {
-            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "schema": {
+              "$ref": "#/components/schemas/HtmlError"
+            },
             "example": "<html><head><title>400 Bad Request</title></head><body><h1>400 Bad Request</h1><p>Invalid todo id</p></body></html>"
           }
         }
@@ -509,7 +1058,9 @@
         "description": "The rendered todo exceeded the storage engine's 1024-byte value limit.",
         "content": {
           "text/html": {
-            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "schema": {
+              "$ref": "#/components/schemas/HtmlError"
+            },
             "example": "<html><head><title>413 Payload Too Large</title></head><body><h1>413 Payload Too Large</h1><p>Todo too large</p></body></html>"
           }
         }
@@ -518,10 +1069,55 @@
         "description": "Transaction, allocation, or storage failure.",
         "content": {
           "text/html": {
-            "schema": { "$ref": "#/components/schemas/HtmlError" },
+            "schema": {
+              "$ref": "#/components/schemas/HtmlError"
+            },
             "example": "<html><head><title>500 Internal Server Error</title></head><body><h1>500 Internal Server Error</h1><p>Transaction failed</p></body></html>"
           }
         }
+      },
+      "Unauthorized": {
+        "description": "Missing, malformed, expired, or badly signed Bearer token.",
+        "headers": {
+          "WWW-Authenticate": {
+            "schema": {
+              "type": "string"
+            },
+            "description": "Always `Bearer realm=\"codo\", charset=\"UTF-8\"`."
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/JsonError"
+            },
+            "examples": {
+              "missing": {
+                "value": {
+                  "error": "missing bearer token"
+                }
+              },
+              "invalid": {
+                "value": {
+                  "error": "invalid token"
+                }
+              },
+              "expired": {
+                "value": {
+                  "error": "token expired"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "JWT issued by /api/auth/register or /api/auth/login."
       }
     }
   }

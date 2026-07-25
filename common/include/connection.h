@@ -6,6 +6,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <sys/types.h>
 #include <time.h>
 #include <zlib.h>
@@ -46,11 +47,25 @@ typedef struct connection
   http_request_t request;
   http_response_t response;
 
+  // Authenticated user for the request currently being processed. Set (or
+  // cleared) by jwt_middleware before the route handler runs; a user id of 0
+  // means unauthenticated. Only meaningful for routes behind the JWT
+  // middleware.
+  uint64_t auth_user_id;
+  char auth_username[64];
+
   // Set true while a worker thread has handed this connection off to the
   // storage thread pool to run a blocking handler. While set, the owning
   // worker must not touch the connection (no event handling, no timeout
   // reaping) -- the pool thread owns it until it re-arms the socket for output.
   _Atomic(bool) offloaded;
+
+  // Expect: 100-continue progress for the current request: bytes of the
+  // interim "100 Continue" line already written to the socket, and whether it
+  // has fully flushed. Both reset when the connection is reused for the next
+  // request.
+  size_t continue_pos;
+  bool continue_sent;
 
   // Timing
   time_t last_activity;

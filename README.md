@@ -23,17 +23,28 @@ The handoff is the interesting part. A handler that touches the storage engine (
 
 The pool has **two priority levels**: reads are queued above writes (`STORAGE_PRIORITY_READ` > `STORAGE_PRIORITY_WRITE`), so a `GET` doesn't wait behind a burst of WAL-fsyncing writes. It is deliberately oversubscribed relative to the core count — those threads spend most of their life parked in `fsync`/`pread`, so extra threads keep the CPU busy rather than idle.
 
-Every handler runs inside a **middleware chain** (`logging` → `cors` → handler). The chain is installed by `register_default_middleware()` and wraps every route, including the default file handler.
+Every handler runs inside a **middleware chain** (`logging` → `metrics` → `cors` → `rate_limit` → `auth` → `jwt` → handler). The chain is installed by `register_default_middleware()` and wraps every route, including the default file handler. The order is deliberate: logging (outermost) times the whole chain; metrics records the final status and latency of every request, including ones a later stage short-circuits; CORS answers `OPTIONS` preflight before rate limiting or auth can reject it; rate limiting sheds excess load before the server spends effort on auth; API-key auth guards mutating routes outside the JWT paths; the JWT middleware (innermost) verifies bearer tokens for the per-user routes and hands the verified identity to the handler.
 
 ## Features
 
 **HTTP**
 - HTTP/1.1 with keep-alive and a 30s idle timeout
 - Edge-triggered `epoll`, one loop per worker thread
+- Conditional requests on static files: strong `ETag` (mtime + size) and `Last-Modified` on every file response, answered with `304 Not Modified` on a matching `If-None-Match` / `If-Modified-Since` (gzipped responses carry a weak `W/` etag, since the encoded bytes differ)
+- Byte ranges: a single `Range: bytes=` (including `N-`, `-N` suffix forms) returns `206 Partial Content` with `Content-Range`, validated against `If-Range`, `416` when unsatisfiable — served through the same zero-copy `sendfile` window
+- Chunked request bodies: `Transfer-Encoding: chunked` is decoded (extensions and trailers tolerated); a message carrying both `Content-Length` and `Transfer-Encoding` is refused with `400` as a request-smuggling guard, and any non-chunked coding gets `501`
+- `Expect: 100-continue`: the interim `100 Continue` is written as soon as the headers arrive, so clients that wait before sending a large body aren't stuck for their retry timeout
 - Route table with per-method handlers, trailing-`*` wildcards (`/api/todos/*`), and a default static-file handler
-- Composable middleware chain — request logging (with timing) and CORS, including `OPTIONS` preflight
+- Composable middleware chain — request logging (with timing), metrics, CORS (including `OPTIONS` preflight), rate limiting, API-key auth, and JWT auth
 - Optional TLS via OpenSSL, auto-enabled when the cert and key exist
 - WebSocket upgrade + full RFC 6455 frame handling (masked frames, ping/pong, close) — `/ws/chat` is a working echo endpoint
+
+**Middleware & policy**
+- Token-bucket **rate limiting** per client IP, refilled at `RATE_LIMIT_RPS`/s up to a `RATE_LIMIT_BURST` allowance; over-limit requests get `429 Too Many Requests` with `Retry-After`. Buckets live in a fixed open-addressing table with bounded, LRU-evicting probes, so the check stays O(1) and the memory footprint is constant
+- **User accounts + JWT auth** for the Todo API: `POST /api/auth/register` and `POST /api/auth/login` issue HS256 JWTs; passwords are hashed with PBKDF2-HMAC-SHA256 (100k iterations, per-user salt, via the crypto framework in `common/src/crypto.c`) and every `/api/todos*` request needs a `Authorization: Bearer <jwt>` — each user sees only their own todos
+- **API-key auth** on mutating verbs (`POST`/`PUT`/`DELETE`/`PATCH`) outside the JWT paths: keys come from `API_KEYS`, presented as `X-API-Key` or `Authorization: Bearer`, checked in constant time; reads stay public and auth is off entirely when no keys are set
+- **Prometheus metrics** at `/metrics` — per-method/status request counters, a request-latency histogram, and process gauges (uptime, active/total connections) in the text exposition format
+- **Health endpoints** — `/healthz` (liveness, inline) and `/readyz` (readiness, proves the storage engine can serve a transaction)
 
 **Performance**
 - Thread-pool offload of blocking handlers, with read-over-write priority queueing
@@ -79,6 +90,12 @@ Configuration is read from `.env` (override the path with `ENV_FILE`), then over
 | `SSL_CERT_FILE`      | `server.crt`     | TLS certificate                                              |
 | `SSL_KEY_FILE`       | `server.key`     | TLS private key                                              |
 | `CORS_ALLOW_ORIGIN`  | `*`              | Value echoed in `Access-Control-Allow-Origin`                |
+| `RATE_LIMIT_ENABLED` | `true`           | Enable per-IP token-bucket rate limiting                     |
+| `RATE_LIMIT_RPS`     | `100`            | Sustained refill rate (tokens/sec per client IP)             |
+| `RATE_LIMIT_BURST`   | `200`            | Bucket size — the largest instantaneous burst allowed        |
+| `API_KEYS`           | _(empty)_        | Comma-separated keys guarding writes; empty disables auth    |
+| `JWT_SECRET`         | _(random)_       | HMAC secret signing the JWTs; unset = random per run, so tokens die with the process |
+| `JWT_TTL_SECONDS`    | `3600`           | Lifetime of issued tokens                                    |
 | `DB_FILE`            | `codo.db`        | B-tree data file                                             |
 | `WAL_FILE`           | `codo.wal`       | Write-ahead log                                              |
 | `TODO_CACHE_CAPACITY`| `1024`           | Max entries in the todo read cache                           |
@@ -96,32 +113,64 @@ Compile-time limits (thread counts, buffer sizes, connection caps) live in `comm
 | `GET`    | `/api/status`     | Server status                                  |
 | `GET`    | `/api/stats`      | Network counters (see below)                   |
 | `GET`    | `/api/cache`      | Todo cache hit/miss counters                   |
+| `GET`    | `/metrics`        | Prometheus metrics (see below)                 |
+| `GET`    | `/healthz`        | Liveness probe — `{"status":"ok"}`             |
+| `GET`    | `/readyz`         | Readiness probe (checks the storage engine)    |
 | `GET`    | `/ws/chat`        | WebSocket echo endpoint                        |
-| —        | `/api/todos[/id]` | Todo CRUD — see below                          |
+| `POST`   | `/api/auth/register` | Create a user, returns a JWT — see below    |
+| `POST`   | `/api/auth/login` | Log in, returns a JWT — see below              |
+| `GET`    | `/api/auth/me`    | Current user (requires a Bearer token)         |
+| —        | `/api/todos[/id]` | Todo CRUD, JWT-protected — see below           |
 | `GET`    | `/*`              | Static files from `DOCUMENT_ROOT`              |
 
 ### Todo API
 
-A todo is `{"id": <number>, "title": <string>, "completed": <bool>}`. On `POST`/`PUT` the body must supply `title`; `completed` defaults to `false`. Ids are assigned by the server and seeded at startup from the highest id already on disk.
+A todo is `{"id": <number>, "user_id": <number>, "title": <string>, "completed": <bool>}`. On `POST`/`PUT` the body must supply `title`; `completed` defaults to `false`. Ids are assigned by the server and seeded at startup from the highest id already on disk.
+
+Every `/api/todos` route requires an `Authorization: Bearer <jwt>` header (see [Auth](#auth)), and each user only ever sees their own todos: the list is filtered to the authenticated user, and fetching, replacing, or deleting another user's todo answers `404` — indistinguishable from a todo that doesn't exist, so ids can't be probed.
 
 | Method   | Path              | Description                      | Success |
 | -------- | ----------------- | -------------------------------- | ------- |
-| `GET`    | `/api/todos`      | List all todos (JSON array)      | `200`   |
-| `POST`   | `/api/todos`      | Create a todo from the JSON body | `201`   |
+| `GET`    | `/api/todos`      | List your todos (JSON array, filterable — see below) | `200`   |
+| `POST`   | `/api/todos`      | Create a todo owned by you       | `201`   |
 | `GET`    | `/api/todos/{id}` | Fetch a single todo              | `200`   |
 | `PUT`    | `/api/todos/{id}` | Replace a todo                   | `200`   |
 | `DELETE` | `/api/todos/{id}` | Delete a todo                    | `204`   |
 
-Errors: `400` (missing/invalid `title`, or a non-numeric id), `404` (no such todo), `413` (todo too large).
+Errors: `400` (missing/invalid `title`, or a non-numeric id), `401` (missing, invalid, or expired token), `404` (no such todo — or not yours), `413` (todo too large); over the rate limit, any request is `429`.
+
+**Filtering & pagination.** `GET /api/todos` accepts query parameters, applied during the scan:
+
+| Param       | Example              | Effect                                             |
+| ----------- | -------------------- | -------------------------------------------------- |
+| `completed` | `?completed=true`    | Keep only todos with that completed state          |
+| `q`         | `?q=milk`            | Case-insensitive substring match on the title      |
+| `offset`    | `?offset=20`         | Skip the first N matches                            |
+| `limit`     | `?limit=10`          | Return at most N matches                            |
+
+The response body stays a bare JSON array (so existing clients and the demo UI are unaffected); the count of matches *before* pagination is returned in an `X-Total-Count` header.
 
 ```sh
-curl -X POST localhost:8080/api/todos -d '{"title":"buy milk","completed":false}'
-# 201 {"id":1,"title":"buy milk","completed":false}
+curl -i -H "Authorization: Bearer $TOKEN" \
+  "localhost:8080/api/todos?completed=false&q=buy&limit=10&offset=0"
+# 200, X-Total-Count: 7, body is the first 10 matching todos
+```
 
-curl localhost:8080/api/todos
-curl localhost:8080/api/todos/1
-curl -X PUT localhost:8080/api/todos/1 -d '{"title":"buy oat milk","completed":true}'
-curl -X DELETE localhost:8080/api/todos/1
+```sh
+# grab a token first (see Auth below)
+TOKEN=$(curl -s -X POST localhost:8080/api/auth/login \
+  -d '{"username":"alice","password":"wonderland123"}' \
+  | sed 's/.*"token":"\([^"]*\)".*/\1/')
+
+curl -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/api/todos \
+  -d '{"title":"buy milk","completed":false}'
+# 201 {"id":1,"user_id":1,"title":"buy milk","completed":false}
+
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/api/todos
+curl -H "Authorization: Bearer $TOKEN" localhost:8080/api/todos/1
+curl -X PUT -H "Authorization: Bearer $TOKEN" localhost:8080/api/todos/1 \
+  -d '{"title":"buy oat milk","completed":true}'
+curl -X DELETE -H "Authorization: Bearer $TOKEN" localhost:8080/api/todos/1
 ```
 
 **Caching.** A single-todo `GET` otherwise costs a transaction plus a B-tree descent through the buffer pool, so it reads through a fixed-capacity LRU cache instead. Writes keep the cache in step: create and update store the new JSON, delete drops the entry. A cache fill that races a concurrent write is discarded rather than resurrecting a stale value — the cache carries a generation counter that every write bumps, and a fill whose snapshot is stale is dropped.
@@ -143,14 +192,83 @@ curl localhost:8080/api/stats
 #  "connections_accepted":5,"connections_closed":4,"errors":0}
 ```
 
+### Metrics & health
+
+`GET /metrics` renders the Prometheus text exposition format: a request counter labelled by method and status class, a latency histogram (`codo_request_duration_seconds`) over the classic bucket ladder, and process gauges. The `metrics` middleware records every request as the chain unwinds, so short-circuited replies (a `429`, a `401`) are counted too.
+
+```sh
+curl localhost:8080/metrics
+# codo_requests_total{method="GET",status="2xx"} 41
+# codo_requests_total{method="POST",status="4xx"} 2
+# codo_request_duration_seconds_bucket{le="0.01"} 38
+# codo_request_duration_seconds_bucket{le="+Inf"} 43
+# codo_request_duration_seconds_sum 0.184392
+# codo_request_duration_seconds_count 43
+# codo_uptime_seconds 128
+# codo_active_connections 1
+```
+
+`GET /healthz` is a cheap liveness check answered inline. `GET /readyz` is a readiness check that begins and commits a storage transaction, so it only returns `200` once the engine can actually serve traffic (`503` otherwise) — point a load balancer's health check at it.
+
+### Rate limiting
+
+Each client IP gets a token bucket, refilled at `RATE_LIMIT_RPS` tokens/second up to `RATE_LIMIT_BURST`; every request spends one token. When the bucket is empty the request is rejected with `429 Too Many Requests` and a `Retry-After` telling the client how many seconds until a token frees up. Buckets live in a fixed-size table, so the limiter adds constant memory and an O(1) check on the request path. Preflight `OPTIONS` is answered by the CORS middleware before the limiter runs, so browsers aren't penalized for it. Set `RATE_LIMIT_ENABLED=false` to turn it off.
+
+```sh
+# with RATE_LIMIT_BURST=2, the third rapid request is shed:
+curl -i localhost:8080/healthz   # 200
+curl -i localhost:8080/healthz   # 200
+curl -i localhost:8080/healthz   # 429 Too Many Requests, Retry-After: 1
+```
+
+### Auth
+
+**User accounts (JWT).** The Todo API is per-user: register or log in to get an HS256 JWT, then present it as `Authorization: Bearer <token>` on every `/api/todos` request. Usernames are 3–63 characters of `[A-Za-z0-9_.-]`; passwords are at least 8 characters, hashed with PBKDF2-HMAC-SHA256 (100k iterations, 16-byte random salt) — only the salt and hash are stored, in the same B-tree as the todos under `user:<name>` keys. Login runs the same KDF even for unknown usernames and compares hashes in constant time, so neither timing nor the response distinguishes a wrong password from a missing user.
+
+| Method | Path                 | Body                              | Success | Errors |
+| ------ | -------------------- | --------------------------------- | ------- | ------ |
+| `POST` | `/api/auth/register` | `{"username":..,"password":..}`   | `201` + token | `400` invalid fields, `409` name taken |
+| `POST` | `/api/auth/login`    | `{"username":..,"password":..}`   | `200` + token | `400`, `401` bad credentials |
+| `GET`  | `/api/auth/me`       | — (Bearer token required)         | `200` `{"id":..,"username":..}` | `401` |
+
+```sh
+curl -X POST localhost:8080/api/auth/register -d '{"username":"alice","password":"wonderland123"}'
+# 201 {"id":1,"username":"alice","token":"eyJ...","token_type":"Bearer","expires_in":3600}
+
+curl -X POST localhost:8080/api/auth/login -d '{"username":"alice","password":"wonderland123"}'
+# 200 {"token":"eyJ...","token_type":"Bearer","expires_in":3600,"user":{"id":1,"username":"alice"}}
+
+curl -H "Authorization: Bearer eyJ..." localhost:8080/api/auth/me
+# 200 {"id":1,"username":"alice"}
+```
+
+Tokens carry `sub` (username), `uid` (user id), `iat`, and `exp`, and expire after `JWT_TTL_SECONDS` (default one hour). The signing secret comes from `JWT_SECRET`; when unset a random secret is generated at startup (and a warning printed), which means every issued token dies with the process — set it in production, and set the *same* value on every instance behind the balancer. The verifier recomputes the HS256 signature unconditionally and never reads the token's `alg` header, so `alg:none`-style downgrades don't apply.
+
+**API keys.** Set `API_KEYS` to a comma-separated list to lock down mutating requests (`POST`/`PUT`/`DELETE`/`PATCH`) on the remaining routes (e.g. `/api/echo`); reads stay public, and the JWT-owned paths (`/api/todos*`, `/api/auth/*`) are exempt so a request never needs two credentials. The key is presented as `X-API-Key: <key>` or `Authorization: Bearer <key>` and compared in constant time. A protected request with no key is `401`; a wrong key is `403`. With `API_KEYS` empty (the default), API-key auth is disabled.
+
+```sh
+# API_KEYS=secret123
+curl -X POST localhost:8080/api/echo -d 'hello'
+# 401 {"error":"missing API key"}
+curl -X POST -H 'X-API-Key: secret123' localhost:8080/api/echo -d 'hello'
+# 200 hello
+```
+
 ### Helper scripts
 
-`scripts/` wraps each CRUD operation in a small `curl` script. They target `http://localhost:8080` unless you set `BASE_URL`, and need `bash` + `curl` (on Windows: WSL or Git Bash).
+`scripts/` wraps each operation in a small `curl` script. They target `http://localhost:8080` unless you set `BASE_URL`, and need `bash` + `curl` (on Windows: WSL or Git Bash). The todo scripts require a JWT in the `TOKEN` env var:
+
+```sh
+TOKEN=$(./scripts/login.sh alice wonderland123 | sed 's/.*"token":"\([^"]*\)".*/\1/')
+TOKEN=$TOKEN ./scripts/list_todos.sh
+```
 
 | Script             | Arguments                    | Notes                                          |
 | ------------------ | ---------------------------- | ---------------------------------------------- |
+| `register.sh`      | `<username> <password>`      | Creates a user, prints the JSON incl. token    |
+| `login.sh`         | `<username> <password>`      | Prints the JSON incl. token                    |
 | `create_todo.sh`   | `"<title>" [completed]`      | Prints the created todo                        |
-| `list_todos.sh`    | _(none)_                     | Prints the JSON array of all todos             |
+| `list_todos.sh`    | _(none)_                     | Prints the JSON array of your todos            |
 | `get_todo.sh`      | `<id>`                       | Prints the matching todo, or a `404` body      |
 | `update_todo.sh`   | `<id> "<title>" [completed]` | Replaces the todo, prints the result           |
 | `delete_todo.sh`   | `<id>`                       | Prints the status (`204`, or `404` if absent)  |
@@ -189,10 +307,11 @@ Five components, each with its own `include/` + `src/`. `common/`, `storage/` an
 
 ```
 common/     shared infrastructure -> libcommon.a
-  config, env, util, stats, mime, connection (socket helpers + teardown),
-  http_protocol (request parser + response writer), compression (gzip),
-  thread_pool (priority task queues; work stealing exists but is off),
-  lru (the read cache), lockfree (queue/hashtable/skiplist -- see note below)
+  config, env, util, stats, metrics (Prometheus request counters + histogram),
+  mime, connection (socket helpers + teardown), http_protocol (request parser +
+  response writer), compression (gzip), thread_pool (priority task queues; work
+  stealing exists but is off), lru (the read cache), lockfree (queue/hashtable/
+  skiplist -- see note below)
 storage/    embedded B-tree engine -> libstorage.a
   storage.h  public API: engine lifecycle, transactions, insert/search/update/delete/scan
   engine     singleton init/cleanup, checkpoint, statistics
@@ -203,12 +322,14 @@ storage/    embedded B-tree engine -> libstorage.a
   db         CRUD/scan API (tree descent over the layers above)
 api/        the web API served on top of the core -> libapi.a
   api.h      public API: api_init / api_mount / api_shutdown
-  handlers   /api/hello, /api/echo, /api/status, /api/stats, /ws/chat
+  handlers   /api/hello, /api/echo, /api/status, /api/stats, /ws/chat,
+             /metrics, /healthz, /readyz
   todo_handlers  the Todo CRUD resource (JSON layer + LRU read cache)
 server/     the HTTP/1.1 server core -> bin/codo
   main (wiring only), server_config (.env + argv), server (accept loop),
   worker (epoll loop + offload), connection_pool, route, middleware,
-  ssl_util, websocket
+  rate_limit (token-bucket limiter), auth (API-key guard), jwt (HS256 tokens),
+  user_auth (accounts + login routes + the JWT middleware), ssl_util, websocket
 balancer/   epoll TCP load balancer -> bin/codo-balancer
   main (wiring only), balancer_config (.env + argv + backend list),
   balancer (event loop + proxying), selection (strategies), hash
@@ -231,6 +352,8 @@ api_shutdown();               // drop the cache, checkpoint and close the engine
 ```
 
 The dependency runs one way: `api/` includes the core's headers to register routes on `http_server_t`; the core never includes `api/`. The single exception is `server/src/main.c`, which is pure wiring — load config, init, mount, run, shut down — and does no request-level work of its own. Adding an endpoint means touching `api/`, not the server.
+
+The policy middleware (`rate_limit`, `auth`, `jwt`) and the user accounts behind it stay on the core side: they are transport-level concerns that guard *every* route, and `register_default_middleware()` installs them as one chain. `api_mount()` registers the auth *routes* (`/api/auth/register`, `/api/auth/login`, `/api/auth/me`) alongside the other endpoints, so the wiring still enters through the same seam.
 
 The balancer is split the same way: `balancer/src/main.c` only loads `balancer_config_t` and calls into the library (`load_balancer_init`, `balancer_add_backends`, `load_balancer_main_loop`); backend-spec parsing lives in `balancer/src/balancer_config.c`.
 

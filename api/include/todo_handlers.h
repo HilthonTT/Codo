@@ -13,13 +13,15 @@ void todo_api_init(void);
 // Tear the read cache down. Call once the server has stopped serving.
 void todo_api_shutdown(void);
 
-// Register the Todo CRUD routes on the given server:
-//   GET    /api/todos        list all todos
-//   POST   /api/todos        create a todo
+// Register the Todo CRUD routes on the given server. All /api/todos routes
+// require a JWT (see jwt_middleware in user_auth.h) and operate only on the
+// authenticated user's todos:
+//   GET    /api/todos        list the user's todos
+//   POST   /api/todos        create a todo owned by the user
 //   GET    /api/todos/{id}   fetch one todo (served from the LRU cache on a hit)
 //   PUT    /api/todos/{id}   replace one todo
 //   DELETE /api/todos/{id}   delete one todo
-//   GET    /api/cache        read-cache hit/miss counters
+//   GET    /api/cache        read-cache hit/miss counters (public)
 void todo_api_register_routes(http_server_t *server);
 
 // Individual route handlers (exposed for explicit wiring / testing).

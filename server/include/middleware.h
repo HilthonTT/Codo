@@ -27,10 +27,15 @@ struct middleware_ctx
   route_handler_t handler;      // terminal handler, run once the chain is done
 };
 
-// Register the built-in middleware chain on `server`: logging first so it times
-// the whole chain, then CORS so it can answer preflight requests before they
-// reach any route or the default file handler. `cors_allow_origin` is the value
-// the CORS middleware echoes in Access-Control-Allow-Origin ("*" when NULL).
+// Register the built-in middleware chain on `server` and initialize the policy
+// it reads from the environment (metrics, rate limiting, API keys):
+//
+//   logging -> metrics -> cors -> rate_limit -> auth -> jwt -> handler
+//
+// See the comments at the definition for why the order is what it is.
+// `cors_allow_origin` is the value the CORS middleware echoes in
+// Access-Control-Allow-Origin ("*" when NULL). Call after api_init(), since the
+// JWT stage needs the secret that the user-auth layer loads.
 void register_default_middleware(struct http_server *server,
                                  const char *cors_allow_origin);
 
@@ -55,6 +60,13 @@ int run_with_middleware(connection_t *conn, http_request_t *request,
 // time spent handling the request. Register it first so it times the whole
 // chain (including any other middleware).
 int logging_middleware(connection_t *conn, http_request_t *request,
+                       http_response_t *response, middleware_ctx_t *next);
+
+// Built-in middleware: records Prometheus request metrics (a per-method/status
+// counter and a latency histogram) after the rest of the chain returns, so it
+// captures the final status of every request -- handled or short-circuited.
+// Register it near the top of the chain so its timing spans the real work.
+int metrics_middleware(connection_t *conn, http_request_t *request,
                        http_response_t *response, middleware_ctx_t *next);
 
 // Built-in middleware: adds CORS headers. For a preflight (OPTIONS) request it

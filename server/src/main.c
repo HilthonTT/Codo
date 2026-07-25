@@ -51,6 +51,8 @@ int main(int argc, char *argv[])
     return 1;
   }
 
+  // The JWT stage of the chain needs the secret api_init() loaded, so the
+  // middleware is registered after it.
   register_default_middleware(&g_server, config.cors_allow_origin);
   api_mount(&g_server);
   init_ssl_if_available(&g_server, config.ssl_enabled, config.ssl_cert_file,
@@ -72,8 +74,8 @@ int main(int argc, char *argv[])
   http_server_stop(&g_server);
   http_server_cleanup(&g_server);
 
-  // No handler can be running now, so the API's cache and storage engine are
-  // safe to tear down (this takes the final checkpoint).
+  // No handler can be running now, so the API's caches, storage engine and
+  // crypto framework are safe to tear down (this takes the final checkpoint).
   api_shutdown();
 
   printf("HTTP server stopped\n");

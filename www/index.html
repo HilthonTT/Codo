@@ -42,10 +42,31 @@
       </section>
 
       <section class="card">
+        <h2>Account</h2>
+        <p class="hint">
+          <code>POST /api/auth/register</code> and
+          <code>POST /api/auth/login</code> issue a JWT; the todo API below
+          only answers requests carrying it.
+        </p>
+        <div class="row" id="auth-forms">
+          <input id="auth-user" type="text" placeholder="Username" autocomplete="username" />
+          <input id="auth-pass" type="password" placeholder="Password" autocomplete="current-password" />
+          <button id="auth-login">Log in</button>
+          <button id="auth-register">Register</button>
+        </div>
+        <div class="row">
+          <span id="auth-state" class="badge off">logged out</span>
+          <button id="auth-logout" disabled>Log out</button>
+        </div>
+        <pre id="auth-out" class="out">—</pre>
+      </section>
+
+      <section class="card">
         <h2>Todos</h2>
         <p class="hint">
-          Full CRUD against the btree storage engine:
-          <code>GET/POST/PUT/DELETE /api/todos</code>.
+          Full per-user CRUD against the btree storage engine:
+          <code>GET/POST/PUT/DELETE /api/todos</code> with an
+          <code>Authorization: Bearer</code> token.
         </p>
         <div class="row">
           <input id="todo-title" type="text" placeholder="New todo title" />
