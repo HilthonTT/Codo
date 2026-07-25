@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "server.h"
 #include "ssl_util.h"
@@ -52,6 +53,24 @@ int init_ssl(http_server_t *server, const char *cert_file, const char *key_file)
   server->ssl_cert_file = strdup(cert_file);
   server->ssl_key_file = strdup(key_file);
   return 0;
+}
+
+int init_ssl_if_available(http_server_t *server, bool enabled,
+                          const char *cert_file, const char *key_file) {
+  if (!enabled || !cert_file || !key_file) {
+    return 0;
+  }
+  if (access(cert_file, F_OK) != 0 || access(key_file, F_OK) != 0) {
+    return 0;
+  }
+
+  if (init_ssl(server, cert_file, key_file) != 0) {
+    fprintf(stderr, "SSL init failed, continuing without SSL\n");
+    return -1;
+  }
+
+  printf("SSL enabled (%s / %s)\n", cert_file, key_file);
+  return 1;
 }
 
 void cleanup_ssl(http_server_t *server) {

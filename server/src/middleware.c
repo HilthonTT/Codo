@@ -26,6 +26,22 @@ static const char *request_header(const http_request_t *request, const char *nam
   return NULL;
 }
 
+void register_default_middleware(http_server_t *server,
+                                 const char *cors_allow_origin)
+{
+  if (!server)
+  {
+    return;
+  }
+
+  // Store the CORS policy where cors_middleware can reach it.
+  snprintf(server->cors_allow_origin, sizeof(server->cors_allow_origin), "%s",
+           cors_allow_origin ? cors_allow_origin : "*");
+
+  add_middleware(server, logging_middleware);
+  add_middleware(server, cors_middleware);
+}
+
 int add_middleware(http_server_t *server, middleware_fn_t fn)
 {
   if (!server || !fn)

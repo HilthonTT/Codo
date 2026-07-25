@@ -27,6 +27,13 @@ struct middleware_ctx
   route_handler_t handler;      // terminal handler, run once the chain is done
 };
 
+// Register the built-in middleware chain on `server`: logging first so it times
+// the whole chain, then CORS so it can answer preflight requests before they
+// reach any route or the default file handler. `cors_allow_origin` is the value
+// the CORS middleware echoes in Access-Control-Allow-Origin ("*" when NULL).
+void register_default_middleware(struct http_server *server,
+                                 const char *cors_allow_origin);
+
 // Register a middleware. Middlewares run in registration order: the first
 // registered is the outermost wrapper -- it runs first on the way in and last
 // on the way out. Returns 0 on success, -1 if the table is full or args are bad.

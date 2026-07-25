@@ -2,17 +2,12 @@
 
 #include <signal.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 
-#include "handlers.h"
+#include "api.h"
 #include "middleware.h"
-#include "route.h"
 #include "server.h"
+#include "server_config.h"
 #include "ssl_util.h"
-#include "storage.h"
-#include "todo_handlers.h"
-#include "env.h"
 
 // Global server instance and shutdown flag, shared across translation units
 // (workers reach into g_server directly via these externs).
@@ -26,102 +21,49 @@ static void http_signal_handler(int signum)
   g_server.running = false;
 }
 
+static void install_signal_handlers(void)
+{
+  signal(SIGINT, http_signal_handler);
+  signal(SIGTERM, http_signal_handler);
+  // A write to a peer that has already gone away would otherwise kill us.
+  signal(SIGPIPE, SIG_IGN);
+}
+
 int main(int argc, char *argv[])
 {
-  const char *env_file = getenv("ENV_FILE");
-  if (load_env(env_file ? env_file : ".env") != 0)
+  server_config_t config;
+  if (server_config_load(&config, argc, argv) != 0)
   {
-    perror("load_env");
-  }
-
-  int port = env_int("PORT", 8080);
-  const char *document_root = env_str("DOCUMENT_ROOT", "/var/www/html");
-  const char *ssl_cert = env_str("SSL_CERT_FILE", "server.crt");
-  const char *ssl_key = env_str("SSL_KEY_FILE", "server.key");
-  bool ssl_enabled = env_bool("SSL_ENABLED", true);
-  const char *db_file = env_str("DB_FILE", "codo.db");
-  const char *wal_file = env_str("WAL_FILE", "codo.wal");
-  const char *cors_origin = env_str("CORS_ALLOW_ORIGIN", "*");
-
-  // Command line arguments still override everything
-  if (argc > 1)
-  {
-    port = atoi(argv[1]);
-  }
-  if (argc > 2)
-  {
-    document_root = argv[2];
-  }
-
-  if (port <= 0 || port > 65535)
-  {
-    fprintf(stderr, "Invalid port: %d\n", port);
     return 1;
   }
 
-  // Setup signal handlers
-  signal(SIGINT, http_signal_handler);
-  signal(SIGTERM, http_signal_handler);
-  signal(SIGPIPE, SIG_IGN);
+  install_signal_handlers();
 
-  // Initialize HTTP server
-  if (http_server_init(&g_server, port, document_root) != 0)
+  if (http_server_init(&g_server, config.port, config.document_root) != 0)
   {
     fprintf(stderr, "Failed to initialize HTTP server\n");
     return 1;
   }
 
-  // Initialize the btree storage engine that backs the Todo API.
-  if (init_storage_engine(db_file, wal_file) != 0)
+  if (api_init(config.db_file, config.wal_file) != 0)
   {
-    fprintf(stderr, "Failed to initialize storage engine\n");
     http_server_cleanup(&g_server);
     return 1;
   }
-  todo_api_init();
 
-  // Store the CORS policy where the middleware can reach it.
-  snprintf(g_server.cors_allow_origin, sizeof(g_server.cors_allow_origin),
-           "%s", cors_origin);
+  register_default_middleware(&g_server, config.cors_allow_origin);
+  api_mount(&g_server);
+  init_ssl_if_available(&g_server, config.ssl_enabled, config.ssl_cert_file,
+                        config.ssl_key_file);
 
-  // Register middleware first -- it wraps every route handler below. The
-  // logging middleware is registered first so it times the whole chain
-  // (including CORS). CORS runs next so it can answer preflight requests before
-  // they reach any route or the default file handler.
-  add_middleware(&g_server, logging_middleware);
-  add_middleware(&g_server, cors_middleware);
-
-  // Add example routes
-  add_route(&g_server, "/api/hello", HTTP_GET, api_hello_handler);
-  add_route(&g_server, "/api/echo", HTTP_POST, api_echo_handler);
-  add_route(&g_server, "/api/status", HTTP_GET, api_status_handler);
-  add_route(&g_server, "/api/stats", HTTP_GET, api_stats_handler);
-  add_route(&g_server, "/ws/chat", HTTP_GET, websocket_chat_handler);
-
-  // Mount the Todo CRUD web API on top of the storage engine.
-  todo_api_register_routes(&g_server);
-
-  // Enable SSL if requested and certificates are available
-  if (ssl_enabled &&
-      access(ssl_cert, F_OK) == 0 && access(ssl_key, F_OK) == 0)
-  {
-    if (init_ssl(&g_server, ssl_cert, ssl_key) == 0)
-    {
-      printf("SSL enabled (%s / %s)\n", ssl_cert, ssl_key);
-    }
-    else
-    {
-      fprintf(stderr, "SSL init failed, continuing without SSL\n");
-    }
-  }
-
-  printf("HTTP server starting on port %d\n", port);
-  printf("Document root: %s\n", document_root);
+  printf("HTTP server starting on port %d\n", config.port);
+  printf("Document root: %s\n", config.document_root);
 
   if (http_server_start(&g_server) != 0)
   {
     fprintf(stderr, "Failed to start HTTP server\n");
     http_server_cleanup(&g_server);
+    api_shutdown();
     return 1;
   }
 
@@ -130,11 +72,9 @@ int main(int argc, char *argv[])
   http_server_stop(&g_server);
   http_server_cleanup(&g_server);
 
-  // No handler can be running now, so the read cache is safe to tear down.
-  todo_api_shutdown();
-
-  // Flush and close the storage engine (final checkpoint).
-  cleanup_storage_engine();
+  // No handler can be running now, so the API's cache and storage engine are
+  // safe to tear down (this takes the final checkpoint).
+  api_shutdown();
 
   printf("HTTP server stopped\n");
 

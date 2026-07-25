@@ -23,7 +23,7 @@ The handoff is the interesting part. A handler that touches the storage engine (
 
 The pool has **two priority levels**: reads are queued above writes (`STORAGE_PRIORITY_READ` > `STORAGE_PRIORITY_WRITE`), so a `GET` doesn't wait behind a burst of WAL-fsyncing writes. It is deliberately oversubscribed relative to the core count — those threads spend most of their life parked in `fsync`/`pread`, so extra threads keep the CPU busy rather than idle.
 
-Every handler runs inside a **middleware chain** (`logging` → `cors` → handler). Middleware is registered in `main.c` and wraps every route, including the default file handler.
+Every handler runs inside a **middleware chain** (`logging` → `cors` → handler). The chain is installed by `register_default_middleware()` and wraps every route, including the default file handler.
 
 ## Features
 
@@ -48,7 +48,7 @@ Every handler runs inside a **middleware chain** (`logging` → `cors` → handl
 
 ## Build
 
-Shared code compiles once into `libcommon.a`, the storage engine into `libstorage.a`, and each binary links what it needs (the server links both; the balancer only needs `libcommon.a`).
+Shared code compiles once into `libcommon.a`, the storage engine into `libstorage.a`, the web API into `libapi.a`, and each binary links what it needs (the server links all three; the balancer only needs `libcommon.a`).
 
 ```sh
 make              # both binaries -> bin/codo + bin/codo-balancer
@@ -185,7 +185,7 @@ It reads the same `.env` as the server. CLI args override it: `argv[1]` is the l
 
 ## Layout
 
-Four components, each with its own `include/` + `src/`. `common/` and `storage/` are libraries; `server/` and `balancer/` are the binaries built on top of them.
+Five components, each with its own `include/` + `src/`. `common/`, `storage/` and `api/` are libraries; `server/` and `balancer/` are the binaries built on top of them.
 
 ```
 common/     shared infrastructure -> libcommon.a
@@ -201,18 +201,38 @@ storage/    embedded B-tree engine -> libstorage.a
   btree      page-level key search/insert/delete
   txn        transaction begin/commit/abort
   db         CRUD/scan API (tree descent over the layers above)
-server/     the HTTP/1.1 server -> bin/codo
-  main, server (accept loop), worker (epoll loop + offload), connection_pool,
-  route, middleware, handlers, todo_handlers, ssl_util, websocket
+api/        the web API served on top of the core -> libapi.a
+  api.h      public API: api_init / api_mount / api_shutdown
+  handlers   /api/hello, /api/echo, /api/status, /api/stats, /ws/chat
+  todo_handlers  the Todo CRUD resource (JSON layer + LRU read cache)
+server/     the HTTP/1.1 server core -> bin/codo
+  main (wiring only), server_config (.env + argv), server (accept loop),
+  worker (epoll loop + offload), connection_pool, route, middleware,
+  ssl_util, websocket
 balancer/   epoll TCP load balancer -> bin/codo-balancer
-  main, balancer (event loop + proxying), selection (strategies), hash
+  main (wiring only), balancer_config (.env + argv + backend list),
+  balancer (event loop + proxying), selection (strategies), hash
 www/        bundled demo site + OpenAPI description
 scripts/    bash + curl helpers for the Todo API
 build/      objects, dep files, libcommon.a, libstorage.a
 bin/        output binaries
 ```
 
-The Todo API lives in `server/src/todo_handlers.c` (the HTTP/JSON layer) on top of the storage engine's public API. The engine's internals — pages, buffer pool, WAL records, locking — are private to `storage/src/storage_internal.h`.
+The Todo API lives in `api/src/todo_handlers.c` (the HTTP/JSON layer) on top of the storage engine's public API. The engine's internals — pages, buffer pool, WAL records, locking — are private to `storage/src/storage_internal.h`.
+
+### The api / server seam
+
+`server/` is the HTTP engine and knows nothing about what is being served: it accepts connections, parses requests, runs the middleware chain, matches routes and serves static files. `api/` is everything Codo actually exposes — the handlers, the Todo resource and its cache, and the storage engine's lifecycle — behind three calls in `api/include/api.h`:
+
+```c
+api_init(db_file, wal_file);  // open the storage engine, seed ids, build the cache
+api_mount(&g_server);         // register every API route (offloaded where blocking)
+api_shutdown();               // drop the cache, checkpoint and close the engine
+```
+
+The dependency runs one way: `api/` includes the core's headers to register routes on `http_server_t`; the core never includes `api/`. The single exception is `server/src/main.c`, which is pure wiring — load config, init, mount, run, shut down — and does no request-level work of its own. Adding an endpoint means touching `api/`, not the server.
+
+The balancer is split the same way: `balancer/src/main.c` only loads `balancer_config_t` and calls into the library (`load_balancer_init`, `balancer_add_backends`, `load_balancer_main_loop`); backend-spec parsing lives in `balancer/src/balancer_config.c`.
 
 ### What is shared vs. server-only
 

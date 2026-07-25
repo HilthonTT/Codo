@@ -7,6 +7,7 @@ LDLIBS   := -lssl -lcrypto -lz -lpthread
 # ---- Layout ----
 COMMON_DIR   := common
 STORAGE_DIR  := storage
+API_DIR      := api
 SERVER_DIR   := server
 BALANCER_DIR := balancer
 BUILD_DIR    := build
@@ -16,26 +17,35 @@ BIN_DIR      := bin
 # engine's internal header lives in storage/src and is private to libstorage.
 COMMON_INC   := -I$(COMMON_DIR)/include
 STORAGE_INC  := -I$(STORAGE_DIR)/include
-SERVER_INC   := $(COMMON_INC) $(STORAGE_INC) -I$(SERVER_DIR)/include
+SERVER_CORE_INC := $(COMMON_INC) $(STORAGE_INC) -I$(SERVER_DIR)/include
+# The API layer sits on top of the server core -- it registers its routes on
+# http_server_t -- so it sees the core's headers as well as its own. main.c is
+# the only server-core file that reaches the other way, for api.h.
+API_INC      := $(SERVER_CORE_INC) -I$(API_DIR)/include
+SERVER_INC   := $(SERVER_CORE_INC) -I$(API_DIR)/include
 BALANCER_INC := $(COMMON_INC) -I$(BALANCER_DIR)/include
 
 SERVER_BIN   := $(BIN_DIR)/codo
 BALANCER_BIN := $(BIN_DIR)/codo-balancer
 COMMON_LIB   := $(BUILD_DIR)/libcommon.a
 STORAGE_LIB  := $(BUILD_DIR)/libstorage.a
+API_LIB      := $(BUILD_DIR)/libapi.a
 
 # ---- Sources / objects / deps ----
 COMMON_SRCS   := $(wildcard $(COMMON_DIR)/src/*.c)
 STORAGE_SRCS  := $(wildcard $(STORAGE_DIR)/src/*.c)
+API_SRCS      := $(wildcard $(API_DIR)/src/*.c)
 SERVER_SRCS   := $(wildcard $(SERVER_DIR)/src/*.c)
 BALANCER_SRCS := $(wildcard $(BALANCER_DIR)/src/*.c)
 
 COMMON_OBJS   := $(COMMON_SRCS:$(COMMON_DIR)/src/%.c=$(BUILD_DIR)/common/%.o)
 STORAGE_OBJS  := $(STORAGE_SRCS:$(STORAGE_DIR)/src/%.c=$(BUILD_DIR)/storage/%.o)
+API_OBJS      := $(API_SRCS:$(API_DIR)/src/%.c=$(BUILD_DIR)/api/%.o)
 SERVER_OBJS   := $(SERVER_SRCS:$(SERVER_DIR)/src/%.c=$(BUILD_DIR)/server/%.o)
 BALANCER_OBJS := $(BALANCER_SRCS:$(BALANCER_DIR)/src/%.c=$(BUILD_DIR)/balancer/%.o)
 
-DEPS := $(COMMON_OBJS:.o=.d) $(STORAGE_OBJS:.o=.d) $(SERVER_OBJS:.o=.d) $(BALANCER_OBJS:.o=.d)
+DEPS := $(COMMON_OBJS:.o=.d) $(STORAGE_OBJS:.o=.d) $(API_OBJS:.o=.d) \
+        $(SERVER_OBJS:.o=.d) $(BALANCER_OBJS:.o=.d)
 
 # ---- Default: build both binaries ----
 all: $(SERVER_BIN) $(BALANCER_BIN)
@@ -50,10 +60,15 @@ $(COMMON_LIB): $(COMMON_OBJS)
 $(STORAGE_LIB): $(STORAGE_OBJS)
 	ar rcs $@ $^
 
+$(API_LIB): $(API_OBJS)
+	ar rcs $@ $^
+
 # ---- Link binaries ----
-# The server links the storage engine + common; the balancer only needs common.
-$(SERVER_BIN): $(SERVER_OBJS) $(STORAGE_LIB) $(COMMON_LIB) | $(BIN_DIR)
-	$(CC) $(LDFLAGS) $(SERVER_OBJS) $(STORAGE_LIB) $(COMMON_LIB) -o $@ $(LDLIBS)
+# The server links the API layer + the storage engine + common; the balancer
+# only needs common. Library order matters: libapi calls into libstorage, which
+# calls into libcommon.
+$(SERVER_BIN): $(SERVER_OBJS) $(API_LIB) $(STORAGE_LIB) $(COMMON_LIB) | $(BIN_DIR)
+	$(CC) $(LDFLAGS) $(SERVER_OBJS) $(API_LIB) $(STORAGE_LIB) $(COMMON_LIB) -o $@ $(LDLIBS)
 
 $(BALANCER_BIN): $(BALANCER_OBJS) $(COMMON_LIB) | $(BIN_DIR)
 	$(CC) $(LDFLAGS) $(BALANCER_OBJS) $(COMMON_LIB) -o $@ $(LDLIBS)
@@ -65,6 +80,9 @@ $(BUILD_DIR)/common/%.o: $(COMMON_DIR)/src/%.c | $(BUILD_DIR)/common
 $(BUILD_DIR)/storage/%.o: $(STORAGE_DIR)/src/%.c | $(BUILD_DIR)/storage
 	$(CC) $(CFLAGS) $(STORAGE_INC) -MMD -MP -c $< -o $@
 
+$(BUILD_DIR)/api/%.o: $(API_DIR)/src/%.c | $(BUILD_DIR)/api
+	$(CC) $(CFLAGS) $(API_INC) -MMD -MP -c $< -o $@
+
 $(BUILD_DIR)/server/%.o: $(SERVER_DIR)/src/%.c | $(BUILD_DIR)/server
 	$(CC) $(CFLAGS) $(SERVER_INC) -MMD -MP -c $< -o $@
 
@@ -72,7 +90,8 @@ $(BUILD_DIR)/balancer/%.o: $(BALANCER_DIR)/src/%.c | $(BUILD_DIR)/balancer
 	$(CC) $(CFLAGS) $(BALANCER_INC) -MMD -MP -c $< -o $@
 
 # ---- Create dirs on demand ----
-$(BIN_DIR) $(BUILD_DIR)/common $(BUILD_DIR)/storage $(BUILD_DIR)/server $(BUILD_DIR)/balancer:
+$(BIN_DIR) $(BUILD_DIR)/common $(BUILD_DIR)/storage $(BUILD_DIR)/api \
+$(BUILD_DIR)/server $(BUILD_DIR)/balancer:
 	mkdir -p $@
 
 # ---- Variants (apply to all components) ----
