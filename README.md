@@ -55,6 +55,8 @@ Every handler runs inside a **middleware chain** (`logging` → `metrics` → `c
 
 **Storage**
 - Embedded B-tree engine: pages, buffer pool, write-ahead log, transactions, checkpointing
+- Prefix range scans (`db_scan_prefix`) — descend straight to the first matching key and stop at the first one that no longer matches, so a scan costs the range and not the tree
+- **Secondary index on a todo's owner**, so listing a user's todos reads only their rows instead of every row in the database (see below)
 - Final checkpoint on `SIGINT`/`SIGTERM`, so todos survive a restart
 
 ## Build
@@ -139,7 +141,7 @@ Every `/api/todos` route requires an `Authorization: Bearer <jwt>` header (see [
 
 Errors: `400` (missing/invalid `title`, or a non-numeric id), `401` (missing, invalid, or expired token), `404` (no such todo — or not yours), `413` (todo too large); over the rate limit, any request is `429`.
 
-**Filtering & pagination.** `GET /api/todos` accepts query parameters, applied during the scan:
+**Filtering & pagination.** `GET /api/todos` accepts query parameters, applied as the matching rows are read:
 
 | Param       | Example              | Effect                                             |
 | ----------- | -------------------- | -------------------------------------------------- |
@@ -148,13 +150,25 @@ Errors: `400` (missing/invalid `title`, or a non-numeric id), `401` (missing, in
 | `offset`    | `?offset=20`         | Skip the first N matches                            |
 | `limit`     | `?limit=10`          | Return at most N matches                            |
 
-The response body stays a bare JSON array (so existing clients and the demo UI are unaffected); the count of matches *before* pagination is returned in an `X-Total-Count` header.
+The response body stays a bare JSON array (so existing clients and the demo UI are unaffected); the count of matches *before* pagination is returned in an `X-Total-Count` header. Todos come back in ascending id order, which is what makes `offset`/`limit` a stable window.
 
 ```sh
 curl -i -H "Authorization: Bearer $TOKEN" \
   "localhost:8080/api/todos?completed=false&q=buy&limit=10&offset=0"
 # 200, X-Total-Count: 7, body is the first 10 matching todos
 ```
+
+**The owner index.** A collection `GET` used to scan the whole B-tree and throw away every row that wasn't yours — work proportional to *everybody's* todos. Each todo now also gets an index entry keyed `idx:user:<uid>:<id>`, with both ids zero-padded to a fixed width so the tree's lexicographic order is numeric order and one user's entries form a single contiguous range. Listing is then a `db_scan_prefix` over that range followed by a lookup per row, so the cost tracks the caller's own todos. When no filter needs to look inside a row (no `completed`, no `q`), only the requested page is read at all: `?limit=10` reads ten rows no matter how many the user has, and `X-Total-Count` comes from the entry count without touching a row.
+
+Entries are written in the same transaction as the row they describe, and the row stays the authority — a listing re-checks each row's `user_id`, so a stale entry can never leak somebody else's todo. Because the index is derived state, `todo_index_reconcile()` rebuilds it from the rows at startup (in the same pass that seeds the id counter): missing entries are added, entries whose row is gone or whose owner changed are dropped, and the repair is logged.
+
+```sh
+# an existing database gets its index built on the next boot
+./bin/codo
+# todo index: reconciled (12 entries added, 0 dropped)
+```
+
+If that repair can't finish — most plausibly because the page filled up, since the index roughly doubles what a todo costs and a page split isn't implemented — the index is marked unavailable and listings fall back to the old full scan rather than answering from a partial index that would silently hide todos.
 
 ```sh
 # grab a token first (see Auth below)
@@ -175,7 +189,7 @@ curl -X DELETE -H "Authorization: Bearer $TOKEN" localhost:8080/api/todos/1
 
 **Caching.** A single-todo `GET` otherwise costs a transaction plus a B-tree descent through the buffer pool, so it reads through a fixed-capacity LRU cache instead. Writes keep the cache in step: create and update store the new JSON, delete drops the entry. A cache fill that races a concurrent write is discarded rather than resurrecting a stale value — the cache carries a generation counter that every write bumps, and a fill whose snapshot is stale is dropped.
 
-The collection `GET` is deliberately **not** cached: it's a full scan that any write would invalidate, so caching it would trade a scan for a near-permanent miss.
+The collection `GET` is deliberately **not** cached: it builds a result set that any write would invalidate, so caching it would trade the read for a near-permanent miss. Its rows are read through the transaction rather than the LRU cache, so one listing is a consistent snapshot.
 
 ```sh
 curl localhost:8080/api/cache
@@ -319,12 +333,15 @@ storage/    embedded B-tree engine -> libstorage.a
   pager      buffer pool, page IO, free-page management, checksums
   btree      page-level key search/insert/delete
   txn        transaction begin/commit/abort
-  db         CRUD/scan API (tree descent over the layers above)
+  db         CRUD/scan API (tree descent over the layers above), including the
+             full and prefix-range scans
 api/        the web API served on top of the core -> libapi.a
   api.h      public API: api_init / api_mount / api_shutdown
   handlers   /api/hello, /api/echo, /api/status, /api/stats, /ws/chat,
              /metrics, /healthz, /readyz
   todo_handlers  the Todo CRUD resource (JSON layer + LRU read cache)
+  todo_index     the todo key space + the owner index (key layout, maintenance,
+                 prefix lookup, startup reconcile)
 server/     the HTTP/1.1 server core -> bin/codo
   main (wiring only), server_config (.env + argv), server (accept loop),
   worker (epoll loop + offload), connection_pool, route, middleware,
@@ -377,4 +394,6 @@ GitHub Actions (`.github/workflows/ci.yml`) runs on every push and PR to `main`:
 - **No test suite.** Correctness is currently covered only by the CI smoke test and the sanitizer build.
 - **`common/src/lockfree.c` is not wired up.** It implements a lock-free queue, hash table and skip list with hazard-pointer reclamation, and compiles into `libcommon.a`, but nothing links against it yet — it's groundwork, not a load-bearing part of the request path.
 - `db_update()` only handles same-length values, so a todo update is implemented as a delete + insert inside one transaction.
+- **No B-tree page split.** A leaf's capacity is one page, so the whole database is bounded by a single page's worth of rows and a full page fails the insert. The owner index roughly doubles what one todo costs, which is why a reconcile that can't finish degrades to a full scan instead of serving a partial index.
+- **The abort path has no undo** (`storage/src/txn.c`), so a multi-write transaction cannot be rolled back by the engine. Writers that need it compensate by hand — creating a todo whose index entry fails to write deletes the row again rather than committing a todo no listing would show.
 - The JSON parser is hand-rolled and object-shaped: it reads top-level string and boolean fields, and collapses `\uXXXX` escapes to `?`.

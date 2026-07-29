@@ -308,7 +308,7 @@
           "Todos"
         ],
         "summary": "List the authenticated user's todos",
-        "description": "Scans the whole B-tree inside a transaction and returns the authenticated user's todos as a JSON array. Ordering follows the B-tree key order — keys are the todo ids rendered as decimal strings, so the sort is lexicographic, not numeric (`\"10\"` sorts before `\"9\"`). The array is empty (`[]`) when no todos exist.",
+        "description": "Returns the authenticated user's todos as a JSON array, in ascending id order. The rows are found through the owner index — a prefix range scan over this user's index entries inside a transaction — so the cost tracks the caller's own todos rather than the size of the database. The array is empty (`[]`) when no todos exist.",
         "operationId": "listTodos",
         "responses": {
           "200": {

@@ -1,6 +1,5 @@
 #define _GNU_SOURCE
 
-#include <errno.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,13 +16,15 @@
 #include "server.h"
 #include "storage.h"
 #include "todo_handlers.h"
+#include "todo_index.h"
 #include "util.h"
 
 // Todos are stored in the btree keyed by their decimal id (e.g. "42"); the
 // value is the canonical JSON object
 // {"id":..,"user_id":..,"title":..,"completed":..}. Ids are handed out from a
 // process-wide counter that is seeded at startup from the highest id already
-// on disk.
+// on disk. The key layout, and the secondary index over the owner, live in
+// todo_index.c.
 //
 // Every todo belongs to the user who created it. The jwt_middleware runs
 // before these handlers and publishes the verified identity in
@@ -37,32 +38,14 @@ static _Atomic uint64_t g_next_todo_id = 1;
 // pool; a hit skips all of it. Writes keep the cache in step: create and update
 // store the new JSON, delete drops the entry.
 //
-// Only single-todo reads are cached. The collection GET is a full scan whose
-// result any write would invalidate, so caching it would trade a scan for a
-// near-permanent miss.
+// Only single-todo reads are cached. The collection GET builds a result set
+// that any write would invalidate, so caching it would trade the read for a
+// near-permanent miss; its individual rows are read through the transaction
+// rather than this cache, so one listing is a consistent snapshot.
 static lru_cache_t *g_todo_cache = NULL;
 
 static const char TODO_COLLECTION[] = "/api/todos";
 static const char TODO_ITEM_PREFIX[] = "/api/todos/";
-
-// Todo rows are keyed by a bare decimal id. Other record types share the same
-// btree under prefixed keys (e.g. "user:<name>"), so any scan over todos must
-// skip keys that are not purely numeric.
-static bool key_is_todo(const char *key, size_t key_length)
-{
-  if (key_length == 0)
-  {
-    return false;
-  }
-  for (size_t i = 0; i < key_length; i++)
-  {
-    if (key[i] < '0' || key[i] > '9')
-    {
-      return false;
-    }
-  }
-  return true;
-}
 
 // Render a complete todo object into dst. Returns length or -1 on overflow.
 static int build_todo_json(char *dst, size_t dst_size, uint64_t id,
@@ -95,9 +78,10 @@ static bool todo_owned_by(const char *value, size_t value_len, uint64_t user_id)
          owner == user_id;
 }
 
-// Pull a numeric id out of "/api/todos/{id}". Returns false for missing,
-// empty, or non-numeric ids.
-static bool extract_id(const char *uri, char *out, size_t out_size)
+// Pull a numeric id out of "/api/todos/{id}", as both the btree row key and its
+// numeric value. Returns false for missing, empty, non-numeric or overflowing
+// ids.
+static bool extract_id(const char *uri, char *out, size_t out_size, uint64_t *id_out)
 {
   size_t prefix_len = strlen(TODO_ITEM_PREFIX);
   if (strncmp(uri, TODO_ITEM_PREFIX, prefix_len) != 0)
@@ -127,7 +111,10 @@ static bool extract_id(const char *uri, char *out, size_t out_size)
     return false;
   }
   out[out_len] = '\0';
-  return true;
+
+  // Rejects a run of digits that would not fit a uint64 (and so could never be
+  // an id this server handed out).
+  return todo_row_key_parse(out, out_len, id_out);
 }
 
 static int send_json(connection_t *conn, http_request_t *request,
@@ -205,28 +192,17 @@ static int list_append(list_ctx_t *ctx, const char *data, size_t n)
   return 0;
 }
 
-static int list_scan_cb(const char *key, size_t key_length,
-                        const char *value, size_t value_length, void *ctx)
+// Does the stored todo pass the filter? Only decidable by reading the row.
+static bool list_row_matches(const todo_filter_t *f, const char *value,
+                             size_t value_length)
 {
-  list_ctx_t *list = (list_ctx_t *)ctx;
-  const todo_filter_t *f = list->filter;
-
-  // Skip rows that are not todos (user records share the btree) and todos
-  // that belong to somebody else.
-  if (!key_is_todo(key, key_length) ||
-      !todo_owned_by(value, value_length, list->user_id))
-  {
-    return 0;
-  }
-
-  // Apply the filters against the stored JSON before this row counts as a match.
   if (f->have_completed)
   {
     bool completed = false;
     json_get_bool(value, value_length, "completed", &completed);
     if (completed != f->completed_want)
     {
-      return 0;
+      return false;
     }
   }
   if (f->have_q)
@@ -235,8 +211,37 @@ static int list_scan_cb(const char *key, size_t key_length,
     if (!json_get_string(value, value_length, "title", title, sizeof(title)) ||
         !strcasestr(title, f->q))
     {
-      return 0;
+      return false;
     }
+  }
+  return true;
+}
+
+// Append a row to the array being built. Only called for rows already known to
+// fall inside the requested page. Sets list->error on allocation failure.
+static void list_emit(list_ctx_t *list, const char *value, size_t value_length)
+{
+  if (list->count > 0 && list_append(list, ",", 1) != 0)
+  {
+    return;
+  }
+  if (list_append(list, value, value_length) != 0)
+  {
+    return;
+  }
+  list->count++;
+}
+
+// Filter and paginate one row: the path taken whenever a match can only be
+// decided by reading the row, so the window has to be tracked as we go.
+static void list_consider_row(list_ctx_t *list, const char *value,
+                              size_t value_length)
+{
+  const todo_filter_t *f = list->filter;
+
+  if (!list_row_matches(f, value, value_length))
+  {
+    return;
   }
 
   // Matched. Its 0-based position within the matched set drives pagination; the
@@ -246,23 +251,102 @@ static int list_scan_cb(const char *key, size_t key_length,
 
   if (index < f->offset)
   {
-    return 0; // before the requested page
+    return; // before the requested page
   }
   if (f->limit >= 0 && list->count >= f->limit)
   {
-    return 0; // page already full -- keep scanning only to finish the count
+    return; // page already full -- keep counting to finish X-Total-Count
   }
 
-  if (list->count > 0 && list_append(list, ",", 1) != 0)
+  list_emit(list, value, value_length);
+}
+
+// Fallback path, used only while the owner index is unavailable: read every row
+// in the btree -- every other user's included -- and filter by hand.
+static int list_scan_cb(const char *key, size_t key_length,
+                        const char *value, size_t value_length, void *ctx)
+{
+  list_ctx_t *list = (list_ctx_t *)ctx;
+
+  // Skip rows that are not todos (user records and index entries share the
+  // btree) and todos that belong to somebody else.
+  if (!todo_row_key_parse(key, key_length, NULL) ||
+      !todo_owned_by(value, value_length, list->user_id))
   {
-    return 1; // stop on allocation failure
+    return 0;
   }
-  if (list_append(list, value, value_length) != 0)
+
+  list_consider_row(list, value, value_length);
+  return list->error ? 1 : 0;
+}
+
+// Index-backed path: `ids` already holds exactly this user's todo ids, in
+// ascending order, so only their rows are read. When no filter needs to look
+// inside a row, only the page being returned is read at all.
+static void list_from_index(list_ctx_t *list, transaction_t *txn,
+                            const todo_id_list_t *ids)
+{
+  const todo_filter_t *f = list->filter;
+  bool needs_every_row = f->have_completed || f->have_q;
+
+  for (size_t i = 0; i < ids->count && !list->error; i++)
   {
-    return 1;
+    if (!needs_every_row)
+    {
+      // Every entry is a match, so the window is known before reading anything.
+      if ((long)i < f->offset)
+      {
+        continue;
+      }
+      if (f->limit >= 0 && list->count >= f->limit)
+      {
+        break;
+      }
+    }
+
+    char key[TODO_KEY_MAX];
+    int key_len = todo_row_key(key, sizeof(key), ids->ids[i]);
+    if (key_len < 0)
+    {
+      continue;
+    }
+
+    char value[MAX_VALUE_SIZE + 1];
+    size_t value_len = MAX_VALUE_SIZE;
+    if (db_search(txn, key, (size_t)key_len, value, &value_len) != 0)
+    {
+      // An entry whose row is gone: only reachable if a crash landed between
+      // the two writes. The next startup reconcile drops the entry.
+      continue;
+    }
+    if (value_len > MAX_VALUE_SIZE)
+    {
+      value_len = MAX_VALUE_SIZE;
+    }
+
+    // The index says the row is this user's, but the row itself is the
+    // authority -- so a stale entry can never leak somebody else's todo.
+    if (!todo_owned_by(value, value_len, list->user_id))
+    {
+      continue;
+    }
+
+    if (needs_every_row)
+    {
+      list_consider_row(list, value, value_len);
+    }
+    else
+    {
+      list_emit(list, value, value_len);
+    }
   }
-  list->count++;
-  return 0;
+
+  if (!needs_every_row)
+  {
+    // Nothing was filtered out, so the entry count is the pre-pagination total
+    // and X-Total-Count needs no row reads to compute.
+    list->matched = (long)ids->count;
+  }
 }
 
 // Parse the GET /api/todos query string into a filter. Unknown or malformed
@@ -356,7 +440,27 @@ int todo_list_handler(connection_t *conn, http_request_t *request, http_response
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
   }
 
-  db_scan(txn, list_scan_cb, &list);
+  if (todo_index_available())
+  {
+    // Prefix-scan the owner index for this user's ids, then read those rows.
+    // The ids are collected first because a scan callback may not call back
+    // into the engine -- the leaf it is reading is locked for the call.
+    todo_id_list_t ids;
+    if (todo_index_lookup(txn, list.user_id, &ids) == 0)
+    {
+      list_from_index(&list, txn, &ids);
+      todo_id_list_free(&ids);
+    }
+    else
+    {
+      list.error = true;
+    }
+  }
+  else
+  {
+    db_scan(txn, list_scan_cb, &list);
+  }
+
   commit_transaction(txn);
   free(txn);
 
@@ -408,8 +512,12 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
 
   uint64_t id = atomic_fetch_add(&g_next_todo_id, 1);
 
-  char key[32];
-  int key_len = snprintf(key, sizeof(key), "%llu", (unsigned long long)id);
+  char key[TODO_KEY_MAX];
+  int key_len = todo_row_key(key, sizeof(key), id);
+  if (key_len < 0)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Id too large");
+  }
 
   char value[MAX_VALUE_SIZE];
   int value_len = build_todo_json(value, sizeof(value), id, conn->auth_user_id,
@@ -426,6 +534,19 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
   }
 
   int rc = db_insert(txn, key, (size_t)key_len, value, (size_t)value_len);
+
+  // The owner index entry goes in the same transaction as the row it describes.
+  if (rc == 0 && todo_index_available())
+  {
+    if (todo_index_insert(txn, conn->auth_user_id, id) != 0)
+    {
+      // The engine's abort path has no undo yet (storage/src/txn.c), so undo the
+      // row by hand rather than committing a todo no listing would ever show.
+      db_delete(txn, key, (size_t)key_len);
+      rc = -1;
+    }
+  }
+
   commit_transaction(txn);
   free(txn);
 
@@ -443,8 +564,8 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
 
 int todo_get_handler(connection_t *conn, http_request_t *request, http_response_t *response)
 {
-  char key[32];
-  if (!extract_id(request->uri, key, sizeof(key)))
+  char key[TODO_KEY_MAX];
+  if (!extract_id(request->uri, key, sizeof(key), NULL))
   {
     return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
   }
@@ -508,8 +629,9 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
 
 int todo_update_handler(connection_t *conn, http_request_t *request, http_response_t *response)
 {
-  char key[32];
-  if (!extract_id(request->uri, key, sizeof(key)))
+  char key[TODO_KEY_MAX];
+  uint64_t id = 0;
+  if (!extract_id(request->uri, key, sizeof(key), &id))
   {
     return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
   }
@@ -529,13 +651,6 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   json_get_bool(request->body, request->body_length, "completed", &completed);
 
   size_t key_len = strlen(key);
-  errno = 0;
-  char *endptr = NULL;
-  uint64_t id = strtoull(key, &endptr, 10);
-  if (errno != 0 || !endptr || *endptr != '\0' || endptr == key)
-  {
-    return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
-  }
 
   char value[MAX_VALUE_SIZE];
   int value_len = build_todo_json(value, sizeof(value), id, conn->auth_user_id,
@@ -571,6 +686,9 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
 
+  // The owner index needs no work here: the replacement is written with the
+  // authenticated user's id, and the ownership check above already proved that
+  // is the id the row carried, so its index entry is unchanged.
   int rc = db_delete(txn, key, key_len);
   if (rc == 0)
   {
@@ -598,8 +716,9 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
 
 int todo_delete_handler(connection_t *conn, http_request_t *request, http_response_t *response)
 {
-  char key[32];
-  if (!extract_id(request->uri, key, sizeof(key)))
+  char key[TODO_KEY_MAX];
+  uint64_t id = 0;
+  if (!extract_id(request->uri, key, sizeof(key), &id))
   {
     return send_error_response(conn, HTTP_BAD_REQUEST, "Invalid todo id");
   }
@@ -629,6 +748,17 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
     commit_transaction(txn);
     free(txn);
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
+  }
+
+  // Index entry first, in the same transaction: a failure here leaves the todo
+  // both stored and listed, which the client can retry. The other order could
+  // strand an entry pointing at a row that no longer exists. A missing entry is
+  // already the state we want, and db_delete cannot tell that apart from a real
+  // failure, so its result is deliberately not checked -- an entry left behind
+  // is skipped by listings and dropped by the next startup reconcile.
+  if (todo_index_available())
+  {
+    todo_index_delete(txn, conn->auth_user_id, id);
   }
 
   db_delete(txn, key, key_len);
@@ -666,42 +796,13 @@ int todo_cache_stats_handler(connection_t *conn, http_request_t *request, http_r
   return send_json(conn, request, response, HTTP_OK, json);
 }
 
-static int seed_id_scan_cb(const char *key, size_t key_length,
-                           const char *value, size_t value_length, void *ctx)
-{
-  (void)value;
-  (void)value_length;
-  uint64_t *max_id = (uint64_t *)ctx;
-
-  if (!key_is_todo(key, key_length))
-  {
-    return 0; // user records and other namespaces don't consume todo ids
-  }
-
-  char buf[32];
-  size_t n = key_length < sizeof(buf) - 1 ? key_length : sizeof(buf) - 1;
-  memcpy(buf, key, n);
-  buf[n] = '\0';
-
-  uint64_t id = strtoull(buf, NULL, 10);
-  if (id > *max_id)
-  {
-    *max_id = id;
-  }
-  return 0;
-}
-
 void todo_api_init(void)
 {
+  // One pass over the btree both brings the owner index in step with the rows
+  // and reports the highest id on disk, which seeds the counter. A failure is
+  // not fatal: listings fall back to a full scan (todo_index_available()).
   uint64_t max_id = 0;
-
-  transaction_t *txn = begin_transaction();
-  if (txn)
-  {
-    db_scan(txn, seed_id_scan_cb, &max_id);
-    commit_transaction(txn);
-    free(txn);
-  }
+  todo_index_reconcile(&max_id);
 
   atomic_store(&g_next_todo_id, max_id + 1);
 

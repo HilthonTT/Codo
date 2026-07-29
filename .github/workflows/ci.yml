@@ -64,6 +64,78 @@ jobs:
           echo "--- server access log ---"
           cat server.log
 
+      # Exercises the owner index end to end: a listing must show exactly the
+      # caller's todos, page over them in id order, and survive a restart with
+      # the index intact (the startup reconcile must find nothing to repair).
+      - name: Smoke test (owner index)
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          mkdir -p "$work/www"
+          base="http://127.0.0.1:18081"
+
+          boot() {
+            DB_FILE="$work/t.db" WAL_FILE="$work/t.wal" SSL_ENABLED=false \
+            JWT_SECRET=ci-secret RATE_LIMIT_ENABLED=false \
+            ./bin/codo 18081 "$work/www" > "$work/$1.log" 2>&1 &
+            srv=$!
+            for _ in $(seq 1 50); do
+              curl -fs -o /dev/null "$base/healthz" && return 0
+              sleep 0.1
+            done
+            tail -20 "$work/$1.log"; return 1
+          }
+
+          token() {
+            curl -s -X POST "$base/api/auth/register" \
+              -d "{\"username\":\"$1\",\"password\":\"$2\"}" \
+              | sed 's/.*"token":"\([^"]*\)".*/\1/'
+          }
+          ids() {
+            curl -s -H "Authorization: Bearer $1" "$base/api/todos${2:-}" \
+              | grep -o '"id":[0-9]*' | sed 's/"id"://' | tr '\n' ' ' | sed 's/ $//'
+          }
+
+          boot boot1
+          trap 'kill "$srv" 2>/dev/null || true' EXIT
+
+          alice="$(token alice wonderland123)"
+          bob="$(token bob builderpass1)"
+          test -n "$alice" && test -n "$bob"
+
+          for title in "buy milk" "walk the dog" "write code"; do
+            curl -fs -o /dev/null -X POST -H "Authorization: Bearer $alice" \
+              "$base/api/todos" -d "{\"title\":\"$title\"}"
+          done
+          curl -fs -o /dev/null -X POST -H "Authorization: Bearer $bob" \
+            "$base/api/todos" -d '{"title":"bob only"}'
+
+          # Each user sees exactly their own todos, in ascending id order.
+          test "$(ids "$alice")" = "1 2 3"
+          test "$(ids "$bob")" = "4"
+
+          # Paging walks that order; the total ignores the page.
+          test "$(ids "$alice" '?limit=2&offset=1')" = "2 3"
+          total="$(curl -s -D - -o /dev/null -H "Authorization: Bearer $alice" \
+                   "$base/api/todos?limit=1" | grep -i '^X-Total-Count' \
+                   | tr -d '\r' | awk '{print $2}')"
+          test "$total" = "3"
+
+          # A delete drops the index entry with the row.
+          curl -fs -o /dev/null -X DELETE -H "Authorization: Bearer $alice" "$base/api/todos/2"
+          test "$(ids "$alice")" = "1 3"
+
+          kill "$srv"; wait "$srv" 2>/dev/null || true
+
+          # Restart: the index is on disk, so the reconcile has nothing to do.
+          boot boot2
+          test "$(ids "$alice")" = "1 3"
+          test "$(ids "$bob")" = "4"
+          ! grep -q 'todo index: reconciled' "$work/boot2.log"
+          ! grep -qi 'could not be written' "$work/boot2.log"
+
+          echo "owner index smoke test passed"
+
       - name: Upload server log on failure
         if: failure()
         uses: actions/upload-artifact@v4

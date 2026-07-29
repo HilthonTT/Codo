@@ -324,40 +324,41 @@ int db_delete(transaction_t *txn, const char *key, size_t key_length)
   return 0;
 }
 
-int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx)
+// Shared implementation of db_scan / db_scan_prefix: visit every pair whose key
+// starts with `prefix`, in key order. An empty prefix visits the whole tree.
+//
+// Both ends of the range fall out of the key ordering. compare_keys() breaks a
+// tie on the shared bytes in favour of the shorter key, so `prefix` itself sorts
+// before every key that extends it: find_key_position() lands exactly on the
+// first match, and the first key that fails the prefix test ends the range.
+static int scan_range(transaction_t *txn, const char *prefix, size_t prefix_length,
+                      db_scan_callback_t callback, void *ctx)
 {
   if (!txn || txn->state != TXN_STATE_ACTIVE || !callback)
   {
     return -1;
   }
 
-  uint32_t page_id = g_storage.root_page_id;
-  btree_page_t *page = get_page(page_id, LOCK_SHARED);
+  if (prefix_length > MAX_KEY_SIZE)
+  {
+    return -1;
+  }
+
+  // With an empty prefix this follows the first child pointer at every level,
+  // i.e. descends to the leftmost leaf.
+  uint32_t page_id;
+  btree_page_t *page = descend_to_leaf(prefix, prefix_length, LOCK_SHARED, &page_id);
   if (!page)
   {
     return -1;
   }
 
-  // Descend to the leftmost leaf following the first child pointer.
-  while (page->header.page_type == PAGE_TYPE_INTERNAL)
-  {
-    kv_pair_t *kv = get_kv_pair(page, 0);
-    uint32_t child_page_id = kv ? kv->child_page_id : page->header.next_page_id;
+  int start = find_key_position(page, prefix, prefix_length);
 
-    release_page(page_id, LOCK_SHARED);
-    page_id = child_page_id;
-    page = get_page(page_id, LOCK_SHARED);
-
-    if (!page)
-    {
-      return -1;
-    }
-  }
-
-  // Walk the linked list of leaf pages, visiting every key-value pair.
+  // Walk the linked list of leaf pages from that position on.
   while (page)
   {
-    for (int i = 0; i < (int)page->header.key_count; i++)
+    for (int i = start; i < (int)page->header.key_count; i++)
     {
       kv_pair_t *kv = get_kv_pair(page, i);
       if (!kv)
@@ -367,6 +368,14 @@ int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx)
 
       const char *key = kv->data;
       const char *value = kv->data + kv->key_length;
+
+      if (prefix_length > 0 &&
+          (kv->key_length < prefix_length ||
+           memcmp(key, prefix, prefix_length) != 0))
+      {
+        release_page(page_id, LOCK_SHARED);
+        return 0; // Past the end of the prefix range
+      }
 
       if (callback(key, kv->key_length, value, kv->value_length, ctx) != 0)
       {
@@ -385,7 +394,24 @@ int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx)
 
     page_id = next_page_id;
     page = get_page(page_id, LOCK_SHARED);
+    start = 0; // Only the first leaf starts mid-page
   }
 
   return 0;
+}
+
+int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx)
+{
+  return scan_range(txn, "", 0, callback, ctx);
+}
+
+int db_scan_prefix(transaction_t *txn, const char *prefix, size_t prefix_length,
+                   db_scan_callback_t callback, void *ctx)
+{
+  if (prefix_length > 0 && !prefix)
+  {
+    return -1;
+  }
+
+  return scan_range(txn, prefix ? prefix : "", prefix_length, callback, ctx);
 }

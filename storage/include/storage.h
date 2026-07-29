@@ -53,6 +53,17 @@ typedef int (*db_scan_callback_t)(const char *key, size_t key_length,
                                   void *ctx);
 int db_scan(transaction_t *txn, db_scan_callback_t callback, void *ctx);
 
+// Iterate only the pairs whose key starts with `prefix`, in key order. Keys are
+// sorted, so this descends straight to the first matching key and stops at the
+// first one that no longer matches -- the cost is proportional to the range,
+// not to the size of the tree. An empty prefix is equivalent to db_scan().
+//
+// The callback must not call back into the engine: the page holding the current
+// pair is read-locked for the duration of the call. Collect what you need and
+// do the lookups after the scan returns.
+int db_scan_prefix(transaction_t *txn, const char *prefix, size_t prefix_length,
+                   db_scan_callback_t callback, void *ctx);
+
 // Flush the WAL and all dirty pages to disk and record a checkpoint.
 int perform_checkpoint(void);
 

@@ -5,9 +5,10 @@
 #include "http_types.h"
 #include "server.h"
 
-// Seed the in-memory id counter from todos already persisted on disk and build
-// the single-todo read cache (capacity from TODO_CACHE_CAPACITY, default 1024).
-// Call once after init_storage_engine().
+// Seed the in-memory id counter from todos already persisted on disk, bring the
+// owner index in step with them (both from one scan -- see todo_index.h), and
+// build the single-todo read cache (capacity from TODO_CACHE_CAPACITY, default
+// 1024). Call once after init_storage_engine().
 void todo_api_init(void);
 
 // Tear the read cache down. Call once the server has stopped serving.
