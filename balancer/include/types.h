@@ -26,7 +26,6 @@ typedef enum
 
 typedef struct
 {
-  int fd;
   struct sockaddr_in addr;
   int current_weight;
   int weight;
@@ -65,7 +64,6 @@ typedef struct
   io_ctx_t listen_ctx;
   backend_t backends[MAX_BACKENDS];
   int backend_count;
-  int current_backend;
   pthread_mutex_t backend_mutex;
   struct epoll_event events[LB_MAX_EVENTS];
   lb_strategy_t strategy;

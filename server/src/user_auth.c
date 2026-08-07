@@ -1,12 +1,3 @@
-#define _GNU_SOURCE
-
-// crypto.h sets _POSIX_C_SOURCE itself, so it must come before any system
-// header has locked feature macros in. It also defines a MAX_KEY_SIZE that
-// clashes with storage.h's (max crypto key bytes vs max btree key bytes);
-// only the btree limit is used in this file, so let storage.h's win.
-#include "crypto.h"
-#undef MAX_KEY_SIZE
-
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -15,6 +6,7 @@
 #include <string.h>
 #include <strings.h>
 
+#include "crypto.h"
 #include "env.h"
 #include "http_protocol.h"
 #include "json_util.h"

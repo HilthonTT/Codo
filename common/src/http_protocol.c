@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -1211,15 +1209,4 @@ int parse_http_request(connection_t *conn, http_request_t *request)
   }
 
   return 0;
-}
-
-int generate_http_response(connection_t *conn, http_response_t *response)
-{
-  // Simple passthrough: the heavy lifting lives in send_http_response, which
-  // already formats and stages the response in the connection's write buffer.
-  if (!conn || !response)
-  {
-    return -1;
-  }
-  return send_http_response(conn, response);
 }

@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // Transaction lifecycle: begin/commit/abort. A transaction is linked into the
 // engine's active list for its whole life; commit and abort release its locks,
 // write the corresponding WAL record and unlink it. The handle itself is owned

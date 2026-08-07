@@ -1,6 +1,10 @@
 # ---- Toolchain ----
+# -std=c11 defines __STRICT_ANSI__, which hides the Linux-only interfaces the
+# hot paths are built on (epoll, sendfile, accept4, MAP_ANONYMOUS, getrandom).
+# _GNU_SOURCE puts them back; it belongs here rather than at the top of every
+# translation unit, where one file forgetting it is a build break.
 CC       := gcc
-CFLAGS   := -Wall -Wextra -Wpedantic -std=c11
+CFLAGS   := -Wall -Wextra -Wpedantic -std=c11 -D_GNU_SOURCE
 LDFLAGS  :=
 LDLIBS   := -lssl -lcrypto -lz -lpthread
 

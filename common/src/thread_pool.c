@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <stdlib.h>
 #include <stdbool.h>
 #include <sched.h>
@@ -203,7 +201,7 @@ task_t *task_queue_try_pop(task_queue_t *queue)
 // Worker stealing implementation
 task_t *steal_task(thread_pool_t *pool, int worker_id)
 {
-    int num_workers = atomic_load(&pool->active_threads);
+    int num_workers = pool->num_threads;
 
     // Try to steal from other workers' local queues
     for (int i = 1; i < num_workers; i++)
@@ -234,16 +232,7 @@ void *worker_thread(void *arg)
     // Cast through unsigned so a wrapped (negative) counter can never produce a
     // negative index into the worker arrays.
     int worker_id = (int)((unsigned)atomic_fetch_add(&pool->round_robin_index, 1) %
-                          (unsigned)pool->max_threads);
-
-    // Set CPU affinity if specified
-    if (pool->worker_stats[worker_id].cpu_affinity >= 0)
-    {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(pool->worker_stats[worker_id].cpu_affinity, &cpuset);
-        pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-    }
+                          (unsigned)pool->capacity);
 
     struct timespec idle_start, idle_end, task_start, task_end;
 
@@ -300,8 +289,6 @@ void *worker_thread(void *arg)
         atomic_fetch_add(&pool->worker_stats[worker_id].total_execution_time_ns, exec_ns);
         atomic_fetch_add(&pool->total_tasks_completed, 1);
 
-        pool->worker_stats[worker_id].last_task_end = task_end;
-
         free(task);
     }
 
@@ -309,8 +296,8 @@ void *worker_thread(void *arg)
 }
 
 // Create thread pool
-thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_threads,
-                                  bool enable_work_stealing, int num_priorities)
+thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
+                                  int num_priorities)
 {
     thread_pool_t *pool = calloc(1, sizeof(thread_pool_t));
     if (!pool)
@@ -319,9 +306,8 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
     }
 
     pool->num_threads = num_threads;
-    pool->min_threads = min_threads;
-    pool->max_threads = max_threads;
-    atomic_init(&pool->active_threads, num_threads);
+    // Arrays are sized once at creation; the pool never grows or shrinks.
+    pool->capacity = num_threads;
     atomic_init(&pool->shutdown, false);
     atomic_init(&pool->immediate_shutdown, false);
     atomic_init(&pool->total_tasks_submitted, 0);
@@ -340,8 +326,8 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
     // Initialize work-stealing queues
     if (enable_work_stealing)
     {
-        pool->local_queues = calloc(max_threads, sizeof(task_queue_t));
-        pool->queue_locks = calloc(max_threads, sizeof(atomic_int));
+        pool->local_queues = calloc(pool->capacity, sizeof(task_queue_t));
+        pool->queue_locks = calloc(pool->capacity, sizeof(atomic_int));
 
         if (!pool->local_queues || !pool->queue_locks)
         {
@@ -353,7 +339,7 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
             return NULL;
         }
 
-        for (int i = 0; i < max_threads; i++)
+        for (int i = 0; i < pool->capacity; i++)
         {
             task_queue_init(&pool->local_queues[i], num_priorities);
             atomic_init(&pool->queue_locks[i], 0);
@@ -361,8 +347,8 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
     }
 
     // Allocate threads and statistics
-    pool->threads = calloc(max_threads, sizeof(pthread_t));
-    pool->worker_stats = calloc(max_threads, sizeof(worker_stats_t));
+    pool->threads = calloc(pool->capacity, sizeof(pthread_t));
+    pool->worker_stats = calloc(pool->capacity, sizeof(worker_stats_t));
 
     if (!pool->threads || !pool->worker_stats)
     {
@@ -373,7 +359,7 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
         // the main task queue.
         if (pool->local_queues)
         {
-            for (int i = 0; i < max_threads; i++)
+            for (int i = 0; i < pool->capacity; i++)
             {
                 task_queue_destroy(&pool->local_queues[i]);
             }
@@ -386,15 +372,12 @@ thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_thre
     }
 
     // Initialize worker statistics
-    for (int i = 0; i < max_threads; i++)
+    for (int i = 0; i < pool->capacity; i++)
     {
         atomic_init(&pool->worker_stats[i].tasks_executed, 0);
         atomic_init(&pool->worker_stats[i].total_execution_time_ns, 0);
         atomic_init(&pool->worker_stats[i].idle_time_ns, 0);
-        pool->worker_stats[i].cpu_affinity = -1; // No affinity by default
     }
-
-    pthread_mutex_init(&pool->resize_mutex, NULL);
 
     // Create worker threads
     int created = 0;
@@ -458,28 +441,6 @@ int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argu
     return -1;
 }
 
-// Set CPU affinity for worker thread
-int thread_pool_set_affinity(thread_pool_t *pool, int worker_id, int cpu_id)
-{
-    if (worker_id < 0 || worker_id >= pool->max_threads)
-    {
-        return -1;
-    }
-
-    pool->worker_stats[worker_id].cpu_affinity = cpu_id;
-
-    // Apply immediately if thread is running
-    if (worker_id < pool->num_threads)
-    {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(cpu_id, &cpuset);
-        return pthread_setaffinity_np(pool->threads[worker_id], sizeof(cpu_set_t), &cpuset);
-    }
-
-    return 0;
-}
-
 // Get thread pool statistics
 void thread_pool_statistics(thread_pool_t *pool)
 {
@@ -491,7 +452,7 @@ void thread_pool_statistics(thread_pool_t *pool)
 
     printf("=== Thread Pool Statistics ===\n");
     printf("Uptime: %.3f seconds\n", uptime_ns / 1e9);
-    printf("Active threads: %d\n", atomic_load(&pool->active_threads));
+    printf("Worker threads: %d\n", pool->num_threads);
     printf("Tasks submitted: %ld\n", atomic_load(&pool->total_tasks_submitted));
     printf("Tasks completed: %ld\n", atomic_load(&pool->total_tasks_completed));
     printf("Tasks pending: %d\n", atomic_load(&pool->task_queue.size));
@@ -525,50 +486,6 @@ void thread_pool_statistics(thread_pool_t *pool)
            uptime_ns > 0 ? (total_tasks_executed * 1e9) / uptime_ns : 0);
 }
 
-// Dynamic thraed pool resizing
-int thread_pool_resize(thread_pool_t *pool, int new_size)
-{
-    if (new_size < pool->min_threads || new_size > pool->max_threads)
-    {
-        return -1;
-    }
-
-    pthread_mutex_lock(&pool->resize_mutex);
-
-    int current_size = atomic_load(&pool->active_threads);
-
-    if (new_size > current_size)
-    {
-        // Add threads
-        for (int i = current_size; i < new_size; i++)
-        {
-            if (pthread_create(&pool->threads[i], NULL, worker_thread, pool) != 0)
-            {
-                pthread_mutex_unlock(&pool->resize_mutex);
-                return -1;
-            }
-        }
-        atomic_store(&pool->active_threads, new_size);
-    }
-    else if (new_size < current_size)
-    {
-        // LIMITATION: shrinking is not supported. Workers only exit when the
-        // whole pool shuts down (they block in task_queue_pop), and a running
-        // worker's slot is decoupled from its threads[] index by the round-robin
-        // worker-id scheme, so there is no safe way to signal a *specific* worker
-        // to exit and then pthread_join(pool->threads[i]) it -- the join would
-        // block forever on a thread that never received the stop request.
-        // Refuse the shrink instead of deadlocking; growing back up still works.
-        pthread_mutex_unlock(&pool->resize_mutex);
-        return -1;
-    }
-
-    pool->num_threads = new_size;
-    pthread_mutex_unlock(&pool->resize_mutex);
-
-    return 0;
-}
-
 // Destroy thraed pool
 void thread_pool_destroy(thread_pool_t *pool)
 {
@@ -589,7 +506,7 @@ void thread_pool_destroy(thread_pool_t *pool)
 
     if (pool->local_queues)
     {
-        for (int i = 0; i < pool->max_threads; i++)
+        for (int i = 0; i < pool->capacity; i++)
         {
             atomic_store(&pool->local_queues[i].shutdown, true);
             pthread_mutex_lock(&pool->local_queues[i].mutex);
@@ -610,7 +527,7 @@ void thread_pool_destroy(thread_pool_t *pool)
     task_queue_drain(&pool->task_queue);
     if (pool->local_queues)
     {
-        for (int i = 0; i < pool->max_threads; i++)
+        for (int i = 0; i < pool->capacity; i++)
         {
             task_queue_drain(&pool->local_queues[i]);
         }
@@ -618,12 +535,11 @@ void thread_pool_destroy(thread_pool_t *pool)
 
     // Cleanup
     task_queue_destroy(&pool->task_queue);
-    pthread_mutex_destroy(&pool->resize_mutex);
 
     // Free local queues
     if (pool->local_queues)
     {
-        for (int i = 0; i < pool->max_threads; i++)
+        for (int i = 0; i < pool->capacity; i++)
         {
             task_queue_destroy(&pool->local_queues[i]);
         }

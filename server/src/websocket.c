@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/evp.h>

@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // Page-level B-tree operations: binary search over the sorted pair array and
 // insert/delete of variable-length kv pairs within a single page. All lengths
 // coming off disk are treated as untrusted, so every traversal validates that

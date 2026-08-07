@@ -200,13 +200,6 @@ typedef struct
   size_t hash_table_size;
   pthread_mutex_t buffer_mutex;
 
-  // Free page management
-  uint32_t *free_pages;
-  size_t free_page_count;
-  size_t free_page_capacity;
-  uint32_t next_page_id;
-  pthread_mutex_t free_page_mutex;
-
   // Transaction management
   transaction_t *active_transactions;
   uint64_t next_txn_id;
@@ -270,8 +263,6 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id);
 btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type);
 void release_page(uint32_t page_id, lock_type_t lock_type);
 void mark_page_dirty(uint32_t page_id);
-uint32_t allocate_page(void);
-void deallocate_page(uint32_t page_id);
 
 // btree.c
 int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2);

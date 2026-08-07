@@ -37,8 +37,6 @@ typedef struct
   _Atomic(long) tasks_executed;
   _Atomic(long) total_execution_time_ns;
   _Atomic(long) idle_time_ns;
-  struct timespec last_task_end;
-  int cpu_affinity;
 } worker_stats_t;
 
 // Thread pool structure
@@ -47,6 +45,10 @@ typedef struct
   pthread_t *threads;
   worker_stats_t *worker_stats;
   int num_threads;
+  // Size of the threads[]/worker_stats[]/local_queues[] arrays. Fixed at
+  // creation: the pool never grows or shrinks, so it equals num_threads except
+  // in the partially-constructed state a failed create() hands to destroy().
+  int capacity;
   task_queue_t task_queue;
   _Atomic(bool) shutdown;
   _Atomic(bool) immediate_shutdown;
@@ -59,12 +61,6 @@ typedef struct
   _Atomic(long) total_tasks_submitted;
   _Atomic(long) total_tasks_completed;
   struct timespec start_time;
-
-  // Dynamic resizing
-  pthread_mutex_t resize_mutex;
-  int min_threads;
-  int max_threads;
-  _Atomic(int) active_threads;
 
   // Load balancing
   _Atomic(int) round_robin_index;
@@ -83,16 +79,12 @@ task_t *steal_task(thread_pool_t *pool, int worker_id);
 // Worker thread function
 void *worker_thread(void *arg);
 // Create thread pool
-thread_pool_t *thread_pool_create(int num_threads, int min_threads, int max_threads, bool enable_work_stealing, int num_priorities);
+thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing, int num_priorities);
 // Submit task to thread pool
 int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argument, int priority);
-// Set CPU affinity for worker thread
-int thread_pool_set_affinity(thread_pool_t *pool, int worker_id, int cpu_id);
-// Get thread pool statistics
+// Dump pool counters to stdout (debug hook; sole reader of worker_stats)
 void thread_pool_statistics(thread_pool_t *pool);
-// Dynamic thraed pool resizing
-int thread_pool_resize(thread_pool_t *pool, int new_size);
-// Destroy thraed pool
+// Destroy thread pool
 void thread_pool_destroy(thread_pool_t *pool);
 
 #endif

@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -7,7 +5,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "compression.h"
 #include "connection.h"
 
 // Tear down everything owned by a single connection. This is shared between
@@ -45,10 +42,6 @@ void cleanup_connection(connection_t *conn)
   {
     free(conn->response.body);
     conn->response.body = NULL;
-  }
-  if (conn->gzip_initialized)
-  {
-    cleanup_gzip_compression(conn);
   }
 }
 

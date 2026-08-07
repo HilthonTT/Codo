@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // Key layout for the todo namespace plus maintenance of the owner index. See
 // api/include/todo_index.h for the two key shapes and why the index is treated
 // as repairable state rather than as the truth.

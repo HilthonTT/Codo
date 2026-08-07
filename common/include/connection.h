@@ -9,7 +9,6 @@
 #include <stdint.h>
 #include <sys/types.h>
 #include <time.h>
-#include <zlib.h>
 
 #include "config.h"
 #include "http_types.h"
@@ -84,10 +83,6 @@ typedef struct connection
   int file_fd;
   off_t file_offset;
   size_t file_size;
-
-  // Compression
-  z_stream gzip_stream;
-  bool gzip_initialized;
 
   // Linked list for connection pool
   struct connection *next;

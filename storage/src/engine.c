@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // Engine lifecycle: the singleton definition, file/buffer-pool/WAL setup and
 // teardown, checkpointing, and the statistics dump.
 
@@ -194,7 +192,6 @@ int init_storage_engine(const char *data_file, const char *wal_file)
 
   // Initialize mutexes
   pthread_mutex_init(&g_storage.buffer_mutex, NULL);
-  pthread_mutex_init(&g_storage.free_page_mutex, NULL);
   pthread_mutex_init(&g_storage.txn_mutex, NULL);
   pthread_mutex_init(&g_storage.lock_table_mutex, NULL);
   pthread_mutex_init(&g_storage.wal_mutex, NULL);
@@ -202,7 +199,6 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   // Initialize counters
   g_storage.next_txn_id = 1;
   g_storage.next_lsn = 1;
-  g_storage.next_page_id = 1;
   g_storage.root_page_id = 1;
 
   // TODO(durability): WAL crash-recovery replay is NOT implemented. On restart
@@ -253,7 +249,6 @@ void cleanup_storage_engine(void)
   free(g_storage.wal_filename);
   free(g_storage.wal_buffer);
   free(g_storage.hash_table);
-  free(g_storage.free_pages);
   free(g_storage.lock_table);
 
   // Cleanup buffer pool

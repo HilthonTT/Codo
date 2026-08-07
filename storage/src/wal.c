@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // Write-ahead log: record append with 8-byte-aligned framing, buffered in
 // memory and flushed (write + fsync) either when the buffer fills or when a
 // caller needs durability (commit, checkpoint, dirty-page eviction).

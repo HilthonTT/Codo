@@ -1,14 +1,9 @@
-#define _GNU_SOURCE
-
-// crypto.h sets _POSIX_C_SOURCE itself, so it must come before any system
-// header has locked feature macros in.
-#include "crypto.h"
-
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
 
+#include "crypto.h"
 #include "env.h"
 #include "json_util.h"
 #include "jwt.h"

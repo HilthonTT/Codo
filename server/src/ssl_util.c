@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/ssl.h>
@@ -16,10 +14,8 @@ int init_ssl(http_server_t *server, const char *cert_file, const char *key_file)
     return -1;
   }
 
-  SSL_library_init();
-  SSL_load_error_strings();
-  OpenSSL_add_all_algorithms();
-
+  // OpenSSL 1.1.0+ initializes itself on first use; the old SSL_library_init /
+  // OpenSSL_add_all_algorithms calls are no-ops.
   server->ssl_ctx = SSL_CTX_new(TLS_server_method());
   if (!server->ssl_ctx) {
     ERR_print_errors_fp(stderr);

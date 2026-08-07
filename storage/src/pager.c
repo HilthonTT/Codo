@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // Pager: the buffer pool (hash-table lookup, LRU eviction, pinning and
 // per-page rwlocks), page IO against the data file, free-page management and
 // page checksums. Everything above this layer manipulates pages purely in
@@ -327,54 +325,4 @@ void mark_page_dirty(uint32_t page_id)
       entry->page->header.checksum = calculate_checksum(entry->page, PAGE_SIZE);
     }
   }
-}
-
-uint32_t allocate_page(void)
-{
-  pthread_mutex_lock(&g_storage.free_page_mutex);
-
-  uint32_t page_id;
-
-  if (g_storage.free_page_count > 0)
-  {
-    // Reuse a free page
-    page_id = g_storage.free_pages[--g_storage.free_page_count];
-  }
-  else
-  {
-    page_id = g_storage.next_page_id++;
-  }
-
-  pthread_mutex_unlock(&g_storage.free_page_mutex);
-
-  return page_id;
-}
-
-void deallocate_page(uint32_t page_id)
-{
-  pthread_mutex_lock(&g_storage.free_page_mutex);
-
-  // Grow free page array if necessary
-  if (g_storage.free_page_count >= g_storage.free_page_capacity)
-  {
-    size_t new_capacity = g_storage.free_page_capacity * 2;
-    if (new_capacity == 0)
-    {
-      new_capacity = 1024;
-    }
-
-    uint32_t *new_array = realloc(g_storage.free_pages, new_capacity * sizeof(uint32_t));
-    if (new_array)
-    {
-      g_storage.free_pages = new_array;
-      g_storage.free_page_capacity = new_capacity;
-    }
-  }
-
-  if (g_storage.free_page_count < g_storage.free_page_capacity)
-  {
-    g_storage.free_pages[g_storage.free_page_count++] = page_id;
-  }
-
-  pthread_mutex_unlock(&g_storage.free_page_mutex);
 }

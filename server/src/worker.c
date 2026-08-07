@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <errno.h>
 #include <openssl/ssl.h>
 #include <pthread.h>

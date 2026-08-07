@@ -3,11 +3,6 @@
 
 #include <stddef.h>
 
-#include "connection.h"
-
-int init_gzip_compression(connection_t *conn);
-void cleanup_gzip_compression(connection_t *conn);
-
 // One-shot gzip of a whole buffer. On success returns 0, points *out at a freshly
 // malloc'd buffer holding the gzip-wrapped (Content-Encoding: gzip) bytes, and
 // writes their length to *out_len; the caller owns and frees *out. Returns -1 on

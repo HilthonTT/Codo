@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 // High-level key-value API: descend the tree from the root to the target
 // leaf, then delegate to the page-level operations in btree.c. Mutations log
 // a WAL record (via wal.c) before touching the page, and every touched page

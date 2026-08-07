@@ -1,5 +1,3 @@
-#define _GNU_SOURCE
-
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
