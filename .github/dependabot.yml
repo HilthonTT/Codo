@@ -1,0 +1,17 @@
+version: 2
+
+updates:
+  # Codo has no package manifest -- OpenSSL and zlib come from the distro, and
+  # everything else is in-tree. The only pinned third-party dependencies are the
+  # actions used by the workflows, so that is what Dependabot watches.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: ci

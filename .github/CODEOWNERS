@@ -1,0 +1,11 @@
+# Every PR gets a review from the repository owner.
+*                   @HilthonTT
+
+# Areas where a mistake is expensive: on-disk format, durability, and the
+# security-critical paths.
+/storage/           @HilthonTT
+/server/src/jwt.c   @HilthonTT
+/server/src/auth.c  @HilthonTT
+/server/src/user_auth.c @HilthonTT
+/common/src/crypto.c    @HilthonTT
+/.github/           @HilthonTT

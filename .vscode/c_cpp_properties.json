@@ -5,10 +5,16 @@
             "includePath": [
                 "${workspaceFolder}/**",
                 "${workspaceFolder}/common/include",
+                "${workspaceFolder}/storage/include",
+                "${workspaceFolder}/api/include",
                 "${workspaceFolder}/server/include",
                 "${workspaceFolder}/balancer/include"
             ],
-            "defines": [],
+            // Matches the Makefile. Without it, IntelliSense hides epoll,
+            // sendfile, MAP_ANONYMOUS and getrandom behind __STRICT_ANSI__.
+            "defines": [
+                "_GNU_SOURCE"
+            ],
             "compilerPath": "/usr/bin/gcc",
             "cStandard": "c11",
             "cppStandard": "gnu++17",

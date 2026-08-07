@@ -1,0 +1,17 @@
+# Codo builds and runs on Linux only. Normalize to LF in the repository and in
+# the working tree so a checkout on Windows (or WSL sharing a Windows drive)
+# never introduces CRLF into sources the Makefile and shell scripts consume.
+* text=auto eol=lf
+
+*.c    text eol=lf
+*.h    text eol=lf
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+Makefile text eol=lf
+
+# Binary / generated
+*.db   binary
+*.wal  binary
+*.png  binary
+*.ico  binary
