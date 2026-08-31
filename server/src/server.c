@@ -12,6 +12,7 @@
 #include "connection.h"
 #include "http_protocol.h"
 #include "route.h"
+#include "net_util.h"
 #include "server.h"
 #include "ssl_util.h"
 #include "thread_pool.h"
@@ -48,39 +49,18 @@ int http_server_init(http_server_t *server, int port, const char *document_root)
   // Statistics counters are atomics (see http_server_t); memset above zeroed
   // them, which is a valid initial value.
 
-  // Create listening socket
-  server->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+  // Create the listening socket. net_listen_any prefers a dual-stack AF_INET6
+  // socket so the server answers IPv4 and IPv6 clients on one fd, falling back
+  // to IPv4-only where IPv6 is unavailable.
+  server->listen_fd = net_listen_any((uint16_t)port, BACKLOG);
   if (server->listen_fd < 0)
   {
-    perror("socket");
+    perror("listen socket");
     return -1;
   }
 
-  // Set socket options
   set_socket_options(server->listen_fd);
   set_socket_nonblocking(server->listen_fd);
-
-  // Bind to port
-  struct sockaddr_in server_addr;
-  memset(&server_addr, 0, sizeof(server_addr));
-  server_addr.sin_family = AF_INET;
-  server_addr.sin_addr.s_addr = INADDR_ANY;
-  server_addr.sin_port = htons(port);
-
-  if (bind(server->listen_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
-  {
-    perror("bind");
-    close(server->listen_fd);
-    return -1;
-  }
-
-  // Listen for connections
-  if (listen(server->listen_fd, BACKLOG) < 0)
-  {
-    perror("listen");
-    close(server->listen_fd);
-    return -1;
-  }
 
   return 0;
 }
@@ -132,7 +112,7 @@ int http_server_start(http_server_t *server)
   int worker_index = 0;
   while (server->running)
   {
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
 
     int client_fd = accept(server->listen_fd, (struct sockaddr *)&client_addr, &client_len);

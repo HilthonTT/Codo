@@ -45,8 +45,8 @@ typedef struct http_server
   middleware_fn_t middlewares[MAX_MIDDLEWARES];
   int middleware_count;
 
-  // Connection pool
-  connection_t *connection_pool;
+  // Connection accounting. (There is no pool: allocate_connection() mallocs
+  // per connection -- see connection_pool.c.)
   int max_connections;
   _Atomic(int) active_connections;
 
@@ -55,6 +55,8 @@ typedef struct http_server
   int keepalive_timeout;
   bool enable_compression;
   size_t max_request_size;
+  // See server_config_t.trust_proxy_protocol.
+  bool trust_proxy_protocol;
   // Value emitted in Access-Control-Allow-Origin by the CORS middleware. "*" by
   // default; override with the CORS_ALLOW_ORIGIN environment variable.
   char cors_allow_origin[256];

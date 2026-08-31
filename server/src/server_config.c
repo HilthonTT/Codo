@@ -26,6 +26,7 @@ int server_config_load(server_config_t *config, int argc, char *argv[])
   config->db_file = env_str("DB_FILE", "codo.db");
   config->wal_file = env_str("WAL_FILE", "codo.wal");
   config->cors_allow_origin = env_str("CORS_ALLOW_ORIGIN", "*");
+  config->trust_proxy_protocol = env_bool("TRUST_PROXY_PROTOCOL", false);
 
   // Command line arguments still override everything.
   if (argc > 1)

@@ -91,8 +91,10 @@ cert and key files exist.
 | `DB_FILE`             | `codo.db`        | B-tree data file                                     |
 | `WAL_FILE`            | `codo.wal`       | Write-ahead log                                      |
 | `TODO_CACHE_CAPACITY` | `1024`           | Max entries in the todo read cache                   |
+| `TRUST_PROXY_PROTOCOL`| `false`          | Accept a PROXY protocol v1 header and take the client address from it. Enable only when the listener is reachable solely by a trusted balancer — the header lets its sender claim any address. When on, the header is **mandatory**: a connection without one is dropped |
 | `BALANCER_PORT`       | `8000`           | Listen port for `codo-balancer`                      |
-| `BALANCER_BACKENDS`   | `127.0.0.1:8080` | Backends: `host:port[:weight]`, comma-separated       |
+| `BALANCER_BACKENDS`   | `127.0.0.1:8080` | Backends: `host:port[:weight]`, comma-separated. IPv4/IPv6 literals and DNS names |
+| `PROXY_PROTOCOL`      | `false`          | Send a PROXY protocol v1 header to each backend, declaring the real client. Pair with `TRUST_PROXY_PROTOCOL` on the backend |
 
 Compile-time limits (thread counts, buffer sizes, connection caps) live in
 `common/include/config.h`.

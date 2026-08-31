@@ -8,6 +8,7 @@
 
 #include <netinet/in.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <stddef.h>
 #include <sys/epoll.h>
 #include <time.h>
@@ -26,7 +27,10 @@ typedef enum
 
 typedef struct
 {
-  struct sockaddr_in addr;
+  struct sockaddr_storage addr; // IPv4 or IPv6 backend
+  socklen_t addr_len;
+  char host[256]; // as configured, for logging
+  int port;
   int current_weight;
   int weight;
   int current_connections;
@@ -74,6 +78,13 @@ typedef struct lb_connection
   int client_fd;
   int backend_fd;
   backend_t *backend;
+  struct sockaddr_storage client_addr; // peer, for ip-hash and PROXY protocol
+  // Bytes of the PROXY protocol header still to be written to the backend.
+  // The header must precede every proxied byte, so the client->backend pump
+  // stays blocked until this drains. Zero-length when the feature is off.
+  char proxy_hdr[128];
+  size_t proxy_hdr_len;
+  size_t proxy_hdr_sent;
   io_ctx_t client_ctx;
   io_ctx_t backend_ctx;
   // client_buffer holds bytes travelling client -> backend; backend_buffer

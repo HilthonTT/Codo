@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include "hash.h"
+#include "net_util.h"
 #include "selection.h"
 
 static void passive_recovery(load_balancer_t *lb)
@@ -27,22 +28,6 @@ static void passive_recovery(load_balancer_t *lb)
       b->consecutive_failures = 0;
     }
   }
-}
-
-// Format the client's IPv4 address into buf. Falls back to "0.0.0.0" when the
-// address is missing or not AF_INET so the hash stays deterministic instead of
-// reading garbage.
-static const char *get_client_ip(const struct sockaddr_in *client_addr,
-                                 char *buf, size_t buf_len)
-{
-  assert(buf && buf_len >= INET_ADDRSTRLEN);
-
-  if (!client_addr || client_addr->sin_family != AF_INET ||
-      !inet_ntop(AF_INET, &client_addr->sin_addr, buf, (socklen_t)buf_len))
-  {
-    snprintf(buf, buf_len, "0.0.0.0");
-  }
-  return buf;
 }
 
 backend_t *backend_round_robin_select(load_balancer_t *lb)
@@ -142,7 +127,7 @@ backend_t *least_connection_select(load_balancer_t *lb)
   return least_conn_backend;
 }
 
-backend_t *ip_hash_select(load_balancer_t *lb, const struct sockaddr_in *client_addr)
+backend_t *ip_hash_select(load_balancer_t *lb, const struct sockaddr_storage *client_addr)
 {
   assert(lb);
 
@@ -155,10 +140,10 @@ backend_t *ip_hash_select(load_balancer_t *lb, const struct sockaddr_in *client_
     return NULL;
   }
 
-  char ip_buf[INET_ADDRSTRLEN];
-  const char *ip = get_client_ip(client_addr, ip_buf, sizeof(ip_buf));
-
-  uint32_t hash = fnv1_32(ip, strlen(ip));
+  // Hash the raw address bytes rather than a text form: it covers IPv4 and
+  // IPv6 uniformly, and an IPv4 client arriving on a dual-stack listener maps
+  // to the same backend either way.
+  uint32_t hash = (uint32_t)net_addr_hash(client_addr);
   size_t idx = hash % (uint32_t)lb->backend_count;
 
   size_t initial_idx = idx;

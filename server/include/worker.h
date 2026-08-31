@@ -2,6 +2,7 @@
 #define WORKER_H
 
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -35,7 +36,7 @@ typedef struct
 
 void *worker_thread_function(void *arg);
 int handle_new_connection(worker_thread_t *worker, int client_fd,
-                          struct sockaddr_in client_addr);
+                          struct sockaddr_storage client_addr);
 int handle_client_data(worker_thread_t *worker, connection_t *conn);
 int handle_client_write(worker_thread_t *worker, connection_t *conn);
 

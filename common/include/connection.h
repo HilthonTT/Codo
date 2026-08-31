@@ -2,6 +2,7 @@
 #define CONNECTION_H
 
 #include <netinet/in.h>
+#include <sys/socket.h>
 #include <openssl/ssl.h>
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -27,21 +28,29 @@ typedef enum
 typedef struct connection
 {
   int socket_fd;
-  struct sockaddr_in client_addr;
+  struct sockaddr_storage client_addr; // IPv4 or IPv6; see net_util.h
   connection_state_t state;
 
   // SSL support
   SSL *ssl;
   bool ssl_enabled;
 
-  // Request/response data
-  char read_buffer[BUFFER_SIZE];
-  size_t read_buffer_pos;
-  size_t read_buffer_size;
+  // Request/response data. Both buffers are heap-allocated and sized to what
+  // the connection actually needs, rather than being worst-case arrays inside
+  // every connection_t: a 1 MiB write buffer plus the header tables used to
+  // make this struct 1.3 MB, so 1000 idle keep-alive connections cost 1.3 GB
+  // of almost entirely untouched memory. read_buffer starts at
+  // CONN_READ_BUFFER_MIN and grows on demand up to the server's
+  // max_request_size; write_buffer is allocated only when there is a response
+  // to stage. conn_release_idle() hands both back between requests.
+  char *read_buffer;
+  size_t read_buffer_pos; // bytes currently buffered
+  size_t read_buffer_cap; // bytes allocated
 
-  char write_buffer[MAX_RESPONSE_SIZE];
-  size_t write_buffer_pos;
-  size_t write_buffer_size;
+  char *write_buffer;
+  size_t write_buffer_pos;  // bytes already written to the socket
+  size_t write_buffer_size; // bytes staged for sending
+  size_t write_buffer_cap;  // bytes allocated
 
   http_request_t request;
   http_response_t response;
@@ -52,6 +61,10 @@ typedef struct connection
   // middleware.
   uint64_t auth_user_id;
   char auth_username[64];
+
+  // PROXY protocol: whether the header at the head of this connection has
+  // been consumed yet. Only meaningful when the server trusts the header.
+  bool proxy_header_done;
 
   // Set true while a worker thread has handed this connection off to the
   // storage thread pool to run a blocking handler. While set, the owning
@@ -76,8 +89,6 @@ typedef struct connection
   // sending: the write path tears the connection down after flushing it rather
   // than returning to frame-read mode.
   bool websocket_closing;
-  char websocket_frame_buffer[BUFFER_SIZE];
-  size_t websocket_frame_pos;
 
   // File serving
   int file_fd;
@@ -91,6 +102,28 @@ typedef struct connection
 
 // Forward decl to avoid pulling server.h here (circular).
 struct http_server;
+
+// Initial (and idle) size of the read buffer. A request larger than this grows
+// it on demand; see conn_reserve_read.
+#define CONN_READ_BUFFER_MIN BUFFER_SIZE
+
+// Ensure read_buffer and the request/response header tables exist. Called
+// before a connection is used for I/O; returns false on allocation failure.
+bool conn_ensure_buffers(connection_t *conn);
+
+// Ensure read_buffer can hold `need` bytes, growing geometrically up to `max`.
+// Returns false when `need` exceeds `max` or the allocation fails.
+bool conn_reserve_read(connection_t *conn, size_t need, size_t max);
+
+// Ensure write_buffer can hold `need` bytes (allocating it if absent), up to
+// MAX_RESPONSE_SIZE. Returns false when it cannot.
+bool conn_reserve_write(connection_t *conn, size_t need);
+
+// Release the per-request memory of an idle keep-alive connection: the write
+// buffer and both header tables are freed and the read buffer is shrunk back to
+// CONN_READ_BUFFER_MIN. What remains between requests is the struct plus one
+// small read buffer.
+void conn_release_idle(connection_t *conn);
 
 connection_t *allocate_connection(struct http_server *server);
 void free_connection(struct http_server *server, connection_t *conn);

@@ -10,7 +10,7 @@
 //   pager.c   buffer pool (hash lookup, LRU eviction, pin/lock), page IO,
 //             free-page management, checksums
 //   btree.c   page-level key operations (search, insert, delete within a page)
-//   txn.c     transaction lifecycle (begin/commit/abort, undo log teardown)
+//   txn.c     transaction lifecycle (begin/commit/abort)
 //   db.c      public CRUD/scan API: tree descent on top of the layers above
 
 #include <pthread.h>
@@ -47,7 +47,6 @@ typedef enum
   LOCK_NONE = 0,
   LOCK_SHARED = 1,
   LOCK_EXCLUSIVE = 2,
-  LOCK_UPDATE = 3,
 } lock_type_t;
 
 // Transaction states
@@ -56,7 +55,6 @@ typedef enum
   TXN_STATE_ACTIVE,
   TXN_STATE_COMMITED,
   TXN_STATE_ABORTED,
-  TXN_STATE_PREPARED,
 } transaction_state_t;
 
 // WAL record types
@@ -77,7 +75,8 @@ typedef struct
   page_type_t page_type;
   uint16_t key_count;
   uint16_t free_space;
-  uint32_t parent_page_id;
+  uint32_t reserved0; // was parent_page_id; never maintained. Kept so the
+                      // on-disk page layout is unchanged.
   uint32_t next_page_id;
   uint32_t prev_page_id;
   uint64_t lsn; // Log Sequence Number
@@ -133,14 +132,6 @@ struct transaction
   time_t start_time;
   time_t commit_time;
 
-  // Lock table
-  struct lock_entry *locks;
-  pthread_mutex_t lock_mutex;
-
-  // Undo log
-  struct undo_entry *undo_log;
-  size_t undo_count;
-
   // Statistics
   struct
   {
@@ -153,30 +144,6 @@ struct transaction
 
   struct transaction *next;
 };
-
-// Lock entry
-typedef struct lock_entry
-{
-  uint32_t page_id;
-  uint64_t key_hash;
-  lock_type_t lock_type;
-  transaction_t *owner;
-  struct lock_entry *next_in_txn;
-  struct lock_entry *next_in_table;
-} lock_entry_t;
-
-// Undo log entry
-typedef struct undo_entry
-{
-  wal_record_type_t operation;
-  uint32_t page_id;
-  uint16_t slot_id;
-  uint16_t key_length;
-  uint16_t old_value_length;
-  char *key_data;
-  char *old_value_data;
-  struct undo_entry *next;
-} undo_entry_t;
 
 // WAL record
 typedef struct
@@ -220,11 +187,6 @@ typedef struct
   transaction_t *active_transactions;
   uint64_t next_txn_id;
   pthread_mutex_t txn_mutex;
-
-  // Lock table
-  lock_entry_t **lock_table;
-  size_t lock_table_size;
-  pthread_mutex_t lock_table_mutex;
 
   // WAL management
   uint8_t *wal_buffer;

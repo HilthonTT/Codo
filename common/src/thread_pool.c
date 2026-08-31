@@ -441,50 +441,6 @@ int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argu
     return -1;
 }
 
-// Get thread pool statistics
-void thread_pool_statistics(thread_pool_t *pool)
-{
-    struct timespec current_time;
-    clock_gettime(CLOCK_MONOTONIC, &current_time);
-
-    long uptime_ns = (current_time.tv_sec - pool->start_time.tv_sec) * 1000000000L +
-                     (current_time.tv_nsec - pool->start_time.tv_nsec);
-
-    printf("=== Thread Pool Statistics ===\n");
-    printf("Uptime: %.3f seconds\n", uptime_ns / 1e9);
-    printf("Worker threads: %d\n", pool->num_threads);
-    printf("Tasks submitted: %ld\n", atomic_load(&pool->total_tasks_submitted));
-    printf("Tasks completed: %ld\n", atomic_load(&pool->total_tasks_completed));
-    printf("Tasks pending: %d\n", atomic_load(&pool->task_queue.size));
-
-    long total_tasks_executed = 0;
-    long total_execution_time = 0;
-    long total_idle_time = 0;
-
-    printf("\nPer-worker statistics:\n");
-    for (int i = 0; i < pool->num_threads; i++)
-    {
-        long tasks = atomic_load(&pool->worker_stats[i].tasks_executed);
-        long exec_time = atomic_load(&pool->worker_stats[i].total_execution_time_ns);
-        long idle_time = atomic_load(&pool->worker_stats[i].idle_time_ns);
-
-        total_tasks_executed += tasks;
-        total_execution_time += exec_time;
-        total_idle_time += idle_time;
-
-        printf("  Worker %d: %ld tasks, %.3f ms avg exec, %.1f%% idle\n",
-               i, tasks,
-               tasks > 0 ? (exec_time / 1e6) / tasks : 0,
-               uptime_ns > 0 ? (idle_time * 100.0) / uptime_ns : 0);
-    }
-
-    printf("\nOverall performance:\n");
-    printf("  Total tasks executed: %ld\n", total_tasks_executed);
-    printf("  Average execution time: %.3f ms\n",
-           total_tasks_executed > 0 ? (total_execution_time / 1e6) / total_tasks_executed : 0);
-    printf("  Throughput: %.1f tasks/second\n",
-           uptime_ns > 0 ? (total_tasks_executed * 1e9) / uptime_ns : 0);
-}
 
 // Destroy thraed pool
 void thread_pool_destroy(thread_pool_t *pool)

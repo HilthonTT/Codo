@@ -51,6 +51,7 @@ int main(int argc, char *argv[])
 
   // The JWT stage of the chain needs the secret api_init() loaded, so the
   // middleware is registered after it.
+  g_server.trust_proxy_protocol = config.trust_proxy_protocol;
   register_default_middleware(&g_server, config.cors_allow_origin);
   api_mount(&g_server);
   init_ssl_if_available(&g_server, config.ssl_enabled, config.ssl_cert_file,

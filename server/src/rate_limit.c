@@ -6,22 +6,25 @@
 
 #include "env.h"
 #include "http_protocol.h"
+#include "net_util.h"
 #include "rate_limit.h"
 #include "server.h"
 
 // Per-client token bucket. `tokens` is refilled at `g_rps` tokens/second up to
 // `g_burst`, and one token is spent per request; a request with no token left is
 // rejected. Buckets live in a fixed open-addressing table keyed by the client's
-// IPv4 address. The table never grows: a lookup probes a bounded window and, if
+// address (IPv4 or IPv6; an IPv4-mapped address keys the same as the plain
+// IPv4 one, so a dual-stack listener gives a client one bucket, not two). The table never grows: a lookup probes a bounded window and, if
 // it finds neither the client nor a free slot, evicts the least-recently-seen
 // slot in that window. That keeps every operation O(PROBE_WINDOW) and the memory
 // footprint constant, at the cost of being approximate under heavy IP churn --
 // the right trade for a DoS guard that must stay cheap on the hot path.
 typedef struct
 {
-  uint32_t ip;    // client IPv4 (network byte order); 0 = empty slot
-  double tokens;  // tokens currently available
-  double last;    // monotonic seconds at the last refill
+  struct sockaddr_storage addr; // client address (IPv4 or IPv6)
+  uint64_t hash;                // net_addr_hash(addr), cached for probing
+  double tokens;                // tokens currently available
+  double last;                  // monotonic seconds at the last refill
   bool used;
 } bucket_t;
 
@@ -51,24 +54,12 @@ static double monotonic_seconds(void)
   return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-// Fowler-Noll-Vo hash of the 4 address bytes, so nearby IPs scatter across the
-// table instead of clustering.
-static uint32_t hash_ip(uint32_t ip)
-{
-  uint32_t h = 2166136261u;
-  for (int i = 0; i < 4; i++)
-  {
-    h ^= (ip >> (i * 8)) & 0xff;
-    h *= 16777619u;
-  }
-  return h;
-}
-
 // Find (or allocate) the bucket for `ip`. Caller holds g_lock. Never returns
 // NULL: a full probe window is resolved by evicting its stalest entry.
-static bucket_t *acquire_bucket(uint32_t ip, double now)
+static bucket_t *acquire_bucket(const struct sockaddr_storage *addr, double now)
 {
-  uint32_t base = hash_ip(ip) & (TABLE_SIZE - 1);
+  uint64_t hash = net_addr_hash(addr);
+  uint32_t base = (uint32_t)hash & (TABLE_SIZE - 1);
   bucket_t *lru = NULL;
 
   for (uint32_t i = 0; i < PROBE_WINDOW; i++)
@@ -77,12 +68,15 @@ static bucket_t *acquire_bucket(uint32_t ip, double now)
     if (!b->used)
     {
       b->used = true;
-      b->ip = ip;
+      b->addr = *addr;
+      b->hash = hash;
       b->tokens = g_burst;
       b->last = now;
       return b;
     }
-    if (b->ip == ip)
+    // Compare the hash first (cheap) and confirm on the address bytes, so a
+    // hash collision cannot merge two clients into one bucket.
+    if (b->hash == hash && net_addr_equal(&b->addr, addr))
     {
       return b;
     }
@@ -93,7 +87,8 @@ static bucket_t *acquire_bucket(uint32_t ip, double now)
   }
 
   // Window full and no match: repurpose the stalest slot for this client.
-  lru->ip = ip;
+  lru->addr = *addr;
+  lru->hash = hash;
   lru->tokens = g_burst;
   lru->last = now;
   return lru;
@@ -101,12 +96,12 @@ static bucket_t *acquire_bucket(uint32_t ip, double now)
 
 // Consume one token for `ip`. Returns true if allowed. On rejection, writes the
 // seconds until a token is available to *retry_after.
-static bool allow_request(uint32_t ip, int *retry_after)
+static bool allow_request(const struct sockaddr_storage *addr, int *retry_after)
 {
   double now = monotonic_seconds();
 
   pthread_mutex_lock(&g_lock);
-  bucket_t *b = acquire_bucket(ip, now);
+  bucket_t *b = acquire_bucket(addr, now);
 
   // Refill for the time elapsed since we last saw this client, capped at burst.
   double elapsed = now - b->last;
@@ -178,9 +173,8 @@ int rate_limit_middleware(connection_t *conn, http_request_t *request,
     return middleware_next(conn, request, response, next);
   }
 
-  uint32_t ip = conn->client_addr.sin_addr.s_addr;
   int retry_after = 1;
-  if (!allow_request(ip, &retry_after))
+  if (!allow_request(&conn->client_addr, &retry_after))
   {
     return send_429(conn, request, response, retry_after);
   }

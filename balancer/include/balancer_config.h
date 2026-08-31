@@ -1,6 +1,8 @@
 #ifndef BALANCER_CONFIG_H
 #define BALANCER_CONFIG_H
 
+#include <stdbool.h>
+
 #include "types.h"
 
 // Runtime configuration of the load balancer binary. `backends` points into the
@@ -9,7 +11,9 @@
 typedef struct
 {
   int port;
-  const char *backends; // "host:port[:weight],..." -- see balancer_add_backends
+  const char *backends;
+  // Emit a PROXY protocol v1 header to backends (PROXY_PROTOCOL).
+  bool proxy_protocol; // "host:port[:weight],..." -- see balancer_add_backends
 } balancer_config_t;
 
 // Load the configuration in precedence order: .env file (path from ENV_FILE,

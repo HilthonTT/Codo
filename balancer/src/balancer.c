@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "balancer.h"
+#include "net_util.h"
 
 // Forward declarations for the file-local proxy helpers.
 static void flush_client_to_backend(load_balancer_t *lb, lb_connection_t *conn);
@@ -42,8 +43,8 @@ static void mark_backend_failure(load_balancer_t *lb, backend_t *backend)
         {
             fprintf(stderr,
                     "backend %s:%d marked unhealthy after %d consecutive failures\n",
-                    inet_ntoa(backend->addr.sin_addr),
-                    ntohs(backend->addr.sin_port),
+                    backend->host,
+                    backend->port,
                     backend->consecutive_failures);
         }
         backend->health_status = 0;
@@ -90,11 +91,22 @@ static void send_503(int client_fd)
     }
 }
 
+// Set from PROXY_PROTOCOL at startup; see build_proxy_header.
+static bool g_proxy_protocol = false;
+
+static void build_proxy_header(lb_connection_t *conn);
+
+void lb_set_proxy_protocol(bool enabled)
+{
+    g_proxy_protocol = enabled;
+}
+
 static void update_epoll_interest(load_balancer_t *lb, lb_connection_t *conn)
 {
     uint32_t client_events = 0, backend_events = 0;
 
-    bool c2b_pending = conn->client_buffer_len > conn->client_buffer_sent;
+    bool c2b_pending = conn->client_buffer_len > conn->client_buffer_sent ||
+                       conn->proxy_hdr_len > conn->proxy_hdr_sent;
     bool b2c_pending = conn->backend_buffer_len > conn->backend_buffer_sent;
 
     // only read a fresh chunk from a side once its outbound buffer is drained.
@@ -206,37 +218,18 @@ int load_balancer_init(load_balancer_t *lb, int port)
         return -1;
     }
 
-    lb->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    // Dual-stack listener (IPv6 with V6ONLY off, falling back to IPv4), so the
+    // balancer accepts both families on one socket like the server does.
+    lb->listen_fd = net_listen_any((uint16_t)port, SOMAXCONN);
     if (lb->listen_fd == -1)
     {
-        perror("socket");
+        perror("listen socket");
         return -1;
     }
-
-    int opt = 1;
-    setsockopt(lb->listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     if (set_nonblocking(lb->listen_fd) == -1)
     {
         perror("set_nonblocking");
-        return -1;
-    }
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons((uint16_t)port);
-
-    if (bind(lb->listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == -1)
-    {
-        perror("bind");
-        return -1;
-    }
-
-    if (listen(lb->listen_fd, SOMAXCONN) == -1)
-    {
-        perror("listen");
         return -1;
     }
 
@@ -259,7 +252,8 @@ int load_balancer_init(load_balancer_t *lb, int port)
     return 0;
 }
 
-// Register a backend server (resolved as a dotted-quad IPv4 address).
+// Register a backend server. The host may be an IPv4 literal, an IPv6 literal
+// or a DNS name; net_resolve picks whichever family it resolves to.
 int add_backend(load_balancer_t *lb, const char *host, int port, int weight)
 {
     if (lb->backend_count >= MAX_BACKENDS)
@@ -271,13 +265,13 @@ int add_backend(load_balancer_t *lb, const char *host, int port, int weight)
     backend_t *backend = &lb->backends[lb->backend_count];
     memset(backend, 0, sizeof(*backend));
 
-    backend->addr.sin_family = AF_INET;
-    backend->addr.sin_port = htons((uint16_t)port);
-    if (inet_pton(AF_INET, host, &backend->addr.sin_addr) != 1)
+    if (net_resolve(host, (uint16_t)port, &backend->addr, &backend->addr_len) != 0)
     {
         fprintf(stderr, "invalid backend host: %s\n", host);
         return -1;
     }
+    snprintf(backend->host, sizeof(backend->host), "%s", host);
+    backend->port = port;
 
     backend->weight = weight > 0 ? weight : 1;
     backend->current_weight = 0;
@@ -290,7 +284,7 @@ int add_backend(load_balancer_t *lb, const char *host, int port, int weight)
 // Handle new client connection
 void lb_handle_new_connection(load_balancer_t *lb)
 {
-    struct sockaddr_in client_addr;
+    struct sockaddr_storage client_addr;
     socklen_t client_len = sizeof(client_addr);
     int client_fd, backend_fd;
     backend_t *backend;
@@ -352,6 +346,8 @@ void lb_handle_new_connection(load_balancer_t *lb)
     conn->client_fd = client_fd;
     conn->backend_fd = backend_fd;
     conn->backend = backend;
+    conn->client_addr = client_addr;
+    build_proxy_header(conn);
     clock_gettime(CLOCK_MONOTONIC, &conn->start_time);
 
     // Add to epoll
@@ -370,7 +366,7 @@ void lb_handle_new_connection(load_balancer_t *lb)
     pthread_mutex_unlock(&lb->backend_mutex);
 }
 
-backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_in *client_addr)
+backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_storage *client_addr)
 {
     switch (lb->strategy)
     {
@@ -464,11 +460,79 @@ void lb_handle_connection_error(load_balancer_t *lb, lb_connection_t *conn)
     lb_close_connection(lb, conn);
 }
 
+// PROXY protocol v1 (haproxy). A balancer that only pumps bytes erases the
+// client's address: every request reaches the backend from the balancer's own
+// IP, which collapses per-client rate limiting into one shared bucket and makes
+// every access-log line say the same thing. The v1 header states the real peer
+// once per connection, ahead of any payload -- which is what a byte-pump can
+// honestly do, since injecting an X-Forwarded-For header on every request would
+// mean parsing HTTP framing here.
+//
+// Enabled with PROXY_PROTOCOL=true; the backend must be configured to expect
+// it (TRUST_PROXY_PROTOCOL on the server), because a header from an untrusted
+// peer is a free address spoof.
+static void build_proxy_header(lb_connection_t *conn)
+{
+    if (!g_proxy_protocol)
+    {
+        return;
+    }
+
+    struct sockaddr_storage local;
+    socklen_t local_len = sizeof(local);
+    char src[NET_ADDR_STRLEN];
+    char dst[NET_ADDR_STRLEN];
+    int n = -1;
+
+    int cv = net_addr_version(&conn->client_addr);
+    if (getsockname(conn->client_fd, (struct sockaddr *)&local, &local_len) == 0 &&
+        cv != 0 && net_addr_version(&local) == cv &&
+        net_addr_str(&conn->client_addr, src, sizeof(src)) == 0 &&
+        net_addr_str(&local, dst, sizeof(dst)) == 0)
+    {
+        n = snprintf(conn->proxy_hdr, sizeof(conn->proxy_hdr),
+                     "PROXY TCP%d %s %s %u %u\r\n", cv, src, dst,
+                     (unsigned)net_addr_port(&conn->client_addr),
+                     (unsigned)net_addr_port(&local));
+    }
+
+    // Anything we cannot state accurately is declared UNKNOWN rather than
+    // guessed -- the spec requires the receiver to accept that and fall back to
+    // the transport-level peer.
+    if (n < 0 || (size_t)n >= sizeof(conn->proxy_hdr))
+    {
+        n = snprintf(conn->proxy_hdr, sizeof(conn->proxy_hdr), "PROXY UNKNOWN\r\n");
+    }
+    conn->proxy_hdr_len = (size_t)n;
+    conn->proxy_hdr_sent = 0;
+}
+
 // Push the buffered client->backend bytes to the backend. If the backend blocks
 // we stop reading the client and wait for the backend to become writable; once
 // fully drained we restore normal read interest on both sides.
 static void flush_client_to_backend(load_balancer_t *lb, lb_connection_t *conn)
 {
+    // The PROXY header must be the first bytes on the backend connection, so
+    // it drains before any payload is allowed through.
+    while (conn->proxy_hdr_sent < conn->proxy_hdr_len)
+    {
+        ssize_t n = write(conn->backend_fd, conn->proxy_hdr + conn->proxy_hdr_sent,
+                          conn->proxy_hdr_len - conn->proxy_hdr_sent);
+        if (n > 0)
+        {
+            conn->proxy_hdr_sent += (size_t)n;
+            continue;
+        }
+        if (n == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            update_epoll_interest(lb, conn);
+            return;
+        }
+        mark_backend_failure(lb, conn->backend);
+        lb_close_connection(lb, conn);
+        return;
+    }
+
     while (conn->client_buffer_sent < conn->client_buffer_len)
     {
         ssize_t n = write(conn->backend_fd,
@@ -583,7 +647,7 @@ int set_nonblocking(int fd)
 
 int create_backend_connection(backend_t *backend)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    int fd = socket(backend->addr.ss_family, SOCK_STREAM, 0);
     if (fd == -1)
         return -1;
 
@@ -594,7 +658,8 @@ int create_backend_connection(backend_t *backend)
     }
 
     // Non-blocking connect: EINPROGRESS is expected, not an error
-    if (connect(fd, (struct sockaddr *)&backend->addr, sizeof(backend->addr)) == -1 && errno != EINPROGRESS)
+    if (connect(fd, (struct sockaddr *)&backend->addr, backend->addr_len) == -1 &&
+        errno != EINPROGRESS)
     {
         close(fd);
         return -1;

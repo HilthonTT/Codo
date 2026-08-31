@@ -56,52 +56,6 @@ int perform_checkpoint(void)
   return 0;
 }
 
-void print_storage_statistics(void)
-{
-  printf("\n=== Storage Engine Statistics ===\n");
-
-  printf("Buffer Pool:\n");
-  printf("  Pages read: %lu\n", atomic_load(&g_storage.stats.pages_read));
-  printf("  Pages written: %lu\n", atomic_load(&g_storage.stats.pages_written));
-  printf("  Cache hits: %lu\n", atomic_load(&g_storage.stats.cache_hits));
-  printf("  Cache misses: %lu\n", atomic_load(&g_storage.stats.cache_misses));
-
-  uint64_t total_accesses = atomic_load(&g_storage.stats.cache_hits) +
-                            atomic_load(&g_storage.stats.cache_misses);
-  if (total_accesses > 0)
-  {
-    double hit_ratio = (double)atomic_load(&g_storage.stats.cache_hits) / total_accesses;
-    printf("  Cache hit ratio: %.2f%%\n", hit_ratio * 100.0);
-  }
-
-  printf("\nTransactions:\n");
-  printf("  Committed: %lu\n", atomic_load(&g_storage.stats.transactions_committed));
-  printf("  Aborted: %lu\n", atomic_load(&g_storage.stats.transactions_aborted));
-
-  printf("\nWAL:\n");
-  printf("  Records written: %lu\n", atomic_load(&g_storage.stats.wal_records_written));
-  printf("  Checkpoints: %lu\n", atomic_load(&g_storage.stats.checkpoints_performed));
-  printf("  Next LSN: %lu\n", atomic_load(&g_storage.next_lsn));
-  printf("  Last checkpoint LSN: %lu\n", g_storage.last_checkpoint_lsn);
-
-  printf("\nActive Transactions:\n");
-  pthread_mutex_lock(&g_storage.txn_mutex);
-  transaction_t *txn = g_storage.active_transactions;
-  int count = 0;
-  while (txn)
-  {
-    printf("  TXN %lu: inserts=%lu, updates=%lu, deletes=%lu\n",
-           txn->txn_id, txn->stats.rows_inserted,
-           txn->stats.rows_updated, txn->stats.rows_deleted);
-    txn = txn->next;
-    count++;
-  }
-  printf("  Total active: %d\n", count);
-  pthread_mutex_unlock(&g_storage.txn_mutex);
-
-  printf("=================================\n");
-}
-
 int init_storage_engine(const char *data_file, const char *wal_file)
 {
   memset(&g_storage, 0, sizeof(g_storage));
@@ -172,29 +126,10 @@ int init_storage_engine(const char *data_file, const char *wal_file)
     entry->hash_next = UINT32_MAX;
   }
 
-  // Initialize lock table
-  g_storage.lock_table_size = 10007; // Prime number
-  g_storage.lock_table = calloc(g_storage.lock_table_size, sizeof(lock_entry_t *));
-  if (!g_storage.lock_table)
-  {
-    close(g_storage.data_fd);
-    close(g_storage.wal_fd);
-    free(g_storage.data_filename);
-    free(g_storage.wal_filename);
-    free(g_storage.wal_buffer);
-    free(g_storage.hash_table);
-    for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
-    {
-      pthread_rwlock_destroy(&g_storage.buffer_pool[i].page_lock);
-    }
-    return -1;
-  }
-
   // Initialize mutexes
   pthread_mutex_init(&g_storage.buffer_mutex, NULL);
   pthread_mutex_init(&g_storage.free_page_mutex, NULL);
   pthread_mutex_init(&g_storage.txn_mutex, NULL);
-  pthread_mutex_init(&g_storage.lock_table_mutex, NULL);
   pthread_mutex_init(&g_storage.wal_mutex, NULL);
   pthread_rwlock_init(&g_storage.tree_lock, NULL);
 
@@ -272,7 +207,6 @@ void cleanup_storage_engine(void)
   free(g_storage.wal_buffer);
   free(g_storage.hash_table);
   free(g_storage.free_pages);
-  free(g_storage.lock_table);
 
   // Cleanup buffer pool
   for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)

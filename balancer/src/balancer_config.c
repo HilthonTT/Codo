@@ -22,6 +22,7 @@ int balancer_config_load(balancer_config_t *config, int argc, char *argv[])
   // env_* reads the .env table first and lets the real environment win.
   config->port = env_int("BALANCER_PORT", 8000);
   config->backends = env_str("BALANCER_BACKENDS", "127.0.0.1:8080");
+  config->proxy_protocol = env_bool("PROXY_PROTOCOL", false);
 
   // CLI args override the environment.
   if (argc > 1)

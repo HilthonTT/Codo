@@ -12,6 +12,10 @@
 #include "http_types.h"
 #include "websocket.h"
 
+// Upper bound on the 101 handshake response: four fixed header lines plus a
+// 28-byte base64 accept key, rounded up.
+#define WS_HANDSHAKE_MAX 256
+
 // WebSocket opcodes (RFC 6455 section 5.2).
 #define WS_OP_CONTINUATION 0x0
 #define WS_OP_TEXT 0x1
@@ -93,14 +97,18 @@ int handle_websocket_upgrade(connection_t *conn, http_request_t *request)
   // Stage the 101 response directly: it carries no body and needs the exact
   // Upgrade/Connection/Accept header set, so send_http_response (which always
   // emits Content-Length and a Connection header) is not a good fit here.
-  int n = snprintf(conn->write_buffer, sizeof(conn->write_buffer),
+  if (!conn_reserve_write(conn, WS_HANDSHAKE_MAX))
+  {
+    return -1;
+  }
+  int n = snprintf(conn->write_buffer, conn->write_buffer_cap,
                    "HTTP/1.1 101 Switching Protocols\r\n"
                    "Upgrade: websocket\r\n"
                    "Connection: Upgrade\r\n"
                    "Sec-WebSocket-Accept: %s\r\n"
                    "\r\n",
                    accept_key);
-  if (n < 0 || (size_t)n >= sizeof(conn->write_buffer))
+  if (n < 0 || (size_t)n >= conn->write_buffer_cap)
   {
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handshake too large");
   }
@@ -148,7 +156,7 @@ static int ws_append_frame(connection_t *conn, unsigned char opcode,
     hlen = 10;
   }
 
-  if (conn->write_buffer_size + hlen + len > sizeof(conn->write_buffer))
+  if (!conn_reserve_write(conn, conn->write_buffer_size + hlen + len))
   {
     return -1; // no room; caller stops producing output
   }
@@ -236,7 +244,7 @@ int ws_process_frames(connection_t *conn, bool *should_close)
     }
 
     // A frame whose payload cannot fit in our buffer can never be assembled.
-    if (len > sizeof(conn->read_buffer))
+    if (len > conn->read_buffer_cap)
     {
       ws_append_close(conn, WS_CLOSE_MESSAGE_TOO_BIG);
       *should_close = true;

@@ -680,10 +680,10 @@ int send_http_response(connection_t *conn, http_response_t *response)
   // in-memory response cap.
   size_t body_in_buffer = (streaming_file || no_body) ? 0 : out_body_len;
   size_t total_size = (size_t)header_len + body_in_buffer;
-  if (total_size > MAX_RESPONSE_SIZE)
+  if (!conn_reserve_write(conn, total_size))
   {
     free(gzip_buf);
-    return -1; // Response too large
+    return -1; // Response too large, or out of memory
   }
 
   memcpy(conn->write_buffer, header_buffer, (size_t)header_len);
@@ -1002,7 +1002,9 @@ int parse_http_request(connection_t *conn, http_request_t *request,
   // Hold onto the old body pointer in case we are re-parsing on the same
   // connection; free it after zeroing the struct.
   char *old_body = request->body;
+  http_header_t *headers = request->headers; // heap-allocated; must survive
   memset(request, 0, sizeof(http_request_t));
+  request->headers = headers;
   if (old_body)
   {
     free(old_body);

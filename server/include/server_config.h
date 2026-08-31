@@ -18,6 +18,10 @@ typedef struct
   const char *db_file;
   const char *wal_file;
   const char *cors_allow_origin;
+  // Trust a PROXY protocol v1 header from the peer (TRUST_PROXY_PROTOCOL).
+  // Only enable when the listener is reachable solely by a trusted balancer:
+  // the header lets its sender claim any client address.
+  bool trust_proxy_protocol;
 } server_config_t;
 
 // Load the configuration in precedence order: .env file (path from ENV_FILE,

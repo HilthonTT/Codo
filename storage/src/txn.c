@@ -1,7 +1,12 @@
 // Transaction lifecycle: begin/commit/abort. A transaction is linked into the
-// engine's active list for its whole life; commit and abort release its locks,
-// write the corresponding WAL record and unlink it. The handle itself is owned
-// (and freed) by the caller -- see storage.h.
+// engine's active list for its whole life; commit and abort write the
+// corresponding WAL record and unlink it. The handle itself is owned (and
+// freed) by the caller -- see storage.h.
+//
+// A transaction is a WAL-record boundary and nothing more: there is no lock
+// manager and no undo log, so it neither isolates concurrent readers/writers
+// nor rolls anything back. Isolation comes from the pager's per-page rwlocks
+// plus tree_lock. Both belong with the WAL replay work in engine.c.
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,8 +31,6 @@ transaction_t *begin_transaction(void)
   txn->start_time = time(NULL);
   txn->start_lsn = atomic_load(&g_storage.next_lsn);
 
-  pthread_mutex_init(&txn->lock_mutex, NULL);
-
   // Add to active transactions list
   txn->next = g_storage.active_transactions;
   g_storage.active_transactions = txn;
@@ -41,8 +44,7 @@ transaction_t *begin_transaction(void)
 
 // Unlink txn from the engine's active list. Must be called before the caller
 // free()s the handle, otherwise the global list would hold a dangling pointer
-// (any later traversal, e.g. print_storage_statistics, would be a
-// use-after-free).
+// and any later traversal of it would be a use-after-free.
 static void unlink_transaction(transaction_t *txn)
 {
   pthread_mutex_lock(&g_storage.txn_mutex);
@@ -60,27 +62,12 @@ static void unlink_transaction(transaction_t *txn)
   pthread_mutex_unlock(&g_storage.txn_mutex);
 }
 
-// Free every lock entry held by txn. Caller holds txn->lock_mutex.
-static void release_transaction_locks(transaction_t *txn)
-{
-  lock_entry_t *lock = txn->locks;
-  while (lock)
-  {
-    lock_entry_t *next_lock = lock->next_in_txn;
-    free(lock);
-    lock = next_lock;
-  }
-  txn->locks = NULL;
-}
-
 int commit_transaction(transaction_t *txn)
 {
   if (!txn || txn->state != TXN_STATE_ACTIVE)
   {
     return -1;
   }
-
-  pthread_mutex_lock(&txn->lock_mutex);
 
   // Write commit record to WAL
   if (g_storage.config.enable_wal)
@@ -92,10 +79,6 @@ int commit_transaction(transaction_t *txn)
   txn->state = TXN_STATE_COMMITED;
   txn->commit_time = time(NULL);
   txn->commit_lsn = atomic_load(&g_storage.next_lsn) - 1;
-
-  release_transaction_locks(txn);
-
-  pthread_mutex_unlock(&txn->lock_mutex);
 
   unlink_transaction(txn);
 
@@ -113,34 +96,15 @@ int abort_transaction(transaction_t *txn)
     return -1;
   }
 
-  pthread_mutex_lock(&txn->lock_mutex);
-
-  // Apply undo operations in reverse order
-  undo_entry_t *undo = txn->undo_log;
-  while (undo)
-  {
-    // TODO: Implement undo logic here
-    // This would restore the old values
-
-    undo_entry_t *next_undo = undo->next;
-    free(undo->key_data);
-    free(undo->old_value_data);
-    free(undo);
-    undo = next_undo;
-  }
-  txn->undo_log = NULL;
-
-  // Write abort record to WAL
+  // Write abort record to WAL. Note that aborting does NOT roll back changes
+  // already applied to pages -- there is no undo log to replay. Callers use
+  // abort only to close out a transaction that never wrote.
   if (g_storage.config.enable_wal)
   {
     write_wal_record(txn->txn_id, WAL_ABORT, 0, NULL, 0);
   }
 
   txn->state = TXN_STATE_ABORTED;
-
-  release_transaction_locks(txn);
-
-  pthread_mutex_unlock(&txn->lock_mutex);
 
   unlink_transaction(txn);
 

@@ -4,6 +4,8 @@
 #include <netinet/in.h>
 #include <stdint.h>
 
+#include <stdbool.h>
+
 #include "types.h"
 #include "selection.h"
 
@@ -18,7 +20,11 @@ int load_balancer_main_loop(load_balancer_t *lb);
 // Accept a client, pick a backend and start proxying.
 void lb_handle_new_connection(load_balancer_t *lb);
 
-backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_in *client_addr);
+// Emit a PROXY protocol v1 header to each backend, declaring the real client
+// address. The backend must be configured to trust it.
+void lb_set_proxy_protocol(bool enabled);
+
+backend_t *select_backend(load_balancer_t *lb, const struct sockaddr_storage *client_addr);
 
 // Read-side handlers for each end of a proxied connection.
 void lb_handle_client_data(load_balancer_t *lb, lb_connection_t *conn);

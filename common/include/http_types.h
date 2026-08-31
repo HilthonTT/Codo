@@ -66,7 +66,10 @@ typedef struct
   char uri[2048];
   char version[16];
   char query_string[2048];
-  http_header_t headers[MAX_HEADERS];
+  // MAX_HEADERS slots, heap-allocated per connection and released between
+  // requests (see conn_release_idle). Indexing still yields an http_header_t,
+  // so sizeof(headers[i].value) reads the same as when this was an array.
+  http_header_t *headers;
   int header_count;
   char *body;
   size_t body_length;
@@ -100,12 +103,11 @@ typedef struct
 {
   http_status_t status;
   char version[16];
-  http_header_t headers[MAX_HEADERS];
+  http_header_t *headers; // MAX_HEADERS slots; see http_request_t.headers
   int header_count;
   char *body;
   size_t body_length;
   bool keep_alive;
-  bool chunked_encoding;
   bool gzip_compressed;
   time_t last_modified;
   char etag[64];

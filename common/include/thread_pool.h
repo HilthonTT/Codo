@@ -82,8 +82,6 @@ void *worker_thread(void *arg);
 thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing, int num_priorities);
 // Submit task to thread pool
 int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argument, int priority);
-// Dump pool counters to stdout (debug hook; sole reader of worker_stats)
-void thread_pool_statistics(thread_pool_t *pool);
 // Destroy thread pool
 void thread_pool_destroy(thread_pool_t *pool);
 

@@ -440,109 +440,6 @@ static int db_search_locked(transaction_t *txn, const char *key, size_t key_leng
   return -1; // Key not found
 }
 
-static int db_update_locked(transaction_t *txn, const char *key, size_t key_length, const char *new_value, size_t new_value_length)
-{
-  if (!txn || txn->state != TXN_STATE_ACTIVE)
-  {
-    return -1;
-  }
-
-  uint32_t page_id;
-  btree_page_t *page = descend_to_leaf(key, key_length, LOCK_EXCLUSIVE, &page_id);
-  if (!page)
-  {
-    return -1;
-  }
-
-  // Find key in leaf page
-  int pos = find_key_position(page, key, key_length);
-  kv_pair_t *kv = get_kv_pair(page, pos);
-
-  if (!kv || compare_keys(key, key_length, kv->data, kv->key_length) != 0)
-  {
-    release_page(page_id, LOCK_EXCLUSIVE);
-    return -1; // Key not found
-  }
-
-  // Save old value for undo log
-  char *old_value = malloc(kv->value_length);
-  if (old_value)
-  {
-    memcpy(old_value, kv->data + kv->key_length, kv->value_length);
-
-    undo_entry_t *undo = malloc(sizeof(undo_entry_t));
-    if (undo)
-    {
-      undo->operation = WAL_UPDATE;
-      undo->page_id = page_id;
-      undo->slot_id = pos;
-      undo->key_length = key_length;
-      undo->old_value_length = kv->value_length;
-      undo->key_data = malloc(key_length);
-      undo->old_value_data = old_value;
-
-      if (undo->key_data)
-      {
-        memcpy(undo->key_data, key, key_length);
-      }
-
-      undo->next = txn->undo_log;
-      txn->undo_log = undo;
-      txn->undo_count++;
-    }
-  }
-
-  // Write WAL record
-  if (g_storage.config.enable_wal)
-  {
-    char wal_data[MAX_KEY_SIZE + MAX_VALUE_SIZE * 2 + 16];
-    size_t wal_size = 0;
-
-    memcpy(wal_data + wal_size, &key_length, sizeof(key_length));
-    wal_size += sizeof(key_length);
-
-    uint16_t old_value_length = kv->value_length;
-    memcpy(wal_data + wal_size, &old_value_length, sizeof(old_value_length));
-    wal_size += sizeof(old_value_length);
-
-    memcpy(wal_data + wal_size, &new_value_length, sizeof(new_value_length));
-    wal_size += sizeof(new_value_length);
-
-    // Advance by key_length (the actual key bytes just copied), not by
-    // sizeof(key_length) -- otherwise the value bytes land at the wrong offset.
-    memcpy(wal_data + wal_size, key, key_length);
-    wal_size += key_length;
-
-    memcpy(wal_data + wal_size, kv->data + kv->key_length, old_value_length);
-    wal_size += old_value_length;
-
-    memcpy(wal_data + wal_size, new_value, new_value_length);
-    wal_size += new_value_length;
-
-    write_wal_record(txn->txn_id, WAL_UPDATE, page_id, wal_data, wal_size);
-  }
-
-  // Update the value in place. NOTE: this only supports a same-size update --
-  // variable-length in-place resize (which could need a page-split) is not
-  // implemented. If the new value differs in size we cannot update in place,
-  // so propagate a failure instead of silently dropping the change.
-  if (kv->value_length != new_value_length)
-  {
-    release_page(page_id, LOCK_EXCLUSIVE);
-    return -1;
-  }
-
-  memcpy(kv->data + kv->key_length, new_value, new_value_length);
-  mark_page_dirty(page_id);
-  txn->stats.rows_updated++;
-
-  printf("Updated key in transaction %lu\n", txn->txn_id);
-
-  release_page(page_id, LOCK_EXCLUSIVE);
-
-  return 0;
-}
-
 static int db_delete_locked(transaction_t *txn, const char *key, size_t key_length)
 {
   if (!txn || txn->state != TXN_STATE_ACTIVE)
@@ -698,15 +595,6 @@ int db_search(transaction_t *txn, const char *key, size_t key_length,
 {
   pthread_rwlock_rdlock(&g_storage.tree_lock);
   int rc = db_search_locked(txn, key, key_length, value, value_length);
-  pthread_rwlock_unlock(&g_storage.tree_lock);
-  return rc;
-}
-
-int db_update(transaction_t *txn, const char *key, size_t key_length,
-              const char *new_value, size_t new_value_length)
-{
-  pthread_rwlock_rdlock(&g_storage.tree_lock);
-  int rc = db_update_locked(txn, key, key_length, new_value, new_value_length);
   pthread_rwlock_unlock(&g_storage.tree_lock);
   return rc;
 }

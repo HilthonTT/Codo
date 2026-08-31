@@ -33,6 +33,8 @@ int main(int argc, char *argv[])
     return 1;
   }
 
+  lb_set_proxy_protocol(config.proxy_protocol);
+
   install_signal_handlers();
 
   if (load_balancer_init(&g_lb, config.port) != 0)

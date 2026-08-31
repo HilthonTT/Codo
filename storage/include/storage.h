@@ -14,7 +14,7 @@
 
 #include <stddef.h>
 
-// Hard limits for a single key / value, enforced by db_insert/db_update.
+// Hard limits for a single key / value, enforced by db_insert.
 #define MAX_KEY_SIZE 256
 #define MAX_VALUE_SIZE 1024
 
@@ -40,10 +40,6 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length,
 // *value_length to the stored value's full length.
 int db_search(transaction_t *txn, const char *key, size_t key_length,
               char *value, size_t *value_length);
-// In-place update; only supports a new value of identical length (no
-// page-split / relocation). Callers needing a resize do delete + insert.
-int db_update(transaction_t *txn, const char *key, size_t key_length,
-              const char *new_value, size_t new_value_length);
 int db_delete(transaction_t *txn, const char *key, size_t key_length);
 
 // Iterate every key-value pair in key order. The callback returns non-zero to
@@ -67,7 +63,5 @@ int db_scan_prefix(transaction_t *txn, const char *prefix, size_t prefix_length,
 // Flush the WAL and all dirty pages to disk and record a checkpoint.
 int perform_checkpoint(void);
 
-// Dump buffer-pool / transaction / WAL counters to stdout.
-void print_storage_statistics(void);
 
 #endif

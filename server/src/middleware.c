@@ -8,6 +8,7 @@
 #include "auth.h"
 #include "http_protocol.h"
 #include "metrics.h"
+#include "net_util.h"
 #include "middleware.h"
 #include "rate_limit.h"
 #include "server.h"
@@ -120,11 +121,10 @@ int logging_middleware(connection_t *conn, http_request_t *request,
   double elapsed_ms = (end.tv_sec - start.tv_sec) * 1e3 +
                       (end.tv_nsec - start.tv_nsec) / 1e6;
 
-  char client_ip[INET_ADDRSTRLEN];
-  if (!inet_ntop(AF_INET, &conn->client_addr.sin_addr, client_ip, sizeof(client_ip)))
-  {
-    strcpy(client_ip, "-");
-  }
+  // net_addr_str handles both families and writes "-" if the address is
+  // unusable, so there is no failure path to paper over here.
+  char client_ip[NET_ADDR_STRLEN];
+  net_addr_str(&conn->client_addr, client_ip, sizeof(client_ip));
 
   // Sanitize control bytes in the URI before logging so a crafted request line
   // cannot inject terminal escapes or forge log lines. The URI has no spaces or

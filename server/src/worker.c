@@ -15,12 +15,89 @@
 #include "connection.h"
 #include "http_protocol.h"
 #include "http_types.h"
+#include "net_util.h"
 #include "route.h"
 #include "server.h"
 #include "stats.h"
 #include "thread_pool.h"
 #include "websocket.h"
 #include "worker.h"
+
+// Consume a PROXY protocol v1 header from the head of the read buffer and
+// adopt the client address it declares. Only called when the server is
+// configured to trust the peer (TRUST_PROXY_PROTOCOL) -- otherwise any client
+// could name its own source address and walk past per-IP rate limiting.
+//
+// Returns 1 when a header was consumed, 0 when more bytes are needed, -1 when
+// the connection is unusable (no header, or a malformed one). Trust is
+// all-or-nothing by design: with it on, the header is mandatory, so a direct
+// connection that bypasses the balancer is refused rather than silently
+// treated as anonymous.
+static int consume_proxy_header(connection_t *conn)
+{
+  // v1 headers are at most 107 bytes plus CRLF.
+  const size_t max_len = 108;
+  const char *buf = conn->read_buffer;
+  size_t avail = conn->read_buffer_pos;
+
+  if (avail < 6)
+  {
+    return memcmp(buf, "PROXY ", avail) == 0 ? 0 : -1;
+  }
+  if (memcmp(buf, "PROXY ", 6) != 0)
+  {
+    return -1;
+  }
+
+  const char *nl = memchr(buf, '\n', avail < max_len ? avail : max_len);
+  if (!nl)
+  {
+    return avail >= max_len ? -1 : 0; // still arriving, or over-long
+  }
+  size_t line_len = (size_t)(nl - buf) + 1;
+
+  char line[128];
+  size_t copy = line_len - 1;
+  if (copy > 0 && buf[copy - 1] == '\r')
+  {
+    copy--;
+  }
+  if (copy >= sizeof(line))
+  {
+    return -1;
+  }
+  memcpy(line, buf, copy);
+  line[copy] = '\0';
+
+  // "PROXY UNKNOWN..." is legal and means the sender could not determine the
+  // peer; keep the transport-level address in that case.
+  char proto[8], src[NET_ADDR_STRLEN], dst[NET_ADDR_STRLEN];
+  unsigned sport = 0, dport = 0;
+  if (sscanf(line, "PROXY %7s %45s %45s %u %u", proto, src, dst, &sport, &dport) == 5 &&
+      (strcmp(proto, "TCP4") == 0 || strcmp(proto, "TCP6") == 0) &&
+      sport <= 65535)
+  {
+    struct sockaddr_storage declared;
+    if (net_addr_from_str(src, (uint16_t)sport, &declared) == 0)
+    {
+      conn->client_addr = declared;
+    }
+  }
+  else if (strncmp(line, "PROXY UNKNOWN", 13) != 0)
+  {
+    return -1;
+  }
+
+  // Drop the header so the HTTP parser sees a clean request.
+  size_t leftover = conn->read_buffer_pos - line_len;
+  if (leftover > 0)
+  {
+    memmove(conn->read_buffer, conn->read_buffer + line_len, leftover);
+  }
+  conn->read_buffer_pos = leftover;
+  conn->read_buffer[leftover] = '\0';
+  return 1;
+}
 
 // Payload handed to a storage-pool thread describing one offloaded request.
 typedef struct
@@ -144,7 +221,7 @@ static void drop_connection(worker_thread_t *worker, connection_t *conn)
 }
 
 int handle_new_connection(worker_thread_t *worker, int client_fd,
-                          struct sockaddr_in client_addr)
+                          struct sockaddr_storage client_addr)
 {
   // Allocate connection structure
   connection_t *conn = allocate_connection(&g_server);
@@ -580,7 +657,7 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
 
     for (;;)
     {
-      if (conn->read_buffer_pos >= sizeof(conn->read_buffer) - 1)
+      if (conn->read_buffer_pos >= conn->read_buffer_cap - 1)
       {
         break; // buffer full; decode below frees room (or flags a close)
       }
@@ -590,7 +667,7 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
       {
         bytes_read = SSL_read(conn->ssl,
                               conn->read_buffer + conn->read_buffer_pos,
-                              (int)(sizeof(conn->read_buffer) - conn->read_buffer_pos - 1));
+                              (int)(conn->read_buffer_cap - conn->read_buffer_pos - 1));
         if (bytes_read <= 0)
         {
           int ssl_error = SSL_get_error(conn->ssl, (int)bytes_read);
@@ -606,7 +683,7 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
       {
         bytes_read = read(conn->socket_fd,
                           conn->read_buffer + conn->read_buffer_pos,
-                          sizeof(conn->read_buffer) - conn->read_buffer_pos - 1);
+                          conn->read_buffer_cap - conn->read_buffer_pos - 1);
         if (bytes_read == 0)
         {
           return -1; // peer closed
@@ -644,7 +721,7 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
     // Buffer filled: if decoding could not free any room the pending frame is
     // wedged (ws_process_frames emits a Close in that case), so stop. Otherwise
     // loop back and keep reading the still-readable socket.
-    if (conn->read_buffer_pos >= sizeof(conn->read_buffer) - 1)
+    if (conn->read_buffer_pos >= conn->read_buffer_cap - 1)
     {
       should_close = true;
       break;
@@ -679,6 +756,13 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     return -1;
   }
 
+  // A connection that has just been accepted, or that was stripped back while
+  // idle, gets its read buffer and header tables here.
+  if (!conn_ensure_buffers(conn))
+  {
+    return -1;
+  }
+
   // Once the handshake has switched this connection to WebSocket framing, all
   // further inbound bytes are frames, not HTTP requests.
   if (conn->state == CONN_STATE_WEBSOCKET)
@@ -691,13 +775,21 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   bool buffer_full = false;
   for (;;)
   {
-    if (conn->read_buffer_pos >= sizeof(conn->read_buffer) - 1)
+    if (conn->read_buffer_pos >= conn->read_buffer_cap - 1)
     {
-      // Out of room. That is only an error if no complete request is framed in
-      // what we already have -- a buffer packed with pipelined requests is
-      // perfectly legal, and the leftovers make room as each one is consumed.
-      buffer_full = true;
-      break;
+      // Try to grow first: the read buffer starts small and is allowed to
+      // reach max_request_size, so the configured limit is the real limit
+      // rather than whatever the initial buffer happened to be.
+      if (!conn_reserve_read(conn, conn->read_buffer_cap * 2,
+                             g_server.max_request_size))
+      {
+        // At the configured ceiling. That is only an error if no complete
+        // request is framed in what we already have -- a buffer packed with
+        // pipelined requests is perfectly legal, and the leftovers make room
+        // as each one is consumed.
+        buffer_full = true;
+        break;
+      }
     }
 
     ssize_t bytes_read;
@@ -705,7 +797,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     {
       bytes_read = SSL_read(conn->ssl,
                             conn->read_buffer + conn->read_buffer_pos,
-                            (int)(sizeof(conn->read_buffer) - conn->read_buffer_pos - 1));
+                            (int)(conn->read_buffer_cap - conn->read_buffer_pos - 1));
       if (bytes_read <= 0)
       {
         int ssl_error = SSL_get_error(conn->ssl, (int)bytes_read);
@@ -720,7 +812,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     {
       bytes_read = read(conn->socket_fd,
                         conn->read_buffer + conn->read_buffer_pos,
-                        sizeof(conn->read_buffer) - conn->read_buffer_pos - 1);
+                        conn->read_buffer_cap - conn->read_buffer_pos - 1);
       if (bytes_read == 0)
       {
         // Peer closed.
@@ -745,6 +837,23 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     worker->bytes_received += (uint64_t)bytes_read;
     stats_record_bytes_received((uint64_t)bytes_read);
     conn->last_activity = time(NULL);
+  }
+
+  // A trusted PROXY header precedes the first request on the connection and
+  // replaces the transport-level peer, so it must be consumed before any
+  // framing or routing happens.
+  if (g_server.trust_proxy_protocol && !conn->proxy_header_done)
+  {
+    int pr = consume_proxy_header(conn);
+    if (pr < 0)
+    {
+      return -1; // no usable header from a peer we require one from
+    }
+    if (pr == 0)
+    {
+      return 0; // header still arriving
+    }
+    conn->proxy_header_done = true;
   }
 
   // Wait until the full request -- headers plus any declared body -- has
@@ -1053,8 +1162,21 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     {
       free(conn->response.body);
     }
+    // The header tables are heap-allocated; carry the pointers across the
+    // reset so they are not leaked by the memset.
+    http_header_t *req_headers = conn->request.headers;
+    http_header_t *resp_headers = conn->response.headers;
     memset(&conn->request, 0, sizeof(http_request_t));
     memset(&conn->response, 0, sizeof(http_response_t));
+    conn->request.headers = req_headers;
+    conn->response.headers = resp_headers;
+
+    // Nothing is pending on an idle keep-alive connection, so hand back the
+    // write buffer and header tables until the next request needs them.
+    if (conn->read_buffer_pos == 0)
+    {
+      conn_release_idle(conn);
+    }
 
     // Re-arm for reads.
     struct epoll_event event;

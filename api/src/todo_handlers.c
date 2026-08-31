@@ -664,7 +664,7 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
   }
 
-  // db_update only handles same-length values, so replace via delete+insert.
+  // The engine has no update primitive, so replace via delete+insert.
   char existing[MAX_VALUE_SIZE + 1];
   size_t existing_len = MAX_VALUE_SIZE;
   if (db_search(txn, key, key_len, existing, &existing_len) != 0)
