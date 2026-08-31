@@ -1,8 +1,24 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "env.h"
 #include "server_config.h"
+
+static int is_safe_path_component(const char *value)
+{
+  if (!value || !*value)
+  {
+    return 0;
+  }
+
+  if (strstr(value, "..") || strchr(value, '/') || strchr(value, '\\'))
+  {
+    return 0;
+  }
+
+  return 1;
+}
 
 int server_config_load(server_config_t *config, int argc, char *argv[])
 {
@@ -26,6 +42,18 @@ int server_config_load(server_config_t *config, int argc, char *argv[])
   config->db_file = env_str("DB_FILE", "codo.db");
   config->wal_file = env_str("WAL_FILE", "codo.wal");
   config->cors_allow_origin = env_str("CORS_ALLOW_ORIGIN", "*");
+
+  if (!is_safe_path_component(config->db_file))
+  {
+    fprintf(stderr, "Invalid DB_FILE: %s\n", config->db_file ? config->db_file : "(null)");
+    return -1;
+  }
+
+  if (!is_safe_path_component(config->wal_file))
+  {
+    fprintf(stderr, "Invalid WAL_FILE: %s\n", config->wal_file ? config->wal_file : "(null)");
+    return -1;
+  }
 
   // Command line arguments still override everything.
   if (argc > 1)
