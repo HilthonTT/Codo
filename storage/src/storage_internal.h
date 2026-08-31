@@ -26,6 +26,11 @@
 #define BTREE_ORDER 128
 #define BUFFER_POOL_SIZE 10000
 #define WAL_BUFFER_SIZE (1024 * 1024)
+// Deepest root-to-leaf path a descent or split will follow. A 4 KiB internal
+// page holds at least 15 separators, so a real tree never comes close; the
+// limit is a backstop that turns a corrupt page cycle into an error return
+// instead of an infinite loop.
+#define BTREE_MAX_DEPTH 32
 
 // Page types
 typedef enum
@@ -200,6 +205,17 @@ typedef struct
   size_t hash_table_size;
   pthread_mutex_t buffer_mutex;
 
+  // Free page management. Removed once as dead state, and restored here
+  // because btree_split_node() allocates a page per new node. next_page_id is
+  // recovered from the data file's extent at startup (see init_storage_engine);
+  // the free list is in-memory only, so ids freed before a restart are not
+  // reused after one.
+  uint32_t *free_pages;
+  size_t free_page_count;
+  size_t free_page_capacity;
+  uint32_t next_page_id;
+  pthread_mutex_t free_page_mutex;
+
   // Transaction management
   transaction_t *active_transactions;
   uint64_t next_txn_id;
@@ -219,6 +235,16 @@ typedef struct
 
   // Root page
   uint32_t root_page_id;
+
+  // Guards the *shape* of the tree (which page is a node's parent/child/
+  // sibling), as opposed to the contents of any one page, which the pager's
+  // per-page rwlocks already protect. A split rewires several pages at once,
+  // and a reader descending through that rewiring could follow a pointer that
+  // is briefly stale, so structural writers take this exclusively and everyone
+  // else takes it shared. Coarse but correct; the finer-grained fix is
+  // latch-coupling (crab-latching) the descent, which also retires the
+  // TODO(concurrency) in db.c.
+  pthread_rwlock_t tree_lock;
 
   // Statistics
   struct
@@ -263,6 +289,8 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id);
 btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type);
 void release_page(uint32_t page_id, lock_type_t lock_type);
 void mark_page_dirty(uint32_t page_id);
+uint32_t allocate_page(void);
+void deallocate_page(uint32_t page_id);
 
 // btree.c
 int compare_keys(const char *key1, size_t len1, const char *key2, size_t len2);
@@ -277,5 +305,24 @@ int insert_kv_pair(
     size_t value_length,
     uint32_t child_page_id);
 int delete_kv_pair(btree_page_t *page, int position);
+// Bytes of a page available to kv pairs (the page minus its header).
+size_t btree_page_capacity(void);
+// Bytes currently occupied by `page`'s pairs, or SIZE_MAX if free_space is
+// corrupt.
+size_t btree_used_bytes(btree_page_t *page);
+// Move the upper half of `src`'s entries into the empty page `dst` (which will
+// live at `dst_page_id`) and write the separator key that routes to `src` into
+// sep_out. Pure page surgery -- no engine state is touched, so the caller owns
+// publishing `dst` into the parent. Returns 0 on success, -1 if `src` cannot be
+// split (too few entries, or corrupt).
+int btree_split_page(btree_page_t *src, btree_page_t *dst, uint32_t dst_page_id,
+                     char *sep_out, size_t sep_out_size, size_t *sep_len_out);
+
+// db.c
+// Split `node_id` in two, publishing the new right sibling in its parent (and
+// growing a new root when `node_id` is the root). The caller must hold
+// tree_lock exclusively and hold no page lock. `depth` bounds the recursion
+// when the split cascades upward. Returns 0 on success.
+int btree_split_node(uint32_t node_id, int depth);
 
 #endif

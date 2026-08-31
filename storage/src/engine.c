@@ -192,14 +192,36 @@ int init_storage_engine(const char *data_file, const char *wal_file)
 
   // Initialize mutexes
   pthread_mutex_init(&g_storage.buffer_mutex, NULL);
+  pthread_mutex_init(&g_storage.free_page_mutex, NULL);
   pthread_mutex_init(&g_storage.txn_mutex, NULL);
   pthread_mutex_init(&g_storage.lock_table_mutex, NULL);
   pthread_mutex_init(&g_storage.wal_mutex, NULL);
+  pthread_rwlock_init(&g_storage.tree_lock, NULL);
 
   // Initialize counters
   g_storage.next_txn_id = 1;
   g_storage.next_lsn = 1;
   g_storage.root_page_id = 1;
+
+  // Recover the page allocator from the data file's extent. The allocator is
+  // not persisted anywhere, so without this every restart would start handing
+  // out page 1 again -- the root -- and the first split after a restart would
+  // write a new node straight over live data. Rounding up covers a torn final
+  // page: the id it occupies is treated as taken.
+  //
+  // Pages freed by deallocate_page() before the restart are not recovered and
+  // simply leak; reclaiming them needs the free list on disk, which belongs
+  // with the WAL replay work below.
+  struct stat data_st;
+  uint32_t pages_in_file = 0;
+  if (fstat(g_storage.data_fd, &data_st) == 0 && data_st.st_size > 0)
+  {
+    pages_in_file =
+        (uint32_t)(((uint64_t)data_st.st_size + PAGE_SIZE - 1) / PAGE_SIZE);
+  }
+  g_storage.next_page_id = pages_in_file > g_storage.root_page_id
+                               ? pages_in_file
+                               : g_storage.root_page_id + 1;
 
   // TODO(durability): WAL crash-recovery replay is NOT implemented. On restart
   // we do not scan the WAL to redo committed changes / undo uncommitted ones,
@@ -209,8 +231,7 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   // but full recovery still needs a replay pass here.
 
   // Initialize root page if file is empty
-  struct stat st;
-  if (fstat(g_storage.data_fd, &st) == 0 && st.st_size == 0)
+  if (pages_in_file == 0)
   {
     btree_page_t *root_page = get_page(g_storage.root_page_id, LOCK_EXCLUSIVE);
     if (root_page)
@@ -222,7 +243,8 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   }
 
   printf("Storage engine initialized\n");
-  printf("Data file: %s\n", data_file);
+  printf("Data file: %s (%u page(s), next page id %u)\n", data_file,
+         pages_in_file, g_storage.next_page_id);
   printf("WAL file: %s\n", wal_file);
 
   return 0;
@@ -249,6 +271,7 @@ void cleanup_storage_engine(void)
   free(g_storage.wal_filename);
   free(g_storage.wal_buffer);
   free(g_storage.hash_table);
+  free(g_storage.free_pages);
   free(g_storage.lock_table);
 
   // Cleanup buffer pool
@@ -261,4 +284,6 @@ void cleanup_storage_engine(void)
     }
     pthread_rwlock_destroy(&entry->page_lock);
   }
+
+  pthread_rwlock_destroy(&g_storage.tree_lock);
 }

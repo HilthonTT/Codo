@@ -47,8 +47,8 @@ static int finalize_response(worker_thread_t *worker, connection_t *conn)
   atomic_fetch_add(&g_server.total_requests, 1);
   atomic_fetch_add(&worker->requests_processed, 1);
 
-  conn->read_buffer_pos = 0;
-  conn->read_buffer[0] = '\0';
+  // The read buffer is deliberately left alone: handle_client_data has already
+  // trimmed it to the bytes of the next pipelined request, if any.
   conn->state = CONN_STATE_WRITING_RESPONSE;
 
   struct epoll_event ev;
@@ -76,8 +76,8 @@ static void run_offloaded_handler(void *arg)
   // Account and reset while we still exclusively own the connection.
   atomic_fetch_add(&g_server.total_requests, 1);
   atomic_fetch_add(&worker->requests_processed, 1);
-  conn->read_buffer_pos = 0;
-  conn->read_buffer[0] = '\0';
+  // Leave the read buffer as handle_client_data left it: it may hold the next
+  // pipelined request, which the worker picks up once this response flushes.
   conn->last_activity = time(NULL);
   conn->state = CONN_STATE_WRITING_RESPONSE;
 
@@ -259,6 +259,15 @@ void *worker_thread_function(void *arg)
         }
       }
 
+      // handle_client_data may have handed this connection to the storage pool
+      // (a pipelined request picked up in handle_client_write can do the same),
+      // so re-check before touching it again for the write half of a combined
+      // EPOLLIN|EPOLLOUT event -- the pool owns it until it re-arms.
+      if (atomic_load(&conn->offloaded))
+      {
+        continue;
+      }
+
       if (event.events & EPOLLOUT)
       {
         if (handle_client_write(worker, conn) != 0)
@@ -356,22 +365,30 @@ static int copy_header_value(const char *v, const char *v_end, char *tmp, size_t
 // straggle in over several reads, so this is checked before every dispatch.
 // *expect_100 is set when the headers are complete and carry
 // "Expect: 100-continue" -- on a 0 return the caller should send the interim
-// response so the client releases the body. Returns:
+// response so the client releases the body. On a 1 return *request_len holds
+// the byte length of this request, so the caller knows where the next
+// pipelined one starts. Returns:
 //   1  request fully received
 //   0  incomplete, keep reading
-//  -1  malformed framing (bad Content-Length, bad chunking, or both
-//      Content-Length and Transfer-Encoding present) -> 400
+//  -1  malformed framing (bad Content-Length, bad chunking, both
+//      Content-Length and Transfer-Encoding present, or a NUL in the
+//      headers) -> 400
 //  -2  unsupported (non-chunked) Transfer-Encoding -> 501
 //  -3  body exceeds max_body -> 413
-static int check_request_frame(connection_t *conn, size_t max_body, bool *expect_100)
+static int check_request_frame(connection_t *conn, size_t max_body,
+                               bool *expect_100, size_t *request_len)
 {
   const char *buf = conn->read_buffer;
+  const size_t avail = conn->read_buffer_pos;
 
+  // Scan by length, not with strstr: a NUL byte anywhere in the request would
+  // otherwise hide the header terminator from every later read, leaving the
+  // connection to sit until the keep-alive reaper collects it.
   size_t term_len = 4;
-  const char *hdr_end = strstr(buf, "\r\n\r\n");
+  const char *hdr_end = memmem(buf, avail, "\r\n\r\n", 4);
   if (!hdr_end)
   {
-    hdr_end = strstr(buf, "\n\n");
+    hdr_end = memmem(buf, avail, "\n\n", 2);
     term_len = 2;
   }
   if (!hdr_end)
@@ -380,6 +397,15 @@ static int check_request_frame(connection_t *conn, size_t max_body, bool *expect
   }
 
   size_t header_len = (size_t)(hdr_end - buf) + term_len;
+
+  // A NUL cannot appear in a request line or header field. Rejecting it
+  // outright stops a header from being truncated at the NUL by the
+  // string-based parsing below while a proxy in front read the whole value --
+  // the classic setup for request smuggling.
+  if (memchr(buf, '\0', header_len) != NULL)
+  {
+    return -1;
+  }
 
   // Walk the header lines (request line first, then fields) looking for the
   // framing headers. Non-mutating so a later real parse still sees an intact
@@ -453,8 +479,9 @@ static int check_request_frame(connection_t *conn, size_t max_body, bool *expect
       return -1;
     }
     size_t decoded = 0;
-    int r = http_chunked_decode(buf + header_len,
-                                conn->read_buffer_pos - header_len, NULL, &decoded);
+    size_t chunk_bytes = 0;
+    int r = http_chunked_decode(buf + header_len, avail - header_len, NULL,
+                                &decoded, &chunk_bytes);
     if (r < 0)
     {
       return -1;
@@ -463,6 +490,10 @@ static int check_request_frame(connection_t *conn, size_t max_body, bool *expect
     {
       return -3;
     }
+    if (r == 1 && request_len)
+    {
+      *request_len = header_len + chunk_bytes;
+    }
     return r; // 1 = terminal chunk seen, 0 = still arriving
   }
 
@@ -470,11 +501,15 @@ static int check_request_frame(connection_t *conn, size_t max_body, bool *expect
   {
     return -3;
   }
-  if (header_len + content_length > conn->read_buffer_pos)
+  if (header_len + content_length > avail)
   {
     return 0; // full body not yet received
   }
 
+  if (request_len)
+  {
+    *request_len = header_len + content_length;
+  }
   return 1;
 }
 
@@ -653,17 +688,16 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
 
   // Drain everything currently readable on the socket into the read buffer.
   // We're using edge-triggered epoll, so we must keep reading until EAGAIN.
+  bool buffer_full = false;
   for (;;)
   {
     if (conn->read_buffer_pos >= sizeof(conn->read_buffer) - 1)
     {
-      // Buffer full -- request larger than we can handle.
-      send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
-      struct epoll_event ev;
-      ev.events = EPOLLOUT | EPOLLET;
-      ev.data.ptr = conn;
-      epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev);
-      return 0;
+      // Out of room. That is only an error if no complete request is framed in
+      // what we already have -- a buffer packed with pipelined requests is
+      // perfectly legal, and the leftovers make room as each one is consumed.
+      buffer_full = true;
+      break;
     }
 
     ssize_t bytes_read;
@@ -716,9 +750,20 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   // Wait until the full request -- headers plus any declared body -- has
   // arrived before dispatching. A body can straggle in over several reads.
   bool expect_100 = false;
-  int frame = check_request_frame(conn, g_server.max_request_size, &expect_100);
+  size_t request_len = 0;
+  int frame =
+      check_request_frame(conn, g_server.max_request_size, &expect_100, &request_len);
   if (frame == 0)
   {
+    if (buffer_full)
+    {
+      // Nothing complete and nowhere left to put more: the request genuinely
+      // does not fit.
+      send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
+      conn->read_buffer_pos = 0;
+      conn->read_buffer[0] = '\0';
+      return finalize_response(worker, conn);
+    }
     // Headers complete but the body still in flight: honor Expect:
     // 100-continue (once) so a waiting client releases the body.
     if (expect_100 && !conn->continue_sent && send_100_continue(conn) != 0)
@@ -730,16 +775,24 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   if (frame == -2)
   {
     send_error_response(conn, HTTP_NOT_IMPLEMENTED, "Unsupported Transfer-Encoding");
+    conn->read_buffer_pos = 0;
+    conn->read_buffer[0] = '\0';
     return finalize_response(worker, conn);
   }
   if (frame == -3)
   {
     send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
+    conn->read_buffer_pos = 0;
+    conn->read_buffer[0] = '\0';
     return finalize_response(worker, conn);
   }
   if (frame < 0)
   {
+    // Framing is untrustworthy, so we cannot tell where a following request
+    // would begin; discard everything buffered rather than guess.
     send_error_response(conn, HTTP_BAD_REQUEST, "Bad Request");
+    conn->read_buffer_pos = 0;
+    conn->read_buffer[0] = '\0';
     return finalize_response(worker, conn);
   }
 
@@ -756,7 +809,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
 
   conn->state = CONN_STATE_PROCESSING;
 
-  int parse_result = parse_http_request(conn, &conn->request);
+  int parse_result = parse_http_request(conn, &conn->request, request_len);
   if (parse_result != 0)
   {
     // parse_http_request returns -2 for an internal failure (e.g. body malloc)
@@ -765,8 +818,23 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
         (parse_result == -2) ? HTTP_INTERNAL_SERVER_ERROR : HTTP_BAD_REQUEST;
     send_error_response(conn, status,
                         (parse_result == -2) ? "Internal Server Error" : "Bad Request");
+    conn->read_buffer_pos = 0;
+    conn->read_buffer[0] = '\0';
     return finalize_response(worker, conn);
   }
+
+  // The parse copied everything it needs out of the read buffer, so the bytes
+  // of this request can go now. Whatever follows is the next pipelined request:
+  // slide it to the front and keep it. Discarding it here (as this code used to)
+  // silently dropped the request -- and because epoll is edge-triggered and no
+  // new bytes were coming, the connection then sat idle until it timed out.
+  size_t leftover = conn->read_buffer_pos - request_len;
+  if (leftover > 0)
+  {
+    memmove(conn->read_buffer, conn->read_buffer + request_len, leftover);
+  }
+  conn->read_buffer_pos = leftover;
+  conn->read_buffer[leftover] = '\0';
 
   route_t *route = find_route(&g_server, conn->request.uri, conn->request.method);
 
@@ -969,9 +1037,9 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
 
   if (conn->request.keep_alive && g_server.enable_keepalive)
   {
-    // Reset for next request on this connection.
+    // Reset for next request on this connection. read_buffer_pos is preserved:
+    // it counts the bytes of an already-received pipelined request.
     conn->state = CONN_STATE_READING_REQUEST;
-    conn->read_buffer_pos = 0;
     conn->write_buffer_pos = 0;
     conn->write_buffer_size = 0;
     conn->continue_pos = 0;
@@ -995,6 +1063,16 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &event) < 0)
     {
       return -1;
+    }
+
+    // A pipelined request is already sitting in the buffer. The socket is
+    // edge-triggered and those bytes arrived with the request we just answered,
+    // so no further EPOLLIN will announce them -- dispatch it here instead.
+    // handle_client_data re-arms EPOLLOUT for its response, which drives the
+    // next round; the chain is one call deep, not recursive.
+    if (conn->read_buffer_pos > 0)
+    {
+      return handle_client_data(worker, conn);
     }
   }
   else

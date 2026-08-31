@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include "storage_internal.h"
 
@@ -20,16 +21,18 @@ uint32_t hash_page_id(uint32_t page_id)
 
 uint32_t calculate_checksum(const void *data, size_t length)
 {
-  // Simple CRC32-like checksum
-  uint32_t checksum = 0;
-  const uint8_t *bytes = (const uint8_t *)data;
-
-  for (size_t i = 0; i < length; i++)
-  {
-    checksum = (checksum << 1) ^ bytes[i];
-  }
-
-  return checksum;
+  // Real CRC32 (from zlib, which the build already links for gzip). The
+  // previous hand-rolled "(checksum << 1) ^ byte" shifted every earlier byte
+  // out of a 32-bit accumulator within 32 iterations, so the result of a 4 KiB
+  // page depended only on its last ~32 bytes -- corruption anywhere else
+  // verified clean. Page images are compared byte-for-byte here, so the extra
+  // cost per page load is negligible next to the pread it follows.
+  //
+  // NOTE: this changes the bytes stored in page_header_t.checksum, so a data
+  // file written before this change will fail verification on load. There is
+  // no format version to negotiate against, so such a file must be recreated.
+  uint32_t crc = (uint32_t)crc32(0L, Z_NULL, 0);
+  return (uint32_t)crc32(crc, (const Bytef *)data, (uInt)length);
 }
 
 buffer_entry_t *find_buffer_entry(uint32_t page_id)
@@ -250,7 +253,11 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
 
     if (stored_checksum != 0 && stored_checksum != calculated_checksum)
     {
-      printf("Checksum mismatch for page %u\n", page_id);
+      fprintf(stderr,
+              "storage: checksum mismatch on page %u (stored %08x, computed "
+              "%08x). The page is corrupt, or the data file predates the "
+              "switch to CRC32 -- an older file must be recreated.\n",
+              page_id, stored_checksum, calculated_checksum);
       // The entry was never linked into the hash table, so a corrupt page is
       // simply discarded here (ref_count back to 0) and can never be served
       // from the cache on a later get_page.
@@ -325,4 +332,63 @@ void mark_page_dirty(uint32_t page_id)
       entry->page->header.checksum = calculate_checksum(entry->page, PAGE_SIZE);
     }
   }
+}
+
+// Page allocation. This was removed once as dead code -- correctly, at a time
+// when nothing ever needed a second page because the B-tree could not split.
+// btree_split_node() calls it for every new node, so it is load-bearing again.
+uint32_t allocate_page(void)
+{
+  pthread_mutex_lock(&g_storage.free_page_mutex);
+
+  uint32_t page_id;
+
+  if (g_storage.free_page_count > 0)
+  {
+    // Reuse a free page
+    page_id = g_storage.free_pages[--g_storage.free_page_count];
+  }
+  else if (g_storage.next_page_id < MAX_PAGES)
+  {
+    page_id = g_storage.next_page_id++;
+  }
+  else
+  {
+    // Out of address space. 0 is the failure sentinel (it is also the leaf
+    // chain's terminator, so it is never a real page id).
+    page_id = 0;
+  }
+
+  pthread_mutex_unlock(&g_storage.free_page_mutex);
+
+  return page_id;
+}
+
+void deallocate_page(uint32_t page_id)
+{
+  pthread_mutex_lock(&g_storage.free_page_mutex);
+
+  // Grow free page array if necessary
+  if (g_storage.free_page_count >= g_storage.free_page_capacity)
+  {
+    size_t new_capacity = g_storage.free_page_capacity * 2;
+    if (new_capacity == 0)
+    {
+      new_capacity = 1024;
+    }
+
+    uint32_t *new_array = realloc(g_storage.free_pages, new_capacity * sizeof(uint32_t));
+    if (new_array)
+    {
+      g_storage.free_pages = new_array;
+      g_storage.free_page_capacity = new_capacity;
+    }
+  }
+
+  if (g_storage.free_page_count < g_storage.free_page_capacity)
+  {
+    g_storage.free_pages[g_storage.free_page_count++] = page_id;
+  }
+
+  pthread_mutex_unlock(&g_storage.free_page_mutex);
 }

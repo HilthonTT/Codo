@@ -96,9 +96,23 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
     return send_error_response(conn, HTTP_METHOD_NOT_ALLOWED, "Method not allowed");
   }
 
-  // Check if path is safe
-  if (!is_valid_uri(request->uri))
+  // Percent-decode before anything looks at the path. Skipping this used to
+  // mean a request for "/my%20file.html" was passed to the filesystem with the
+  // "%20" intact and 404'd, so no path containing an escaped character could
+  // ever be served. Decoding first is also the safe order: the traversal check
+  // below then sees "../" whether it arrived literally or as "%2e%2e%2f".
+  // url_decode rejects an encoded NUL, which would otherwise truncate the path
+  // out from under those checks.
+  char *path = url_decode(request->uri);
+  if (!path)
   {
+    return send_error_response(conn, HTTP_BAD_REQUEST, "Malformed request path");
+  }
+
+  // Check if path is safe
+  if (!is_valid_uri(path))
+  {
+    free(path);
     return send_error_response(conn, HTTP_FORBIDDEN, "Access denied");
   }
 
@@ -107,11 +121,12 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
   // A truncated path is treated as not-found rather than silently serving a
   // different (shortened) file.
   char file_path[4096];
-  size_t uri_len = strlen(request->uri);
+  size_t path_len_in = strlen(path);
   const char *suffix =
-      (uri_len > 0 && request->uri[uri_len - 1] == '/') ? "index.html" : "";
+      (path_len_in > 0 && path[path_len_in - 1] == '/') ? "index.html" : "";
   int path_len = snprintf(file_path, sizeof(file_path), "%s%s%s",
-                          g_server.document_root, request->uri, suffix);
+                          g_server.document_root, path, suffix);
+  free(path);
   if (path_len < 0 || (size_t)path_len >= sizeof(file_path))
   {
     return send_error_response(conn, HTTP_NOT_FOUND, "File not found");
@@ -145,6 +160,8 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
     return send_error_response(conn, HTTP_FORBIDDEN, "Access denied");
   }
 
-  // Send file
-  return send_file_response(conn, file_path);
+  // Open the path we actually validated, not the unresolved one: opening
+  // file_path again would re-walk every symlink and could land somewhere else
+  // if one was swapped since realpath() ran.
+  return send_file_response(conn, real_path);
 }

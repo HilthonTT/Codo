@@ -77,7 +77,8 @@ static int hex_digit(char c)
   return -1;
 }
 
-int http_chunked_decode(const char *in, size_t in_len, char *out, size_t *out_len)
+int http_chunked_decode(const char *in, size_t in_len, char *out,
+                        size_t *out_len, size_t *consumed)
 {
   if (!in || !out_len)
   {
@@ -87,6 +88,10 @@ int http_chunked_decode(const char *in, size_t in_len, char *out, size_t *out_le
   size_t pos = 0;
   size_t decoded = 0;
   *out_len = 0;
+  if (consumed)
+  {
+    *consumed = 0;
+  }
 
   for (;;)
   {
@@ -96,6 +101,10 @@ int http_chunked_decode(const char *in, size_t in_len, char *out, size_t *out_le
     if (!nl)
     {
       *out_len = decoded;
+      if (consumed)
+      {
+        *consumed = pos;
+      }
       return 0;
     }
     size_t line_len = (size_t)(nl - (in + pos));
@@ -153,6 +162,10 @@ int http_chunked_decode(const char *in, size_t in_len, char *out, size_t *out_le
         if (tlen == 0)
         {
           *out_len = decoded;
+          if (consumed)
+          {
+            *consumed = pos;
+          }
           return 1;
         }
       }
@@ -978,9 +991,10 @@ int send_file_response(connection_t *conn, const char *file_path)
   return send_http_response(conn, &conn->response);
 }
 
-int parse_http_request(connection_t *conn, http_request_t *request)
+int parse_http_request(connection_t *conn, http_request_t *request,
+                       size_t request_len)
 {
-  if (!conn || !request)
+  if (!conn || !request || request_len > conn->read_buffer_pos)
   {
     return -1;
   }
@@ -994,8 +1008,10 @@ int parse_http_request(connection_t *conn, http_request_t *request)
     free(old_body);
   }
 
+  // Parse only this request's bytes. Anything past request_len belongs to the
+  // next pipelined request and must stay untouched.
   char *buf = conn->read_buffer;
-  char *end = buf + conn->read_buffer_pos;
+  char *end = buf + request_len;
 
   // Parse request line
   char *line_end = memchr(buf, '\n', (size_t)(end - buf));
@@ -1071,7 +1087,7 @@ int parse_http_request(connection_t *conn, http_request_t *request)
             return -2;
           }
           size_t decoded_len = 0;
-          if (http_chunked_decode(p, blen, decoded, &decoded_len) != 1)
+          if (http_chunked_decode(p, blen, decoded, &decoded_len, NULL) != 1)
           {
             free(decoded);
             return -1;
@@ -1081,20 +1097,26 @@ int parse_http_request(connection_t *conn, http_request_t *request)
           request->body_length = decoded_len;
           break;
         }
-        if (request->content_length > 0 && request->content_length < blen)
+        // A body exists only as far as Content-Length declares. Taking every
+        // remaining byte instead would swallow whatever follows -- which, on a
+        // pipelined connection, is the next request.
+        if (blen > request->content_length)
         {
           blen = request->content_length;
         }
-        request->body = malloc(blen + 1);
-        if (!request->body)
+        if (blen > 0)
         {
-          // Signal an internal error so the caller replies 500 rather than
-          // proceeding as if the request carried no body.
-          return -2;
+          request->body = malloc(blen + 1);
+          if (!request->body)
+          {
+            // Signal an internal error so the caller replies 500 rather than
+            // proceeding as if the request carried no body.
+            return -2;
+          }
+          memcpy(request->body, p, blen);
+          request->body[blen] = '\0';
+          request->body_length = blen;
         }
-        memcpy(request->body, p, blen);
-        request->body[blen] = '\0';
-        request->body_length = blen;
       }
       break;
     }
