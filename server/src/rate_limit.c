@@ -153,14 +153,11 @@ static int send_429(connection_t *conn, http_request_t *request,
   response->body_length = response->body ? strlen(response->body) : 0;
   response->keep_alive = request->keep_alive;
 
-  int h = 0;
-  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "Content-Type");
-  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "application/json");
-  h++;
-  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "Retry-After");
-  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "%d", retry_after);
-  h++;
-  response->header_count = h;
+  char retry_after_hdr[16];
+  snprintf(retry_after_hdr, sizeof(retry_after_hdr), "%d", retry_after);
+  response_set_header(response, 0, "Content-Type", "application/json");
+  response_set_header(response, 1, "Retry-After", retry_after_hdr);
+  response->header_count = 2;
 
   return send_http_response(conn, response);
 }

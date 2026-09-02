@@ -28,7 +28,6 @@ int http_parse_content_length(const char *value, size_t *out)
     return -1;
   }
 
-  // Skip leading whitespace.
   while (*value == ' ' || *value == '\t')
   {
     value++;
@@ -489,6 +488,115 @@ static bool response_should_gzip(connection_t *conn, http_response_t *response)
   return content_type_compressible(response) && client_accepts_gzip(&conn->request);
 }
 
+// Build the complete header block for a response into `buf`. Returns its byte
+// length, or -1 when it would not fit or a header field carries CR/LF -- a
+// handler that echoes client data must not be able to split the response.
+static int build_response_headers(http_response_t *response, bool gzipped,
+                                  size_t content_length, bool no_body,
+                                  char *buf, size_t cap)
+{
+  char date_buf[64];
+  format_http_date(time(NULL), date_buf, sizeof(date_buf));
+
+  size_t off = 0;
+  if (buf_appendf(buf, cap, &off,
+                  "%s %d %s\r\n"
+                  "Server: %s\r\n"
+                  "Date: %s\r\n",
+                  response->version[0] ? response->version : "HTTP/1.1",
+                  (int)response->status,
+                  http_status_to_string(response->status),
+                  http_server_name(),
+                  date_buf) != 0)
+  {
+    return -1;
+  }
+
+  // A 304 carries no body by definition; omit Content-Length entirely rather
+  // than advertising a zero-length representation to caches.
+  if (!no_body &&
+      buf_appendf(buf, cap, &off, "Content-Length: %zu\r\n", content_length) != 0)
+  {
+    return -1;
+  }
+
+  if (buf_appendf(buf, cap, &off, "Connection: %s\r\n",
+                  response->keep_alive ? "keep-alive" : "close") != 0)
+  {
+    return -1;
+  }
+
+  // Announce the gzip encoding (and vary on Accept-Encoding so caches key the
+  // compressed and plain representations separately).
+  if (gzipped && buf_appendf(buf, cap, &off,
+                             "Content-Encoding: gzip\r\n"
+                             "Vary: Accept-Encoding\r\n") != 0)
+  {
+    return -1;
+  }
+
+  // Entity validators, set on static-file responses (200/206 and 304 alike).
+  // A gzipped body is a different representation of the entity, so its etag is
+  // weakened -- a strong tag must be byte-exact across encodings.
+  if (response->last_modified != 0)
+  {
+    char lm_date[64];
+    format_http_date(response->last_modified, lm_date, sizeof(lm_date));
+    if (buf_appendf(buf, cap, &off, "Last-Modified: %s\r\n", lm_date) != 0)
+    {
+      return -1;
+    }
+  }
+  if (response->etag[0] && !header_field_has_crlf(response->etag) &&
+      buf_appendf(buf, cap, &off, "ETag: %s%s\r\n", gzipped ? "W/" : "",
+                  response->etag) != 0)
+  {
+    return -1;
+  }
+
+  for (int i = 0; i < response->header_count; i++)
+  {
+    if (header_field_has_crlf(response->headers[i].name) ||
+        header_field_has_crlf(response->headers[i].value))
+    {
+      return -1;
+    }
+    if (buf_appendf(buf, cap, &off, "%s: %s\r\n", response->headers[i].name,
+                    response->headers[i].value) != 0)
+    {
+      return -1;
+    }
+  }
+
+  // Emit the CORS origin header the middleware selected for this response. Kept
+  // here (rather than in each handler) so every response path carries it. The
+  // value is server-controlled config, but guard against CR/LF injection all
+  // the same before writing it into the header block.
+  if (response->cors_origin[0])
+  {
+    if (header_field_has_crlf(response->cors_origin))
+    {
+      return -1;
+    }
+    // "Vary: Origin" is only meaningful when the allowed origin is specific --
+    // for a wildcard the response does not depend on the request's Origin.
+    const char *vary =
+        (strcmp(response->cors_origin, "*") == 0) ? "" : "Vary: Origin\r\n";
+    if (buf_appendf(buf, cap, &off, "Access-Control-Allow-Origin: %s\r\n%s",
+                    response->cors_origin, vary) != 0)
+    {
+      return -1;
+    }
+  }
+
+  if (buf_appendf(buf, cap, &off, "\r\n") != 0)
+  {
+    return -1;
+  }
+
+  return (int)off;
+}
+
 int send_http_response(connection_t *conn, http_response_t *response)
 {
   if (!conn || !response)
@@ -528,8 +636,6 @@ int send_http_response(connection_t *conn, http_response_t *response)
     }
   }
 
-  // A 304 carries no body by definition; omit Content-Length entirely rather
-  // than advertising a zero-length representation to caches.
   bool no_body = (response->status == HTTP_NOT_MODIFIED);
 
   // file_offset is non-zero when a byte range is being served, so the length
@@ -537,142 +643,15 @@ int send_http_response(connection_t *conn, http_response_t *response)
   size_t content_length =
       streaming_file ? conn->file_size - (size_t)conn->file_offset : out_body_len;
 
-  char date_buf[64];
-  format_http_date(time(NULL), date_buf, sizeof(date_buf));
-
-  char content_length_hdr[64] = "";
-  if (!no_body)
-  {
-    snprintf(content_length_hdr, sizeof(content_length_hdr),
-             "Content-Length: %zu\r\n", content_length);
-  }
-
-  // Generate response status line + standard headers in a single format string.
   char header_buffer[MAX_HEADERS_SIZE];
-  int header_len = snprintf(header_buffer, sizeof(header_buffer),
-                            "%s %d %s\r\n"
-                            "Server: %s\r\n"
-                            "Date: %s\r\n"
-                            "%s"
-                            "Connection: %s\r\n",
-                            response->version[0] ? response->version : "HTTP/1.1",
-                            (int)response->status,
-                            http_status_to_string(response->status),
-                            http_server_name(),
-                            date_buf,
-                            content_length_hdr,
-                            response->keep_alive ? "keep-alive" : "close");
-
-  if (header_len < 0 || (size_t)header_len >= sizeof(header_buffer))
+  int header_len =
+      build_response_headers(response, gzipped, content_length, no_body,
+                             header_buffer, sizeof(header_buffer));
+  if (header_len < 0)
   {
     free(gzip_buf);
     return -1;
   }
-
-  // Announce the gzip encoding (and vary on Accept-Encoding so caches key the
-  // compressed and plain representations separately).
-  if (gzipped)
-  {
-    int written = snprintf(header_buffer + header_len,
-                           sizeof(header_buffer) - (size_t)header_len,
-                           "Content-Encoding: gzip\r\n"
-                           "Vary: Accept-Encoding\r\n");
-    if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
-    {
-      free(gzip_buf);
-      return -1;
-    }
-    header_len += written;
-  }
-
-  // Entity validators, set on static-file responses (200/206 and 304 alike).
-  // A gzipped body is a different representation of the entity, so its etag is
-  // weakened -- a strong tag must be byte-exact across encodings.
-  if (response->last_modified != 0 || response->etag[0])
-  {
-    char lm_buf[96] = "";
-    if (response->last_modified != 0)
-    {
-      char lm_date[64];
-      format_http_date(response->last_modified, lm_date, sizeof(lm_date));
-      snprintf(lm_buf, sizeof(lm_buf), "Last-Modified: %s\r\n", lm_date);
-    }
-    char etag_buf[96] = "";
-    if (response->etag[0] && !header_field_has_crlf(response->etag))
-    {
-      snprintf(etag_buf, sizeof(etag_buf), "ETag: %s%s\r\n",
-               gzipped ? "W/" : "", response->etag);
-    }
-    int written = snprintf(header_buffer + header_len,
-                           sizeof(header_buffer) - (size_t)header_len,
-                           "%s%s", lm_buf, etag_buf);
-    if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
-    {
-      free(gzip_buf);
-      return -1;
-    }
-    header_len += written;
-  }
-
-  // Add custom headers
-  for (int i = 0; i < response->header_count; i++)
-  {
-    // Refuse to emit a header whose name or value smuggles CR/LF: a handler
-    // that echoes client data must not be able to split the response.
-    if (header_field_has_crlf(response->headers[i].name) ||
-        header_field_has_crlf(response->headers[i].value))
-    {
-      free(gzip_buf);
-      return -1;
-    }
-    int written = snprintf(header_buffer + header_len,
-                           sizeof(header_buffer) - (size_t)header_len,
-                           "%s: %s\r\n",
-                           response->headers[i].name,
-                           response->headers[i].value);
-    if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
-    {
-      free(gzip_buf);
-      return -1;
-    }
-    header_len += written;
-  }
-
-  // Emit the CORS origin header the middleware selected for this response. Kept
-  // here (rather than in each handler) so every response path carries it. The
-  // value is server-controlled config, but guard against CR/LF injection all
-  // the same before writing it into the header block.
-  if (response->cors_origin[0])
-  {
-    if (header_field_has_crlf(response->cors_origin))
-    {
-      free(gzip_buf);
-      return -1;
-    }
-    // "Vary: Origin" is only meaningful when the allowed origin is specific --
-    // for a wildcard the response does not depend on the request's Origin.
-    const char *vary = (strcmp(response->cors_origin, "*") == 0) ? "" : "Vary: Origin\r\n";
-    int written = snprintf(header_buffer + header_len,
-                           sizeof(header_buffer) - (size_t)header_len,
-                           "Access-Control-Allow-Origin: %s\r\n%s",
-                           response->cors_origin, vary);
-    if (written < 0 || (size_t)(header_len + written) >= sizeof(header_buffer))
-    {
-      free(gzip_buf);
-      return -1;
-    }
-    header_len += written;
-  }
-
-  // End headers
-  int end_written = snprintf(header_buffer + header_len,
-                             sizeof(header_buffer) - (size_t)header_len, "\r\n");
-  if (end_written < 0 || (size_t)(header_len + end_written) >= sizeof(header_buffer))
-  {
-    free(gzip_buf);
-    return -1;
-  }
-  header_len += end_written;
 
   // Copy headers (and, unless a file is being streamed, the body) to the write
   // buffer. For a streamed file only the headers are staged here; the body bytes
@@ -699,6 +678,23 @@ int send_http_response(connection_t *conn, http_response_t *response)
   return 0;
 }
 
+void response_set_header(http_response_t *response, int slot, const char *name,
+                         const char *value)
+{
+  snprintf(response->headers[slot].name, sizeof(response->headers[slot].name), "%s",
+           name);
+  snprintf(response->headers[slot].value, sizeof(response->headers[slot].value), "%s",
+           value);
+}
+
+// Release any body a previous (possibly partially-built) response left behind.
+static void response_clear_body(http_response_t *response)
+{
+  free(response->body);
+  response->body = NULL;
+  response->body_length = 0;
+}
+
 int send_error_response(connection_t *conn, http_status_t status, const char *message)
 {
   if (!conn)
@@ -714,11 +710,7 @@ int send_error_response(connection_t *conn, http_status_t status, const char *me
            status, http_status_to_string(status),
            message ? message : "");
 
-  if (conn->response.body)
-  {
-    free(conn->response.body);
-    conn->response.body = NULL;
-  }
+  response_clear_body(&conn->response);
 
   conn->response.status = status;
   strcpy(conn->response.version, "HTTP/1.1");
@@ -730,12 +722,89 @@ int send_error_response(connection_t *conn, http_status_t status, const char *me
   conn->response.etag[0] = '\0';
   conn->response.last_modified = 0;
 
-  // Add HTML content type header
-  strcpy(conn->response.headers[0].name, "Content-Type");
-  strcpy(conn->response.headers[0].value, "text/html");
+  response_set_header(&conn->response, 0, "Content-Type", "text/html");
   conn->response.header_count = 1;
 
   return send_http_response(conn, &conn->response);
+}
+
+int send_body_response(connection_t *conn, http_request_t *request,
+                       http_response_t *response, http_status_t status,
+                       const char *content_type, const char *body,
+                       size_t body_length)
+{
+  if (!conn || !request || !response)
+  {
+    return -1;
+  }
+
+  char *copy = malloc(body_length + 1);
+  if (!copy)
+  {
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
+  }
+  if (body_length > 0)
+  {
+    memcpy(copy, body, body_length);
+  }
+  copy[body_length] = '\0';
+
+  response_clear_body(response);
+  response->body = copy;
+  response->body_length = body_length;
+
+  response->status = status;
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
+  response->keep_alive = request->keep_alive;
+
+  response_set_header(response, 0, "Content-Type", content_type);
+  response->header_count = 1;
+
+  return send_http_response(conn, response);
+}
+
+int send_json_response(connection_t *conn, http_request_t *request,
+                       http_response_t *response, http_status_t status,
+                       const char *json)
+{
+  const char *body = json ? json : "";
+  return send_body_response(conn, request, response, status, "application/json", body,
+                            strlen(body));
+}
+
+int send_error_json(connection_t *conn, http_request_t *request,
+                    http_response_t *response, http_status_t status, const char *msg)
+{
+  if (!conn || !request || !response)
+  {
+    return -1;
+  }
+
+  char body[192];
+  snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg ? msg : "");
+
+  // Built here rather than via send_body_response, which stages and sends in
+  // one step and so leaves no room for the 401 challenge below.
+  response_clear_body(response);
+  response->body = strdup(body);
+  response->body_length = response->body ? strlen(response->body) : 0;
+
+  response->status = status;
+  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
+  response->keep_alive = request->keep_alive;
+
+  response_set_header(response, 0, "Content-Type", "application/json");
+  response->header_count = 1;
+
+  // A 401 must name the scheme the client should retry with.
+  if (status == HTTP_UNAUTHORIZED)
+  {
+    response_set_header(response, 1, "WWW-Authenticate",
+                        "Bearer realm=\"codo\", charset=\"UTF-8\"");
+    response->header_count = 2;
+  }
+
+  return send_http_response(conn, response);
 }
 
 // 416 with the "Content-Range: bytes */<size>" the client needs to learn the
@@ -748,10 +817,7 @@ static int send_range_not_satisfiable(connection_t *conn, off_t size)
            "<html><head><title>416 Range Not Satisfiable</title></head>"
            "<body><h1>416 Range Not Satisfiable</h1></body></html>");
 
-  if (conn->response.body)
-  {
-    free(conn->response.body);
-  }
+  response_clear_body(&conn->response);
 
   conn->response.status = HTTP_RANGE_NOT_SATISFIABLE;
   strcpy(conn->response.version, "HTTP/1.1");
@@ -761,12 +827,136 @@ static int send_range_not_satisfiable(connection_t *conn, off_t size)
   conn->response.etag[0] = '\0';
   conn->response.last_modified = 0;
 
-  strcpy(conn->response.headers[0].name, "Content-Type");
-  strcpy(conn->response.headers[0].value, "text/html");
-  strcpy(conn->response.headers[1].name, "Content-Range");
-  snprintf(conn->response.headers[1].value, sizeof(conn->response.headers[1].value),
-           "bytes */%lld", (long long)size);
+  char content_range[96];
+  snprintf(content_range, sizeof(content_range), "bytes */%lld", (long long)size);
+  response_set_header(&conn->response, 0, "Content-Type", "text/html");
+  response_set_header(&conn->response, 1, "Content-Range", content_range);
   conn->response.header_count = 2;
+
+  return send_http_response(conn, &conn->response);
+}
+
+// Fill the entity metadata and the headers every file response carries:
+// Content-Type, Accept-Ranges, and Content-Range when a byte range is served.
+static void set_file_response_headers(connection_t *conn, const char *mime,
+                                      const char *etag, const struct stat *st,
+                                      bool partial, off_t body_start, off_t body_end)
+{
+  conn->response.status = partial ? HTTP_PARTIAL_CONTENT : HTTP_OK;
+  strcpy(conn->response.version, "HTTP/1.1");
+  conn->response.keep_alive = conn->request.keep_alive;
+  conn->response.last_modified = st->st_mtime;
+  snprintf(conn->response.etag, sizeof(conn->response.etag), "%s", etag);
+
+  response_set_header(&conn->response, 0, "Content-Type", mime);
+  response_set_header(&conn->response, 1, "Accept-Ranges", "bytes");
+  conn->response.header_count = 2;
+
+  if (partial)
+  {
+    char range[96];
+    snprintf(range, sizeof(range), "bytes %lld-%lld/%lld", (long long)body_start,
+             (long long)body_end, (long long)st->st_size);
+    response_set_header(&conn->response, 2, "Content-Range", range);
+    conn->response.header_count = 3;
+  }
+}
+
+// The client's cached copy is still current: answer 304 with the validators
+// and no body at all.
+static int send_not_modified(connection_t *conn, const char *etag, time_t mtime)
+{
+  response_clear_body(&conn->response);
+  conn->response.status = HTTP_NOT_MODIFIED;
+  strcpy(conn->response.version, "HTTP/1.1");
+  conn->response.body_length = 0;
+  conn->response.keep_alive = conn->request.keep_alive;
+  conn->response.last_modified = mtime;
+  snprintf(conn->response.etag, sizeof(conn->response.etag), "%s", etag);
+  conn->response.header_count = 0;
+  return send_http_response(conn, &conn->response);
+}
+
+// Zero-copy path: hand the open fd to the connection so the write path can
+// sendfile(2) the body straight to the socket. Takes ownership of fd. The
+// [offset, size) window is the requested range (the whole file when no range
+// applies), so the sendfile loop and Content-Length need no range-awareness of
+// their own.
+static int send_file_streamed(connection_t *conn, int fd, const char *mime,
+                              const char *etag, const struct stat *st, bool partial,
+                              off_t body_start, off_t body_end)
+{
+  response_clear_body(&conn->response);
+
+  conn->file_fd = fd;
+  conn->file_offset = body_start;
+  conn->file_size = (size_t)(body_end + 1);
+
+  set_file_response_headers(conn, mime, etag, st, partial, body_start, body_end);
+
+  // send_http_response sees conn->file_fd >= 0 and stages only the headers
+  // (Content-Length = file_size); handle_client_write sendfile()s the body.
+  if (send_http_response(conn, &conn->response) != 0)
+  {
+    close(conn->file_fd);
+    conn->file_fd = -1;
+    conn->file_size = 0;
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Response too large");
+  }
+  return 0;
+}
+
+// Read exactly len bytes of fd starting at `start` into buf. Returns 0 on
+// success, -1 on a read error, and 1 on a short read (the file shrank).
+static int read_file_window(int fd, off_t start, char *buf, size_t len)
+{
+  size_t total = 0;
+  while (total < len)
+  {
+    ssize_t n = pread(fd, buf + total, len - total, start + (off_t)total);
+    if (n < 0)
+    {
+      if (errno == EINTR)
+      {
+        continue;
+      }
+      return -1;
+    }
+    if (n == 0)
+    {
+      return 1;
+    }
+    total += (size_t)n;
+  }
+  return 0;
+}
+
+// Buffered path: read the window into memory so it can be gzipped (and because
+// TLS cannot take a raw fd). Takes ownership of fd.
+static int send_file_buffered(connection_t *conn, int fd, const char *mime,
+                              const char *etag, const struct stat *st, bool partial,
+                              off_t body_start, off_t body_end, size_t body_len)
+{
+  char *body = malloc(body_len > 0 ? body_len : 1);
+  if (!body)
+  {
+    close(fd);
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
+  }
+
+  int rc = read_file_window(fd, body_start, body, body_len);
+  close(fd);
+  if (rc != 0)
+  {
+    free(body);
+    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR,
+                               rc < 0 ? "Read error" : "Short read");
+  }
+
+  free(conn->response.body);
+  conn->response.body = body;
+  conn->response.body_length = body_len;
+  set_file_response_headers(conn, mime, etag, st, partial, body_start, body_end);
 
   return send_http_response(conn, &conn->response);
 }
@@ -808,24 +998,10 @@ int send_file_response(connection_t *conn, const char *file_path)
 
   bool is_get = (conn->request.method == HTTP_GET);
 
-  // Conditional GET: a matching validator means the client's cached copy is
-  // current -- answer 304 with the validators and no body.
   if (is_get && request_not_modified(&conn->request, etag, st.st_mtime))
   {
     close(fd);
-    if (conn->response.body)
-    {
-      free(conn->response.body);
-      conn->response.body = NULL;
-    }
-    conn->response.status = HTTP_NOT_MODIFIED;
-    strcpy(conn->response.version, "HTTP/1.1");
-    conn->response.body_length = 0;
-    conn->response.keep_alive = conn->request.keep_alive;
-    conn->response.last_modified = st.st_mtime;
-    snprintf(conn->response.etag, sizeof(conn->response.etag), "%s", etag);
-    conn->response.header_count = 0;
-    return send_http_response(conn, &conn->response);
+    return send_not_modified(conn, etag, st.st_mtime);
   }
 
   // Byte range: applies only when the If-Range validator (if any) still
@@ -862,58 +1038,10 @@ int send_file_response(connection_t *conn, const char *file_path)
   // Plaintext connections stream the file straight from the fd to the socket
   // with sendfile(2): zero-copy, and no in-memory size cap. TLS connections
   // can't hand a raw fd to the OpenSSL layer, and a response we intend to gzip
-  // must be buffered first, so both fall through to the read path below.
+  // must be buffered first, so both take the buffered path below.
   if (!conn->ssl_enabled && !want_gzip)
   {
-    if (conn->response.body)
-    {
-      free(conn->response.body);
-      conn->response.body = NULL;
-    }
-
-    // Hand the open fd to the connection; the write path streams it and closes
-    // it when done (cleanup_connection also closes it if the connection dies).
-    // The [offset, size) window is the requested range (the whole file when no
-    // range applies), so the sendfile loop and Content-Length need no
-    // range-awareness of their own.
-    conn->file_fd = fd;
-    conn->file_offset = body_start;
-    conn->file_size = (size_t)(body_end + 1);
-
-    conn->response.status = partial ? HTTP_PARTIAL_CONTENT : HTTP_OK;
-    strcpy(conn->response.version, "HTTP/1.1");
-    conn->response.body = NULL;
-    conn->response.body_length = 0;
-    conn->response.keep_alive = conn->request.keep_alive;
-    conn->response.last_modified = st.st_mtime;
-    snprintf(conn->response.etag, sizeof(conn->response.etag), "%s", etag);
-
-    strcpy(conn->response.headers[0].name, "Content-Type");
-    strncpy(conn->response.headers[0].value, mime,
-            sizeof(conn->response.headers[0].value) - 1);
-    conn->response.headers[0].value[sizeof(conn->response.headers[0].value) - 1] = '\0';
-    strcpy(conn->response.headers[1].name, "Accept-Ranges");
-    strcpy(conn->response.headers[1].value, "bytes");
-    conn->response.header_count = 2;
-    if (partial)
-    {
-      strcpy(conn->response.headers[2].name, "Content-Range");
-      snprintf(conn->response.headers[2].value,
-               sizeof(conn->response.headers[2].value), "bytes %lld-%lld/%lld",
-               (long long)body_start, (long long)body_end, (long long)st.st_size);
-      conn->response.header_count = 3;
-    }
-
-    // send_http_response sees conn->file_fd >= 0 and stages only the headers
-    // (Content-Length = file_size); handle_client_write sendfile()s the body.
-    if (send_http_response(conn, &conn->response) != 0)
-    {
-      close(conn->file_fd);
-      conn->file_fd = -1;
-      conn->file_size = 0;
-      return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Response too large");
-    }
-    return 0;
+    return send_file_streamed(conn, fd, mime, etag, &st, partial, body_start, body_end);
   }
 
   // Bound the buffered window (whole file, or the requested range of it) to
@@ -924,75 +1052,196 @@ int send_file_response(connection_t *conn, const char *file_path)
     return send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "File too large");
   }
 
-  char *body = malloc(body_len > 0 ? body_len : 1);
-  if (!body)
-  {
-    close(fd);
-    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
-  }
-
-  size_t total = 0;
-  while (total < body_len)
-  {
-    ssize_t n = pread(fd, body + total, body_len - total, body_start + (off_t)total);
-    if (n < 0)
-    {
-      if (errno == EINTR)
-      {
-        continue;
-      }
-      free(body);
-      close(fd);
-      return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Read error");
-    }
-    if (n == 0)
-    {
-      break;
-    }
-    total += (size_t)n;
-  }
-  close(fd);
-
-  if (total < body_len)
-  {
-    free(body);
-    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Short read");
-  }
-
-  // Replace any previously assigned response body.
-  if (conn->response.body)
-  {
-    free(conn->response.body);
-  }
-
-  conn->response.status = partial ? HTTP_PARTIAL_CONTENT : HTTP_OK;
-  strcpy(conn->response.version, "HTTP/1.1");
-  conn->response.body = body;
-  conn->response.body_length = body_len;
-  conn->response.keep_alive = conn->request.keep_alive;
-  conn->response.last_modified = st.st_mtime;
-  snprintf(conn->response.etag, sizeof(conn->response.etag), "%s", etag);
-
-  strcpy(conn->response.headers[0].name, "Content-Type");
-  strncpy(conn->response.headers[0].value, mime, sizeof(conn->response.headers[0].value) - 1);
-  conn->response.headers[0].value[sizeof(conn->response.headers[0].value) - 1] = '\0';
-  strcpy(conn->response.headers[1].name, "Accept-Ranges");
-  strcpy(conn->response.headers[1].value, "bytes");
-  conn->response.header_count = 2;
-  if (partial)
-  {
-    strcpy(conn->response.headers[2].name, "Content-Range");
-    snprintf(conn->response.headers[2].value,
-             sizeof(conn->response.headers[2].value), "bytes %lld-%lld/%lld",
-             (long long)body_start, (long long)body_end, (long long)st.st_size);
-    conn->response.header_count = 3;
-  }
-
-  return send_http_response(conn, &conn->response);
+  return send_file_buffered(conn, fd, mime, etag, &st, partial, body_start, body_end,
+                            body_len);
 }
 
-int parse_http_request(connection_t *conn, http_request_t *request,
-                       size_t request_len)
+// Consume the next CRLF- (or bare LF-) terminated line from [*cursor, end),
+// NUL-terminating it in place and advancing *cursor past it. Returns the line,
+// or NULL when no terminator is left in the window.
+static char *next_line(char **cursor, char *end)
+{
+  char *start = *cursor;
+  char *nl = memchr(start, '\n', (size_t)(end - start));
+  if (!nl)
+  {
+    return NULL;
+  }
+  *nl = '\0';
+  if (nl > start && *(nl - 1) == '\r')
+  {
+    *(nl - 1) = '\0';
+  }
+  *cursor = nl + 1;
+  return start;
+}
+
+// "METHOD /uri HTTP/x.y": splits off any query string and sets the version's
+// default keep-alive policy. Returns 0, or -1 on a malformed line.
+static int parse_request_line(char *line, http_request_t *request)
+{
+  char method_str[16];
+  if (sscanf(line, "%15s %2047s %15s", method_str, request->uri, request->version) != 3)
+  {
+    return -1;
+  }
+  request->method = string_to_http_method(method_str);
+
+  char *query_start = strchr(request->uri, '?');
+  if (query_start)
+  {
+    *query_start = '\0';
+    snprintf(request->query_string, sizeof(request->query_string), "%s", query_start + 1);
+  }
+
+  // Default keep-alive on HTTP/1.1, off on HTTP/1.0. Either side may override
+  // via an explicit Connection header.
+  request->keep_alive = (strcmp(request->version, "HTTP/1.1") == 0);
+  return 0;
+}
+
+// Record one header in the request's table and apply whatever protocol meaning
+// it carries. Returns 0, or -1 when the field makes the message unparseable.
+static int store_header_field(http_request_t *request, const char *name, char *value,
+                              bool *saw_content_length)
+{
+  if (request->header_count < MAX_HEADERS)
+  {
+    http_header_t *slot = &request->headers[request->header_count];
+    snprintf(slot->name, sizeof(slot->name), "%s", name);
+    snprintf(slot->value, sizeof(slot->value), "%s", value);
+    // Drop any embedded CR/LF so stored fields can't smuggle control bytes.
+    strip_crlf_inplace(slot->name);
+    strip_crlf_inplace(slot->value);
+    request->header_count++;
+  }
+
+  if (strcasecmp(name, "Connection") == 0)
+  {
+    // Connection is a comma-separated token list; match keep-alive/upgrade/
+    // close as tokens (case-insensitive) so "keep-alive, Upgrade" is not
+    // mistaken for a close. An explicit "close" token wins.
+    if (strcasestr(value, "close"))
+    {
+      request->keep_alive = false;
+    }
+    else if (strcasestr(value, "keep-alive") || strcasestr(value, "upgrade"))
+    {
+      request->keep_alive = true;
+    }
+  }
+  else if (strcasecmp(name, "Content-Length") == 0)
+  {
+    if (http_parse_content_length(value, &request->content_length) != 0)
+    {
+      return -1;
+    }
+    *saw_content_length = true;
+  }
+  else if (strcasecmp(name, "Transfer-Encoding") == 0)
+  {
+    // Only chunked is understood. Any other coding is rejected rather than
+    // risking a mis-framed message body (the worker answers those with 501
+    // before parsing ever runs).
+    size_t vlen = strlen(value);
+    while (vlen > 0 && (value[vlen - 1] == ' ' || value[vlen - 1] == '\t'))
+    {
+      vlen--;
+    }
+    if (vlen != 7 || strncasecmp(value, "chunked", 7) != 0)
+    {
+      return -1;
+    }
+    request->chunked = true;
+  }
+  else if (strcasecmp(name, "If-None-Match") == 0)
+  {
+    snprintf(request->if_none_match, sizeof(request->if_none_match), "%s", value);
+  }
+  else if (strcasecmp(name, "If-Modified-Since") == 0)
+  {
+    time_t t = parse_http_date(value);
+    request->if_modified_since = (t == (time_t)-1) ? 0 : t;
+  }
+  else if (strcasecmp(name, "If-Range") == 0)
+  {
+    snprintf(request->if_range, sizeof(request->if_range), "%s", value);
+  }
+  else if (strcasecmp(name, "Range") == 0)
+  {
+    parse_range_header(value, request);
+  }
+  else if (strcasecmp(name, "Expect") == 0)
+  {
+    request->expect_continue = (strcasecmp(value, "100-continue") == 0);
+  }
+  else if (strcasecmp(name, "Upgrade") == 0)
+  {
+    request->is_websocket_upgrade = (strcasecmp(value, "websocket") == 0);
+  }
+  else if (strcasecmp(name, "Sec-WebSocket-Key") == 0)
+  {
+    snprintf(request->websocket_key, sizeof(request->websocket_key), "%s", value);
+  }
+  else if (strcasecmp(name, "Sec-WebSocket-Protocol") == 0)
+  {
+    snprintf(request->websocket_protocol, sizeof(request->websocket_protocol), "%s",
+             value);
+  }
+
+  return 0;
+}
+
+// Take the message body from [body, body + len). Returns 0 on success, -1 on
+// malformed chunking, and -2 on an allocation failure -- the caller answers
+// 500 rather than proceeding as if the request carried no body.
+static int parse_request_body(http_request_t *request, const char *body, size_t len)
+{
+  if (request->chunked)
+  {
+    // Decoded data is always a subset of the encoded input, so len bounds the
+    // output. The worker already validated completeness.
+    char *decoded = malloc(len + 1);
+    if (!decoded)
+    {
+      return -2;
+    }
+    size_t decoded_len = 0;
+    if (http_chunked_decode(body, len, decoded, &decoded_len, NULL) != 1)
+    {
+      free(decoded);
+      return -1;
+    }
+    decoded[decoded_len] = '\0';
+    request->body = decoded;
+    request->body_length = decoded_len;
+    return 0;
+  }
+
+  // A body exists only as far as Content-Length declares. Taking every
+  // remaining byte instead would swallow whatever follows -- which, on a
+  // pipelined connection, is the next request.
+  if (len > request->content_length)
+  {
+    len = request->content_length;
+  }
+  if (len == 0)
+  {
+    return 0;
+  }
+
+  request->body = malloc(len + 1);
+  if (!request->body)
+  {
+    return -2;
+  }
+  memcpy(request->body, body, len);
+  request->body[len] = '\0';
+  request->body_length = len;
+  return 0;
+}
+
+int parse_http_request(connection_t *conn, http_request_t *request, size_t request_len)
 {
   if (!conn || !request || request_len > conn->read_buffer_pos)
   {
@@ -1005,231 +1254,53 @@ int parse_http_request(connection_t *conn, http_request_t *request,
   http_header_t *headers = request->headers; // heap-allocated; must survive
   memset(request, 0, sizeof(http_request_t));
   request->headers = headers;
-  if (old_body)
-  {
-    free(old_body);
-  }
+  free(old_body);
 
   // Parse only this request's bytes. Anything past request_len belongs to the
   // next pipelined request and must stay untouched.
-  char *buf = conn->read_buffer;
-  char *end = buf + request_len;
+  char *cursor = conn->read_buffer;
+  char *end = cursor + request_len;
 
-  // Parse request line
-  char *line_end = memchr(buf, '\n', (size_t)(end - buf));
-  if (!line_end)
-  {
-    return -1;
-  }
-  *line_end = '\0';
-  if (line_end > buf && *(line_end - 1) == '\r')
-  {
-    *(line_end - 1) = '\0';
-  }
-
-  char method_str[16];
-  if (sscanf(buf, "%15s %2047s %15s", method_str, request->uri, request->version) != 3)
+  char *line = next_line(&cursor, end);
+  if (!line || parse_request_line(line, request) != 0)
   {
     return -1;
   }
 
-  request->method = string_to_http_method(method_str);
-
-  // Parse query string
-  char *query_start = strchr(request->uri, '?');
-  if (query_start)
-  {
-    *query_start = '\0';
-    strncpy(request->query_string, query_start + 1, sizeof(request->query_string) - 1);
-    request->query_string[sizeof(request->query_string) - 1] = '\0';
-  }
-
-  // Default keep-alive on HTTP/1.1, off on HTTP/1.0. Either side may override
-  // via an explicit Connection header below.
-  request->keep_alive = (strcmp(request->version, "HTTP/1.1") == 0);
-
-  // Parse headers
   bool saw_content_length = false;
-  char *p = line_end + 1;
-  while (p < end)
+  while ((line = next_line(&cursor, end)) != NULL)
   {
-    char *next_end = memchr(p, '\n', (size_t)(end - p));
-    if (!next_end)
+    if (*line == '\0')
     {
-      break;
-    }
-    *next_end = '\0';
-    if (next_end > p && *(next_end - 1) == '\r')
-    {
-      *(next_end - 1) = '\0';
-    }
-
-    if (*p == '\0')
-    {
-      // End of headers -- body (if any) starts here. The worker only dispatches
-      // once the full message has arrived, so bound the body to the declared
-      // Content-Length rather than grabbing every trailing byte (which could
-      // include a pipelined next request); a chunked body is decoded in place.
-      p = next_end + 1;
+      // End of headers -- the body, if any, starts at the cursor. The worker
+      // only dispatches once the full message has arrived.
       if (request->chunked && saw_content_length)
       {
         // Both framings present is a request-smuggling vector; refuse.
         return -1;
       }
-      if (p < end)
-      {
-        size_t blen = (size_t)(end - p);
-        if (request->chunked)
-        {
-          // Decoded data is always a subset of the encoded input, so blen
-          // bounds the output. The worker already validated completeness.
-          char *decoded = malloc(blen + 1);
-          if (!decoded)
-          {
-            return -2;
-          }
-          size_t decoded_len = 0;
-          if (http_chunked_decode(p, blen, decoded, &decoded_len, NULL) != 1)
-          {
-            free(decoded);
-            return -1;
-          }
-          decoded[decoded_len] = '\0';
-          request->body = decoded;
-          request->body_length = decoded_len;
-          break;
-        }
-        // A body exists only as far as Content-Length declares. Taking every
-        // remaining byte instead would swallow whatever follows -- which, on a
-        // pipelined connection, is the next request.
-        if (blen > request->content_length)
-        {
-          blen = request->content_length;
-        }
-        if (blen > 0)
-        {
-          request->body = malloc(blen + 1);
-          if (!request->body)
-          {
-            // Signal an internal error so the caller replies 500 rather than
-            // proceeding as if the request carried no body.
-            return -2;
-          }
-          memcpy(request->body, p, blen);
-          request->body[blen] = '\0';
-          request->body_length = blen;
-        }
-      }
-      break;
+      return cursor < end
+                 ? parse_request_body(request, cursor, (size_t)(end - cursor))
+                 : 0;
     }
 
-    char *colon = strchr(p, ':');
+    char *colon = strchr(line, ':');
     if (!colon)
     {
-      p = next_end + 1;
       continue;
     }
-
     *colon = '\0';
-    char *name = p;
-    char *value = colon + 1;
 
-    // Skip whitespace
+    char *value = colon + 1;
     while (*value == ' ' || *value == '\t')
     {
       value++;
     }
 
-    if (request->header_count < MAX_HEADERS)
+    if (store_header_field(request, line, value, &saw_content_length) != 0)
     {
-      strncpy(request->headers[request->header_count].name, name, 255);
-      request->headers[request->header_count].name[255] = '\0';
-      strncpy(request->headers[request->header_count].value, value, 2047);
-      request->headers[request->header_count].value[2047] = '\0';
-      // Drop any embedded CR/LF so stored fields can't smuggle control bytes.
-      strip_crlf_inplace(request->headers[request->header_count].name);
-      strip_crlf_inplace(request->headers[request->header_count].value);
-      request->header_count++;
+      return -1;
     }
-
-    // Check for special headers
-    if (strcasecmp(name, "Connection") == 0)
-    {
-      // Connection is a comma-separated token list; match keep-alive/upgrade/
-      // close as tokens (case-insensitive) so "keep-alive, Upgrade" is not
-      // mistaken for a close. An explicit "close" token wins.
-      if (strcasestr(value, "close"))
-      {
-        request->keep_alive = false;
-      }
-      else if (strcasestr(value, "keep-alive") || strcasestr(value, "upgrade"))
-      {
-        request->keep_alive = true;
-      }
-    }
-    else if (strcasecmp(name, "Content-Length") == 0)
-    {
-      if (http_parse_content_length(value, &request->content_length) != 0)
-      {
-        return -1;
-      }
-      saw_content_length = true;
-    }
-    else if (strcasecmp(name, "Transfer-Encoding") == 0)
-    {
-      // Only chunked is understood. Any other coding is rejected rather than
-      // risking a mis-framed message body (the worker answers those with 501
-      // before parsing ever runs).
-      size_t vlen = strlen(value);
-      while (vlen > 0 && (value[vlen - 1] == ' ' || value[vlen - 1] == '\t'))
-      {
-        vlen--;
-      }
-      if (vlen != 7 || strncasecmp(value, "chunked", 7) != 0)
-      {
-        return -1;
-      }
-      request->chunked = true;
-    }
-    else if (strcasecmp(name, "If-None-Match") == 0)
-    {
-      strncpy(request->if_none_match, value, sizeof(request->if_none_match) - 1);
-      request->if_none_match[sizeof(request->if_none_match) - 1] = '\0';
-    }
-    else if (strcasecmp(name, "If-Modified-Since") == 0)
-    {
-      time_t t = parse_http_date(value);
-      request->if_modified_since = (t == (time_t)-1) ? 0 : t;
-    }
-    else if (strcasecmp(name, "If-Range") == 0)
-    {
-      strncpy(request->if_range, value, sizeof(request->if_range) - 1);
-      request->if_range[sizeof(request->if_range) - 1] = '\0';
-    }
-    else if (strcasecmp(name, "Range") == 0)
-    {
-      parse_range_header(value, request);
-    }
-    else if (strcasecmp(name, "Expect") == 0)
-    {
-      request->expect_continue = (strcasecmp(value, "100-continue") == 0);
-    }
-    else if (strcasecmp(name, "Upgrade") == 0)
-    {
-      request->is_websocket_upgrade = (strcasecmp(value, "websocket") == 0);
-    }
-    else if (strcasecmp(name, "Sec-WebSocket-Key") == 0)
-    {
-      strncpy(request->websocket_key, value, sizeof(request->websocket_key) - 1);
-      request->websocket_key[sizeof(request->websocket_key) - 1] = '\0';
-    }
-    else if (strcasecmp(name, "Sec-WebSocket-Protocol") == 0)
-    {
-      strncpy(request->websocket_protocol, value, sizeof(request->websocket_protocol) - 1);
-      request->websocket_protocol[sizeof(request->websocket_protocol) - 1] = '\0';
-    }
-
-    p = next_end + 1;
   }
 
   return 0;

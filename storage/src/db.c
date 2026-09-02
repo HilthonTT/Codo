@@ -344,7 +344,6 @@ int db_insert(transaction_t *txn, const char *key, size_t key_length, const char
       break;
     }
 
-    // Check if the key already exists
     int pos = find_key_position(page, key, key_length);
     kv_pair_t *existing = get_kv_pair(page, pos);
 
@@ -423,7 +422,6 @@ static int db_search_locked(transaction_t *txn, const char *key, size_t key_leng
 
   if (kv && compare_keys(key, key_length, kv->data, kv->key_length) == 0)
   {
-    // Found the key
     const char *kv_value = kv->data + kv->key_length;
     size_t copy_length = kv->value_length < *value_length ? kv->value_length : *value_length;
 
@@ -454,7 +452,6 @@ static int db_delete_locked(transaction_t *txn, const char *key, size_t key_leng
     return -1;
   }
 
-  // Find key in leaf page
   int pos = find_key_position(page, key, key_length);
   kv_pair_t *kv = get_kv_pair(page, pos);
 
@@ -490,7 +487,6 @@ static int db_delete_locked(transaction_t *txn, const char *key, size_t key_leng
     write_wal_record(txn->txn_id, WAL_DELETE, page_id, wal_data, wal_size);
   }
 
-  // Delete the key-value pair
   if (delete_kv_pair(page, pos) == 0)
   {
     mark_page_dirty(page_id);
@@ -582,8 +578,6 @@ static int scan_range(transaction_t *txn, const char *prefix, size_t prefix_leng
   return 0;
 }
 
-// ---- Public entry points -------------------------------------------------
-//
 // Everything below takes tree_lock shared. These operations never change the
 // tree's shape -- they land on a single leaf (or walk the leaf chain) and rely
 // on the pager's per-page rwlocks for content safety -- so any number of them

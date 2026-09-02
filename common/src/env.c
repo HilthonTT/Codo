@@ -20,10 +20,8 @@ int load_env(const char *path)
   char line[1024];
   while (fgets(line, sizeof line, f))
   {
-    // strip trailing newline / CR
     line[strcspn(line, "\r\n")] = '\0';
 
-    // skip blanks and comments
     char *p = line;
     while (*p == ' ' || *p == '\t')
     {
@@ -34,7 +32,6 @@ int load_env(const char *path)
       continue;
     }
 
-    // tolerate "export KEY=value" lines
     if (strncmp(p, "export ", 7) == 0)
     {
       p += 7;
@@ -44,7 +41,6 @@ int load_env(const char *path)
       }
     }
 
-    // split on first '='
     char *eq = strchr(p, '=');
     if (!eq)
     {
@@ -55,7 +51,6 @@ int load_env(const char *path)
     const char *key = p;
     char *val = eq + 1;
 
-    // trim trailing whitespace on key, leading on value
     char *kend = eq;
     while (kend > p && (kend[-1] == ' ' || kend[-1] == '\t'))
     {
@@ -66,7 +61,6 @@ int load_env(const char *path)
       val++;
     }
 
-    // strip optional surrounding quotes on the value
     size_t len = strlen(val);
     if (len >= 2 && (val[0] == '"' || val[0] == '\'') && val[len - 1] == val[0])
     {

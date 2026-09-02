@@ -343,13 +343,11 @@ int insert_kv_pair(
   char *end_ptr = page->data + used;
   size_t move_size = end_ptr - insert_ptr;
 
-  // Move existing data to make room
   if (move_size > 0)
   {
     memmove(insert_ptr + pair_size, insert_ptr, move_size);
   }
 
-  // Write the new key-value pair into the gap
   kv_pair_t *new_kv = (kv_pair_t *)insert_ptr;
   new_kv->key_length = key_length;
   new_kv->value_length = value_length;
@@ -393,7 +391,6 @@ int delete_kv_pair(btree_page_t *page, int position)
   }
   size_t used = data_capacity - page->header.free_space;
 
-  // Calculate data to move
   char *delete_ptr = (char *)kv;
   char *next_ptr = delete_ptr + pair_size;
   char *end_ptr = page->data + used;
@@ -403,7 +400,6 @@ int delete_kv_pair(btree_page_t *page, int position)
   }
   size_t move_size = end_ptr - next_ptr;
 
-  // Move data to close the gap
   if (move_size > 0)
   {
     memmove(delete_ptr, next_ptr, move_size);

@@ -1,3 +1,5 @@
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -121,13 +123,11 @@ bool is_valid_uri(const char *uri)
     return false;
   }
 
-  // URI must be absolute path
   if (*uri != '/')
   {
     return false;
   }
 
-  // Check for directory traversal
   if (strstr(uri, "../") != NULL || strstr(uri, "..\\") != NULL)
   {
     return false;
@@ -250,4 +250,24 @@ time_t parse_http_date(const char *value)
     return (time_t)-1;
   }
   return timegm(&tm);
+}
+
+int buf_appendf(char *buf, size_t size, size_t *off, const char *fmt, ...)
+{
+  if (*off >= size)
+  {
+    return -1;
+  }
+
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf + *off, size - *off, fmt, ap);
+  va_end(ap);
+
+  if (n < 0 || (size_t)n >= size - *off)
+  {
+    return -1;
+  }
+  *off += (size_t)n;
+  return 0;
 }

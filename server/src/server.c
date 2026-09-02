@@ -92,7 +92,6 @@ int http_server_start(http_server_t *server)
     // event/timeout traversal, and pool-thread re-arms.
     pthread_mutex_init(&worker->connections_lock, NULL);
 
-    // Create epoll instance for this worker
     worker->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (worker->epoll_fd < 0)
     {
@@ -100,7 +99,6 @@ int http_server_start(http_server_t *server)
       return -1;
     }
 
-    // Create worker thread
     if (pthread_create(&worker->thread, NULL, worker_thread_function, worker) != 0)
     {
       perror("pthread_create");
@@ -108,7 +106,6 @@ int http_server_start(http_server_t *server)
     }
   }
 
-  // Accept connections and distribute to workers
   int worker_index = 0;
   while (server->running)
   {
@@ -131,7 +128,6 @@ int http_server_start(http_server_t *server)
       continue;
     }
 
-    // Set client socket options
     set_socket_nonblocking(client_fd);
     set_socket_options(client_fd);
 
@@ -224,26 +220,22 @@ int http_server_cleanup(http_server_t *server)
     pthread_mutex_destroy(&server->workers[i].connections_lock);
   }
 
-  // Close listening socket
   if (server->listen_fd > 0)
   {
     close(server->listen_fd);
     server->listen_fd = -1;
   }
 
-  // Cleanup SSL
   if (server->ssl_enabled)
   {
     cleanup_ssl(server);
   }
 
-  // Free resources
   free(server->document_root);
   free(server->server_name);
   server->document_root = NULL;
   server->server_name = NULL;
 
-  // Cleanup routes
   route_t *route = server->routes;
   while (route)
   {

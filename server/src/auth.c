@@ -115,41 +115,6 @@ static bool key_is_valid(const char *key)
   return ok;
 }
 
-static int send_auth_error(connection_t *conn, http_request_t *request,
-                           http_response_t *response, http_status_t status,
-                           const char *msg)
-{
-  if (response->body)
-  {
-    free(response->body);
-    response->body = NULL;
-  }
-
-  char body[128];
-  snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
-
-  response->status = status;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(body);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
-  int h = 0;
-  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "Content-Type");
-  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "application/json");
-  h++;
-  if (status == HTTP_UNAUTHORIZED)
-  {
-    snprintf(response->headers[h].name, sizeof(response->headers[h].name), "WWW-Authenticate");
-    snprintf(response->headers[h].value, sizeof(response->headers[h].value),
-             "Bearer realm=\"codo\", charset=\"UTF-8\"");
-    h++;
-  }
-  response->header_count = h;
-
-  return send_http_response(conn, response);
-}
-
 int auth_middleware(connection_t *conn, http_request_t *request,
                     http_response_t *response, middleware_ctx_t *next)
 {
@@ -176,12 +141,12 @@ int auth_middleware(connection_t *conn, http_request_t *request,
 
   if (!presented || !*presented)
   {
-    return send_auth_error(conn, request, response, HTTP_UNAUTHORIZED,
+    return send_error_json(conn, request, response, HTTP_UNAUTHORIZED,
                            "missing API key");
   }
   if (!key_is_valid(presented))
   {
-    return send_auth_error(conn, request, response, HTTP_FORBIDDEN,
+    return send_error_json(conn, request, response, HTTP_FORBIDDEN,
                            "invalid API key");
   }
 

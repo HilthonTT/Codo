@@ -115,33 +115,6 @@ static bool extract_id(const char *uri, char *out, size_t out_size, uint64_t *id
   return todo_row_key_parse(out, out_len, id_out);
 }
 
-static int send_json(connection_t *conn, http_request_t *request,
-                     http_response_t *response, http_status_t status,
-                     const char *json)
-{
-  response->status = status;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-
-  if (response->body)
-  {
-    free(response->body);
-    response->body = NULL;
-  }
-  response->body = strdup(json ? json : "");
-  if (!response->body)
-  {
-    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
-  }
-  response->body_length = strlen(response->body);
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
-}
-
 // Parsed GET /api/todos query parameters. Any subset may be present; an absent
 // field leaves filtering/pagination on that axis disabled.
 typedef struct
@@ -480,14 +453,11 @@ int todo_list_handler(connection_t *conn, http_request_t *request, http_response
   response->body_length = list.len;
   response->keep_alive = request->keep_alive;
 
-  int h = 0;
-  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "Content-Type");
-  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "application/json");
-  h++;
-  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "X-Total-Count");
-  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "%ld", list.matched);
-  h++;
-  response->header_count = h;
+  char total_count[32];
+  snprintf(total_count, sizeof(total_count), "%ld", list.matched);
+  response_set_header(response, 0, "Content-Type", "application/json");
+  response_set_header(response, 1, "X-Total-Count", total_count);
+  response->header_count = 2;
 
   return send_http_response(conn, response);
 }
@@ -557,7 +527,7 @@ int todo_create_handler(connection_t *conn, http_request_t *request, http_respon
   // waiting for the first GET to miss.
   lru_put(g_todo_cache, key, value, (size_t)value_len);
 
-  return send_json(conn, request, response, HTTP_CREATED, value);
+  return send_json_response(conn, request, response, HTTP_CREATED, value);
 }
 
 int todo_get_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -584,7 +554,7 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
     {
       return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
     }
-    return send_json(conn, request, response, HTTP_OK, value);
+    return send_json_response(conn, request, response, HTTP_OK, value);
   }
 
   // Miss. Snapshot the cache generation *before* going to storage: if a write
@@ -622,7 +592,7 @@ int todo_get_handler(connection_t *conn, http_request_t *request, http_response_
   {
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
-  return send_json(conn, request, response, HTTP_OK, value);
+  return send_json_response(conn, request, response, HTTP_OK, value);
 }
 
 int todo_update_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -709,7 +679,7 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   // abort path above leaves storage untouched, and with it the cached entry.)
   lru_put(g_todo_cache, key, value, (size_t)value_len);
 
-  return send_json(conn, request, response, HTTP_OK, value);
+  return send_json_response(conn, request, response, HTTP_OK, value);
 }
 
 int todo_delete_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -765,7 +735,7 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
 
   lru_invalidate(g_todo_cache, key);
 
-  return send_json(conn, request, response, HTTP_NO_CONTENT, "");
+  return send_json_response(conn, request, response, HTTP_NO_CONTENT, "");
 }
 
 // GET /api/cache -- hit/miss counters for the todo cache. Runs inline on the
@@ -791,7 +761,7 @@ int todo_cache_stats_handler(connection_t *conn, http_request_t *request, http_r
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Stats too large");
   }
 
-  return send_json(conn, request, response, HTTP_OK, json);
+  return send_json_response(conn, request, response, HTTP_OK, json);
 }
 
 void todo_api_init(void)

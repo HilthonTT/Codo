@@ -8,7 +8,6 @@
 
 #include "config.h"
 
-// HTTP methods
 typedef enum
 {
   HTTP_GET,
@@ -23,7 +22,6 @@ typedef enum
   HTTP_UNKNOWN,
 } http_method_t;
 
-// HTTP status codes
 typedef enum
 {
   HTTP_SWITCHING_PROTOCOLS = 101,
@@ -52,14 +50,12 @@ typedef enum
   HTTP_GATEWAY_TIMEOUT = 504,
 } http_status_t;
 
-// Single HTTP header (name/value pair)
 typedef struct
 {
   char name[256];
   char value[2048];
 } http_header_t;
 
-// Parsed HTTP request
 typedef struct
 {
   http_method_t method;
@@ -98,7 +94,6 @@ typedef struct
   char websocket_protocol[256];
 } http_request_t;
 
-// Outgoing HTTP response
 typedef struct
 {
   http_status_t status;

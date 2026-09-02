@@ -23,6 +23,131 @@
 #include "websocket.h"
 #include "worker.h"
 
+// Outcome of one non-blocking socket transfer. EINTR is retried inside the
+// helpers, so callers only ever see a terminal outcome.
+typedef enum
+{
+  IO_OK,          // bytes moved; *transferred is non-zero
+  IO_WOULD_BLOCK, // nothing more right now -- wait for the next epoll event
+  IO_CLOSED,      // peer closed cleanly
+  IO_ERROR,       // fatal; tear the connection down
+} io_result_t;
+
+// Read up to `len` bytes, over TLS or a plain socket depending on how the
+// connection was accepted.
+static io_result_t conn_recv(connection_t *conn, void *buf, size_t len,
+                             size_t *transferred)
+{
+  *transferred = 0;
+  for (;;)
+  {
+    ssize_t n;
+    if (conn->ssl_enabled && conn->ssl)
+    {
+      n = SSL_read(conn->ssl, buf, (int)len);
+      if (n <= 0)
+      {
+        int ssl_error = SSL_get_error(conn->ssl, (int)n);
+        return (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
+                   ? IO_WOULD_BLOCK
+                   : IO_ERROR;
+      }
+    }
+    else
+    {
+      n = read(conn->socket_fd, buf, len);
+      if (n == 0)
+      {
+        return IO_CLOSED;
+      }
+      if (n < 0)
+      {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+          return IO_WOULD_BLOCK;
+        }
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return IO_ERROR;
+      }
+    }
+    *transferred = (size_t)n;
+    return IO_OK;
+  }
+}
+
+// Write up to `len` bytes, over TLS or a plain socket. A plain write returning
+// 0 is reported as an error rather than looped on, which would spin forever.
+static io_result_t conn_send(connection_t *conn, const void *buf, size_t len,
+                             size_t *transferred)
+{
+  *transferred = 0;
+  for (;;)
+  {
+    ssize_t n;
+    if (conn->ssl_enabled && conn->ssl)
+    {
+      n = SSL_write(conn->ssl, buf, (int)len);
+      if (n <= 0)
+      {
+        int ssl_error = SSL_get_error(conn->ssl, (int)n);
+        return (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
+                   ? IO_WOULD_BLOCK
+                   : IO_ERROR;
+      }
+    }
+    else
+    {
+      n = write(conn->socket_fd, buf, len);
+      if (n < 0)
+      {
+        if (errno == EAGAIN || errno == EWOULDBLOCK)
+        {
+          return IO_WOULD_BLOCK;
+        }
+        if (errno == EINTR)
+        {
+          continue;
+        }
+        return IO_ERROR;
+      }
+      if (n == 0)
+      {
+        return IO_ERROR;
+      }
+    }
+    *transferred = (size_t)n;
+    return IO_OK;
+  }
+}
+
+// Drop the first `len` bytes of the read buffer, sliding whatever follows to
+// the front -- the next pipelined request, or the request behind a consumed
+// PROXY header.
+static void conn_consume_read(connection_t *conn, size_t len)
+{
+  size_t leftover = conn->read_buffer_pos - len;
+  if (leftover > 0)
+  {
+    memmove(conn->read_buffer, conn->read_buffer + len, leftover);
+  }
+  conn->read_buffer_pos = leftover;
+  conn->read_buffer[leftover] = '\0';
+}
+
+// Re-arm this connection's socket in its worker's epoll set. An `events` mask
+// of 0 parks the connection, which is how it is hidden from the event loop
+// while a pool thread owns it.
+static int arm_socket(worker_thread_t *worker, connection_t *conn, uint32_t events)
+{
+  struct epoll_event ev;
+  ev.events = events;
+  ev.data.ptr = conn;
+  return epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev);
+}
+
 // Consume a PROXY protocol v1 header from the head of the read buffer and
 // adopt the client address it declares. Only called when the server is
 // configured to trust the peer (TRUST_PROXY_PROTOCOL) -- otherwise any client
@@ -89,13 +214,7 @@ static int consume_proxy_header(connection_t *conn)
   }
 
   // Drop the header so the HTTP parser sees a clean request.
-  size_t leftover = conn->read_buffer_pos - line_len;
-  if (leftover > 0)
-  {
-    memmove(conn->read_buffer, conn->read_buffer + line_len, leftover);
-  }
-  conn->read_buffer_pos = leftover;
-  conn->read_buffer[leftover] = '\0';
+  conn_consume_read(conn, line_len);
   return 1;
 }
 
@@ -128,10 +247,19 @@ static int finalize_response(worker_thread_t *worker, connection_t *conn)
   // trimmed it to the bytes of the next pipelined request, if any.
   conn->state = CONN_STATE_WRITING_RESPONSE;
 
-  struct epoll_event ev;
-  ev.events = EPOLLOUT | EPOLLET;
-  ev.data.ptr = conn;
-  return epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev);
+  return arm_socket(worker, conn, EPOLLOUT | EPOLLET);
+}
+
+// Answer a request we refuse to process any further. The read buffer is
+// dropped wholesale rather than trimmed: once framing is in doubt we cannot
+// tell where a following pipelined request would begin.
+static int reject_request(worker_thread_t *worker, connection_t *conn,
+                          http_status_t status, const char *message)
+{
+  send_error_response(conn, status, message);
+  conn->read_buffer_pos = 0;
+  conn->read_buffer[0] = '\0';
+  return finalize_response(worker, conn);
 }
 
 // Runs on a storage-pool thread: execute the blocking handler that fills the
@@ -223,7 +351,6 @@ static void drop_connection(worker_thread_t *worker, connection_t *conn)
 int handle_new_connection(worker_thread_t *worker, int client_fd,
                           struct sockaddr_storage client_addr)
 {
-  // Allocate connection structure
   connection_t *conn = allocate_connection(&g_server);
   if (!conn)
   {
@@ -253,7 +380,6 @@ int handle_new_connection(worker_thread_t *worker, int client_fd,
   worker->connection_count++;
   pthread_mutex_unlock(&worker->connections_lock);
 
-  // Add to epoll
   struct epoll_event event;
   event.events = EPOLLIN | EPOLLET;
   event.data.ptr = conn;
@@ -273,12 +399,115 @@ int handle_new_connection(worker_thread_t *worker, int client_fd,
   return 0;
 }
 
+// Handle one epoll event for a connection, tearing it down on any failure.
+static void dispatch_connection_event(worker_thread_t *worker, connection_t *conn,
+                                      uint32_t events)
+{
+  // A storage-pool thread currently owns this connection. Defer every event --
+  // including EPOLLERR/EPOLLHUP, which the kernel delivers regardless of the
+  // interest mask -- until the pool re-arms it. Touching (or freeing) it here
+  // would race the pool thread.
+  if (atomic_load(&conn->offloaded))
+  {
+    return;
+  }
+
+  if (events & (EPOLLERR | EPOLLHUP))
+  {
+    stats_record_error();
+    drop_connection(worker, conn);
+    return;
+  }
+
+  if ((events & EPOLLIN) && handle_client_data(worker, conn) != 0)
+  {
+    drop_connection(worker, conn);
+    return;
+  }
+
+  // handle_client_data may have handed this connection to the storage pool (a
+  // pipelined request picked up in handle_client_write can do the same), so
+  // re-check before touching it again for the write half of a combined
+  // EPOLLIN|EPOLLOUT event -- the pool owns it until it re-arms.
+  if (atomic_load(&conn->offloaded))
+  {
+    return;
+  }
+
+  if ((events & EPOLLOUT) && handle_client_write(worker, conn) != 0)
+  {
+    drop_connection(worker, conn);
+  }
+}
+
+// Close connections idle past the keep-alive timeout. Traversal and unlink run
+// under the list lock so this cannot race the accept loop's insert or a pool
+// thread's re-arm.
+static void reap_idle_connections(worker_thread_t *worker)
+{
+  pthread_mutex_lock(&worker->connections_lock);
+
+  time_t now = time(NULL);
+  connection_t *conn = worker->connections;
+  while (conn)
+  {
+    connection_t *next = conn->next;
+
+    // Never reap a connection a pool thread is still working on.
+    if (!atomic_load(&conn->offloaded) &&
+        now - conn->last_activity > g_server.keepalive_timeout)
+    {
+      remove_connection_from_worker(worker, conn);
+      free_connection(&g_server, conn);
+    }
+
+    conn = next;
+  }
+
+  pthread_mutex_unlock(&worker->connections_lock);
+}
+
+// Free the worker's connections before the thread exits so the per-connection
+// buffers are not leaked on shutdown. A connection a storage-pool thread is
+// still running (offloaded) must NOT be freed here -- the pool thread may still
+// reference it. Those stay on the list; http_server_cleanup frees them once the
+// pool has been destroyed.
+static void drain_worker_connections(worker_thread_t *worker)
+{
+  connection_t *conn = worker->connections;
+  connection_t *offloaded_head = NULL;
+  int offloaded_count = 0;
+
+  while (conn)
+  {
+    connection_t *next = conn->next;
+    if (atomic_load(&conn->offloaded))
+    {
+      conn->prev = NULL;
+      conn->next = offloaded_head;
+      if (offloaded_head)
+      {
+        offloaded_head->prev = conn;
+      }
+      offloaded_head = conn;
+      offloaded_count++;
+    }
+    else
+    {
+      free_connection(&g_server, conn);
+    }
+    conn = next;
+  }
+
+  worker->connections = offloaded_head;
+  worker->connection_count = offloaded_count;
+}
+
 void *worker_thread_function(void *arg)
 {
   worker_thread_t *worker = (worker_thread_t *)arg;
   struct epoll_event events[MAX_EVENTS];
 
-  // Set thread name
   char thread_name[16];
   snprintf(thread_name, sizeof(thread_name), "http_worker_%d", worker->thread_id);
   pthread_setname_np(pthread_self(), thread_name);
@@ -302,112 +531,17 @@ void *worker_thread_function(void *arg)
 
     for (int i = 0; i < event_count; i++)
     {
-      struct epoll_event event = events[i];
-      connection_t *conn = (connection_t *)event.data.ptr;
-      if (!conn)
+      connection_t *conn = (connection_t *)events[i].data.ptr;
+      if (conn)
       {
-        continue;
-      }
-
-      // A storage-pool thread currently owns this connection. Defer every
-      // event -- including EPOLLERR/EPOLLHUP, which the kernel delivers
-      // regardless of the interest mask -- until the pool re-arms it. Touching
-      // (or freeing) it here would race the pool thread.
-      if (atomic_load(&conn->offloaded))
-      {
-        continue;
-      }
-
-      if (event.events & (EPOLLERR | EPOLLHUP))
-      {
-        // Connection error or hangup
-        stats_record_error();
-        drop_connection(worker, conn);
-        continue;
-      }
-
-      if (event.events & EPOLLIN)
-      {
-        // Data available for reading
-        if (handle_client_data(worker, conn) != 0)
-        {
-          drop_connection(worker, conn);
-          continue;
-        }
-      }
-
-      // handle_client_data may have handed this connection to the storage pool
-      // (a pipelined request picked up in handle_client_write can do the same),
-      // so re-check before touching it again for the write half of a combined
-      // EPOLLIN|EPOLLOUT event -- the pool owns it until it re-arms.
-      if (atomic_load(&conn->offloaded))
-      {
-        continue;
-      }
-
-      if (event.events & EPOLLOUT)
-      {
-        if (handle_client_write(worker, conn) != 0)
-        {
-          drop_connection(worker, conn);
-          continue;
-        }
+        dispatch_connection_event(worker, conn, events[i].events);
       }
     }
 
-    // Check for connection timeouts. Traversal + unlink under the list lock so
-    // it can't race the accept loop's insert or a pool thread's re-arm.
-    pthread_mutex_lock(&worker->connections_lock);
-    time_t current_time = time(NULL);
-    connection_t *conn = worker->connections;
-
-    while (conn)
-    {
-      connection_t *next = conn->next;
-
-      // Never reap a connection a pool thread is still working on.
-      if (!atomic_load(&conn->offloaded) &&
-          current_time - conn->last_activity > g_server.keepalive_timeout)
-      {
-        remove_connection_from_worker(worker, conn);
-        free_connection(&g_server, conn);
-      }
-
-      conn = next;
-    }
-    pthread_mutex_unlock(&worker->connections_lock);
+    reap_idle_connections(worker);
   }
 
-  // Drain the worker's connection list before the thread exits so we don't
-  // leak the per-connection buffers on shutdown. A connection a storage-pool
-  // thread is still running (offloaded) must NOT be freed here -- the pool
-  // thread may still reference it. Leave those linked; http_server_cleanup
-  // frees them once the pool has been destroyed.
-  connection_t *conn = worker->connections;
-  connection_t *offloaded_head = NULL;
-  int offloaded_count = 0;
-  while (conn)
-  {
-    connection_t *next = conn->next;
-    if (atomic_load(&conn->offloaded))
-    {
-      conn->prev = NULL;
-      conn->next = offloaded_head;
-      if (offloaded_head)
-      {
-        offloaded_head->prev = conn;
-      }
-      offloaded_head = conn;
-      offloaded_count++;
-    }
-    else
-    {
-      free_connection(&g_server, conn);
-    }
-    conn = next;
-  }
-  worker->connections = offloaded_head;
-  worker->connection_count = offloaded_count;
+  drain_worker_connections(worker);
 
   printf("Worker thread %d stopping\n", worker->thread_id);
 
@@ -602,40 +736,19 @@ static int send_100_continue(connection_t *conn)
 
   while (conn->continue_pos < len)
   {
-    ssize_t n;
-    if (conn->ssl_enabled && conn->ssl)
+    size_t sent;
+    io_result_t r = conn_send(conn, interim + conn->continue_pos,
+                              len - conn->continue_pos, &sent);
+    if (r == IO_WOULD_BLOCK)
     {
-      n = SSL_write(conn->ssl, interim + conn->continue_pos,
-                    (int)(len - conn->continue_pos));
-      if (n <= 0)
-      {
-        int ssl_error = SSL_get_error(conn->ssl, (int)n);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
-        {
-          return 0;
-        }
-        return -1;
-      }
+      return 0;
     }
-    else
+    if (r != IO_OK)
     {
-      n = write(conn->socket_fd, interim + conn->continue_pos,
-                len - conn->continue_pos);
-      if (n < 0)
-      {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-          return 0;
-        }
-        if (errno == EINTR)
-        {
-          continue;
-        }
-        return -1;
-      }
+      return -1;
     }
-    conn->continue_pos += (size_t)n;
-    stats_record_bytes_sent((uint64_t)n);
+    conn->continue_pos += sent;
+    stats_record_bytes_sent((uint64_t)sent);
   }
 
   conn->continue_sent = true;
@@ -662,48 +775,21 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
         break; // buffer full; decode below frees room (or flags a close)
       }
 
-      ssize_t bytes_read;
-      if (conn->ssl_enabled && conn->ssl)
+      size_t bytes_read;
+      io_result_t r = conn_recv(conn, conn->read_buffer + conn->read_buffer_pos,
+                                conn->read_buffer_cap - conn->read_buffer_pos - 1,
+                                &bytes_read);
+      if (r == IO_WOULD_BLOCK)
       {
-        bytes_read = SSL_read(conn->ssl,
-                              conn->read_buffer + conn->read_buffer_pos,
-                              (int)(conn->read_buffer_cap - conn->read_buffer_pos - 1));
-        if (bytes_read <= 0)
-        {
-          int ssl_error = SSL_get_error(conn->ssl, (int)bytes_read);
-          if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
-          {
-            drained = true;
-            break;
-          }
-          return -1;
-        }
+        drained = true;
+        break;
       }
-      else
+      if (r != IO_OK)
       {
-        bytes_read = read(conn->socket_fd,
-                          conn->read_buffer + conn->read_buffer_pos,
-                          conn->read_buffer_cap - conn->read_buffer_pos - 1);
-        if (bytes_read == 0)
-        {
-          return -1; // peer closed
-        }
-        if (bytes_read < 0)
-        {
-          if (errno == EAGAIN || errno == EWOULDBLOCK)
-          {
-            drained = true;
-            break;
-          }
-          if (errno == EINTR)
-          {
-            continue;
-          }
-          return -1;
-        }
+        return -1;
       }
 
-      conn->read_buffer_pos += (size_t)bytes_read;
+      conn->read_buffer_pos += bytes_read;
       worker->bytes_received += (uint64_t)bytes_read;
       stats_record_bytes_received((uint64_t)bytes_read);
       conn->last_activity = time(NULL);
@@ -735,18 +821,108 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
     conn->websocket_closing = should_close;
     conn->state = CONN_STATE_WRITING_RESPONSE;
 
-    struct epoll_event ev;
-    ev.events = EPOLLOUT | EPOLLET;
-    ev.data.ptr = conn;
-    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &ev) < 0)
-    {
-      return -1;
-    }
-    return 0;
+    return arm_socket(worker, conn, EPOLLOUT | EPOLLET) < 0 ? -1 : 0;
   }
 
   // Nothing to send: either wait for more data, or tear down on a bare close.
   return should_close ? -1 : 0;
+}
+
+// Drain everything currently readable on the socket into the read buffer.
+// Edge-triggered epoll, so we must keep reading until it would block. Sets
+// *buffer_full when the configured request ceiling was reached with bytes
+// still pending. Returns 0 to carry on, -1 to tear the connection down.
+static int drain_socket_reads(worker_thread_t *worker, connection_t *conn,
+                              bool *buffer_full)
+{
+  *buffer_full = false;
+
+  for (;;)
+  {
+    if (conn->read_buffer_pos >= conn->read_buffer_cap - 1)
+    {
+      // Try to grow first: the read buffer starts small and is allowed to
+      // reach max_request_size, so the configured limit is the real limit
+      // rather than whatever the initial buffer happened to be.
+      if (!conn_reserve_read(conn, conn->read_buffer_cap * 2,
+                             g_server.max_request_size))
+      {
+        // At the configured ceiling. That is only an error if no complete
+        // request is framed in what we already have -- a buffer packed with
+        // pipelined requests is perfectly legal, and the leftovers make room
+        // as each one is consumed.
+        *buffer_full = true;
+        return 0;
+      }
+    }
+
+    size_t bytes_read;
+    io_result_t r = conn_recv(conn, conn->read_buffer + conn->read_buffer_pos,
+                              conn->read_buffer_cap - conn->read_buffer_pos - 1,
+                              &bytes_read);
+    if (r == IO_WOULD_BLOCK)
+    {
+      return 0;
+    }
+    if (r != IO_OK)
+    {
+      return -1;
+    }
+
+    conn->read_buffer_pos += bytes_read;
+    conn->read_buffer[conn->read_buffer_pos] = '\0';
+    worker->bytes_received += (uint64_t)bytes_read;
+    stats_record_bytes_received((uint64_t)bytes_read);
+    conn->last_activity = time(NULL);
+  }
+}
+
+// Pick the handler for a request and report whether it blocks. A matched route
+// offloads per its own flag; an unmatched request falls to the default file
+// handler, which hits the disk (stat + read), so it is treated as blocking too.
+static route_handler_t resolve_handler(const http_request_t *request, bool *offload)
+{
+  route_t *route = find_route(&g_server, request->uri, request->method);
+  if (route && route->handler)
+  {
+    *offload = route->offload;
+    return route->handler;
+  }
+  *offload = true;
+  return g_server.default_handler;
+}
+
+// Hand a blocking handler to the storage pool so a WAL fsync or page/file read
+// cannot freeze this worker's event loop. Returns true once the pool owns the
+// connection -- the caller must not touch it again -- and false to run inline.
+static bool dispatch_offloaded(worker_thread_t *worker, connection_t *conn,
+                               route_handler_t handler)
+{
+  offload_task_t *task = malloc(sizeof(*task));
+  if (!task)
+  {
+    return false; // a malloc failure just falls through to inline handling
+  }
+  task->worker = worker;
+  task->conn = conn;
+  task->handler = handler;
+
+  // Take the connection off the interest set (no EPOLLIN/OUT while the pool
+  // owns it) and flag it so the event loop and timeout sweep leave it alone.
+  // Set before submit so the pool's re-arm is the only clear.
+  atomic_store(&conn->offloaded, true);
+  arm_socket(worker, conn, 0);
+
+  if (thread_pool_submit(g_server.pool, run_offloaded_handler, task,
+                         request_priority(&conn->request)) == 0)
+  {
+    return true;
+  }
+
+  // Submit failed -- reclaim the connection and fall back to inline.
+  atomic_store(&conn->offloaded, false);
+  free(task);
+  return false;
 }
 
 int handle_client_data(worker_thread_t *worker, connection_t *conn)
@@ -770,73 +946,10 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     return handle_websocket_data(worker, conn);
   }
 
-  // Drain everything currently readable on the socket into the read buffer.
-  // We're using edge-triggered epoll, so we must keep reading until EAGAIN.
   bool buffer_full = false;
-  for (;;)
+  if (drain_socket_reads(worker, conn, &buffer_full) != 0)
   {
-    if (conn->read_buffer_pos >= conn->read_buffer_cap - 1)
-    {
-      // Try to grow first: the read buffer starts small and is allowed to
-      // reach max_request_size, so the configured limit is the real limit
-      // rather than whatever the initial buffer happened to be.
-      if (!conn_reserve_read(conn, conn->read_buffer_cap * 2,
-                             g_server.max_request_size))
-      {
-        // At the configured ceiling. That is only an error if no complete
-        // request is framed in what we already have -- a buffer packed with
-        // pipelined requests is perfectly legal, and the leftovers make room
-        // as each one is consumed.
-        buffer_full = true;
-        break;
-      }
-    }
-
-    ssize_t bytes_read;
-    if (conn->ssl_enabled && conn->ssl)
-    {
-      bytes_read = SSL_read(conn->ssl,
-                            conn->read_buffer + conn->read_buffer_pos,
-                            (int)(conn->read_buffer_cap - conn->read_buffer_pos - 1));
-      if (bytes_read <= 0)
-      {
-        int ssl_error = SSL_get_error(conn->ssl, (int)bytes_read);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
-        {
-          break;
-        }
-        return -1;
-      }
-    }
-    else
-    {
-      bytes_read = read(conn->socket_fd,
-                        conn->read_buffer + conn->read_buffer_pos,
-                        conn->read_buffer_cap - conn->read_buffer_pos - 1);
-      if (bytes_read == 0)
-      {
-        // Peer closed.
-        return -1;
-      }
-      if (bytes_read < 0)
-      {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-          break;
-        }
-        if (errno == EINTR)
-        {
-          continue;
-        }
-        return -1;
-      }
-    }
-
-    conn->read_buffer_pos += (size_t)bytes_read;
-    conn->read_buffer[conn->read_buffer_pos] = '\0';
-    worker->bytes_received += (uint64_t)bytes_read;
-    stats_record_bytes_received((uint64_t)bytes_read);
-    conn->last_activity = time(NULL);
+    return -1;
   }
 
   // A trusted PROXY header precedes the first request on the connection and
@@ -868,10 +981,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     {
       // Nothing complete and nowhere left to put more: the request genuinely
       // does not fit.
-      send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
-      conn->read_buffer_pos = 0;
-      conn->read_buffer[0] = '\0';
-      return finalize_response(worker, conn);
+      return reject_request(worker, conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
     }
     // Headers complete but the body still in flight: honor Expect:
     // 100-continue (once) so a waiting client releases the body.
@@ -883,26 +993,16 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   }
   if (frame == -2)
   {
-    send_error_response(conn, HTTP_NOT_IMPLEMENTED, "Unsupported Transfer-Encoding");
-    conn->read_buffer_pos = 0;
-    conn->read_buffer[0] = '\0';
-    return finalize_response(worker, conn);
+    return reject_request(worker, conn, HTTP_NOT_IMPLEMENTED,
+                          "Unsupported Transfer-Encoding");
   }
   if (frame == -3)
   {
-    send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
-    conn->read_buffer_pos = 0;
-    conn->read_buffer[0] = '\0';
-    return finalize_response(worker, conn);
+    return reject_request(worker, conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
   }
   if (frame < 0)
   {
-    // Framing is untrustworthy, so we cannot tell where a following request
-    // would begin; discard everything buffered rather than guess.
-    send_error_response(conn, HTTP_BAD_REQUEST, "Bad Request");
-    conn->read_buffer_pos = 0;
-    conn->read_buffer[0] = '\0';
-    return finalize_response(worker, conn);
+    return reject_request(worker, conn, HTTP_BAD_REQUEST, "Bad Request");
   }
 
   // A half-written interim "100 Continue" must be flushed before any final
@@ -923,13 +1023,10 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   {
     // parse_http_request returns -2 for an internal failure (e.g. body malloc)
     // and -1 for a malformed request.
-    http_status_t status =
-        (parse_result == -2) ? HTTP_INTERNAL_SERVER_ERROR : HTTP_BAD_REQUEST;
-    send_error_response(conn, status,
-                        (parse_result == -2) ? "Internal Server Error" : "Bad Request");
-    conn->read_buffer_pos = 0;
-    conn->read_buffer[0] = '\0';
-    return finalize_response(worker, conn);
+    return parse_result == -2
+               ? reject_request(worker, conn, HTTP_INTERNAL_SERVER_ERROR,
+                                "Internal Server Error")
+               : reject_request(worker, conn, HTTP_BAD_REQUEST, "Bad Request");
   }
 
   // The parse copied everything it needs out of the read buffer, so the bytes
@@ -937,77 +1034,26 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   // slide it to the front and keep it. Discarding it here (as this code used to)
   // silently dropped the request -- and because epoll is edge-triggered and no
   // new bytes were coming, the connection then sat idle until it timed out.
-  size_t leftover = conn->read_buffer_pos - request_len;
-  if (leftover > 0)
-  {
-    memmove(conn->read_buffer, conn->read_buffer + request_len, leftover);
-  }
-  conn->read_buffer_pos = leftover;
-  conn->read_buffer[leftover] = '\0';
+  conn_consume_read(conn, request_len);
 
-  route_t *route = find_route(&g_server, conn->request.uri, conn->request.method);
-
-  // Pick the handler and decide whether it blocks. A matched route offloads per
-  // its own flag; an unmatched request falls to the default file handler, which
-  // hits the disk (stat + read), so it's treated as blocking and offloaded too.
-  route_handler_t handler = NULL;
   bool offload = false;
-  if (route && route->handler)
+  route_handler_t handler = resolve_handler(&conn->request, &offload);
+
+  // Gate on g_server.running: once shutdown starts, http_server_cleanup tears
+  // the pool down, so we must stop submitting and run inline instead.
+  if (handler && offload && g_server.pool && g_server.running &&
+      dispatch_offloaded(worker, conn, handler))
   {
-    handler = route->handler;
-    offload = route->offload;
-  }
-  else if (g_server.default_handler)
-  {
-    handler = g_server.default_handler;
-    offload = true;
-  }
-
-  // Blocking handlers are dispatched to the thread pool so a WAL fsync or page/
-  // file read can't freeze this worker's whole event loop. Gate on
-  // g_server.running: once shutdown starts, http_server_cleanup tears the pool
-  // down, so we must stop submitting and run inline instead.
-  if (handler && offload && g_server.pool && g_server.running)
-  {
-    offload_task_t *task = malloc(sizeof(*task));
-    if (task)
-    {
-      task->worker = worker;
-      task->conn = conn;
-      task->handler = handler;
-
-      // Take the connection off the interest set (no EPOLLIN/OUT while the pool
-      // owns it) and flag it so the event loop and timeout sweep leave it
-      // alone. Set before submit so the pool's re-arm is the only clear.
-      atomic_store(&conn->offloaded, true);
-      struct epoll_event off_ev;
-      off_ev.events = 0;
-      off_ev.data.ptr = conn;
-      epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &off_ev);
-
-      if (thread_pool_submit(g_server.pool, run_offloaded_handler, task,
-                             request_priority(&conn->request)) == 0)
-      {
-        return 0; // handled asynchronously; pool arms EPOLLOUT when done
-      }
-
-      // Submit failed -- reclaim the connection and fall through to inline.
-      atomic_store(&conn->offloaded, false);
-      free(task);
-    }
-    // A malloc failure likewise falls through to inline handling.
+    return 0; // handled asynchronously; the pool arms EPOLLOUT when done
   }
 
   if (handler)
   {
-    if (run_with_middleware(conn, &conn->request, &conn->response, handler) != 0)
+    if (run_with_middleware(conn, &conn->request, &conn->response, handler) != 0 &&
+        conn->write_buffer_size == 0)
     {
-      // Handler reported an error; if it didn't already prepare a response,
-      // send a generic one.
-      if (conn->write_buffer_size == 0)
-      {
-        send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
-      }
+      // The handler reported an error without preparing a response of its own.
+      send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Handler error");
     }
   }
   else
@@ -1018,6 +1064,102 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   return finalize_response(worker, conn);
 }
 
+// Push the staged response bytes to the socket. Edge-triggered, so write until
+// the buffer is empty or the socket would block. Returns 0 when fully flushed,
+// 1 when it would block (a later EPOLLOUT resumes), -1 on a fatal error.
+static int flush_write_buffer(worker_thread_t *worker, connection_t *conn)
+{
+  while (conn->write_buffer_pos < conn->write_buffer_size)
+  {
+    size_t written;
+    io_result_t r = conn_send(conn, conn->write_buffer + conn->write_buffer_pos,
+                              conn->write_buffer_size - conn->write_buffer_pos,
+                              &written);
+    if (r == IO_WOULD_BLOCK)
+    {
+      return 1;
+    }
+    if (r != IO_OK)
+    {
+      return -1;
+    }
+
+    conn->write_buffer_pos += written;
+    worker->bytes_sent += (uint64_t)written;
+    stats_record_bytes_sent((uint64_t)written);
+  }
+  return 0;
+}
+
+// Stream a queued static file body straight from its fd to the socket with
+// sendfile(2) -- plaintext connections only, set up in send_file_response.
+// Edge-triggered, so pump until the file is drained or the socket would block;
+// a later EPOLLOUT resumes from the saved offset. Returns 0 once the file is
+// done and its fd released, 1 when it would block, -1 on a fatal error.
+static int stream_queued_file(worker_thread_t *worker, connection_t *conn)
+{
+  while (conn->file_offset < (off_t)conn->file_size)
+  {
+    ssize_t sent = sendfile(conn->socket_fd, conn->file_fd, &conn->file_offset,
+                            conn->file_size - (size_t)conn->file_offset);
+    if (sent < 0)
+    {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      {
+        return 1; // socket buffer full; wait for the next EPOLLOUT
+      }
+      if (errno == EINTR)
+      {
+        continue;
+      }
+      return -1;
+    }
+    if (sent == 0)
+    {
+      break; // file shrank under us; stop rather than spin
+    }
+    worker->bytes_sent += (uint64_t)sent;
+    stats_record_bytes_sent((uint64_t)sent);
+  }
+
+  close(conn->file_fd);
+  conn->file_fd = -1;
+  conn->file_offset = 0;
+  conn->file_size = 0;
+  return 0;
+}
+
+// Clear the per-request state so this connection can carry another request.
+// read_buffer_pos is preserved: it counts the bytes of an already-received
+// pipelined request.
+static void reset_for_next_request(connection_t *conn)
+{
+  conn->state = CONN_STATE_READING_REQUEST;
+  conn->write_buffer_pos = 0;
+  conn->write_buffer_size = 0;
+  conn->continue_pos = 0;
+  conn->continue_sent = false;
+
+  free(conn->request.body);
+  free(conn->response.body);
+
+  // The header tables are heap-allocated; carry the pointers across the reset
+  // so they are not leaked by the memset.
+  http_header_t *req_headers = conn->request.headers;
+  http_header_t *resp_headers = conn->response.headers;
+  memset(&conn->request, 0, sizeof(http_request_t));
+  memset(&conn->response, 0, sizeof(http_response_t));
+  conn->request.headers = req_headers;
+  conn->response.headers = resp_headers;
+
+  // Nothing is pending on an idle keep-alive connection, so hand back the
+  // write buffer and header tables until the next request needs them.
+  if (conn->read_buffer_pos == 0)
+  {
+    conn_release_idle(conn);
+  }
+}
+
 int handle_client_write(worker_thread_t *worker, connection_t *conn)
 {
   if (!conn || conn->state != CONN_STATE_WRITING_RESPONSE)
@@ -1025,99 +1167,22 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     return -1;
   }
 
-  // Edge-triggered: write until we'd block.
-  while (conn->write_buffer_pos < conn->write_buffer_size)
+  int flushed = flush_write_buffer(worker, conn);
+  if (flushed != 0)
   {
-    ssize_t bytes_written;
-
-    if (conn->ssl_enabled && conn->ssl)
-    {
-      // SSL write
-      bytes_written = SSL_write(conn->ssl,
-                                conn->write_buffer + conn->write_buffer_pos,
-                                (int)(conn->write_buffer_size - conn->write_buffer_pos));
-
-      if (bytes_written <= 0)
-      {
-        int ssl_error = SSL_get_error(conn->ssl, (int)bytes_written);
-        if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE)
-        {
-          return 0; // Would block
-        }
-        return -1; // Error
-      }
-    }
-    else
-    {
-      // Regular write
-      bytes_written = write(
-          conn->socket_fd,
-          conn->write_buffer + conn->write_buffer_pos,
-          conn->write_buffer_size - conn->write_buffer_pos);
-
-      if (bytes_written < 0)
-      {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-          return 0; // Would block
-        }
-        if (errno == EINTR)
-        {
-          continue;
-        }
-        return -1; // Error
-      }
-      if (bytes_written == 0)
-      {
-        return -1;
-      }
-    }
-
-    conn->write_buffer_pos += (size_t)bytes_written;
-    worker->bytes_sent += (uint64_t)bytes_written;
-    stats_record_bytes_sent((uint64_t)bytes_written);
+    return flushed < 0 ? -1 : 0;
   }
 
-  // Response headers completely sent. If a static file is queued for this
-  // connection (plaintext only -- the sendfile path is set up in
-  // send_file_response), stream its body straight from the fd to the socket
-  // now. Edge-triggered, so pump until the file is drained or the socket
-  // would block; a later EPOLLOUT resumes from the saved offset.
+  // Headers are out; a queued static file body still has to follow before the
+  // response counts as sent.
   if (conn->file_fd >= 0)
   {
-    while (conn->file_offset < (off_t)conn->file_size)
+    int streamed = stream_queued_file(worker, conn);
+    if (streamed != 0)
     {
-      ssize_t sent = sendfile(conn->socket_fd, conn->file_fd, &conn->file_offset,
-                              conn->file_size - (size_t)conn->file_offset);
-      if (sent < 0)
-      {
-        if (errno == EAGAIN || errno == EWOULDBLOCK)
-        {
-          return 0; // socket buffer full; wait for the next EPOLLOUT
-        }
-        if (errno == EINTR)
-        {
-          continue;
-        }
-        return -1;
-      }
-      if (sent == 0)
-      {
-        break; // file shrank under us; stop rather than spin
-      }
-      worker->bytes_sent += (uint64_t)sent;
-      stats_record_bytes_sent((uint64_t)sent);
+      return streamed < 0 ? -1 : 0;
     }
-
-    // Whole file flushed (or hit EOF): release the fd and fall through to the
-    // normal keep-alive / close handling below.
-    close(conn->file_fd);
-    conn->file_fd = -1;
-    conn->file_offset = 0;
-    conn->file_size = 0;
   }
-
-  // Response completely sent.
 
   // A WebSocket connection (the 101 handshake or a subsequent reply frame just
   // finished flushing): either close after a staged Close, or return to frame-
@@ -1133,74 +1198,29 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     conn->state = CONN_STATE_WEBSOCKET;
     conn->write_buffer_pos = 0;
     conn->write_buffer_size = 0;
-
-    struct epoll_event event;
-    event.events = EPOLLIN | EPOLLET;
-    event.data.ptr = conn;
-    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &event) < 0)
-    {
-      return -1;
-    }
-    return 0;
+    return arm_socket(worker, conn, EPOLLIN | EPOLLET) < 0 ? -1 : 0;
   }
 
-  if (conn->request.keep_alive && g_server.enable_keepalive)
+  if (!conn->request.keep_alive || !g_server.enable_keepalive)
   {
-    // Reset for next request on this connection. read_buffer_pos is preserved:
-    // it counts the bytes of an already-received pipelined request.
-    conn->state = CONN_STATE_READING_REQUEST;
-    conn->write_buffer_pos = 0;
-    conn->write_buffer_size = 0;
-    conn->continue_pos = 0;
-    conn->continue_sent = false;
-
-    if (conn->request.body)
-    {
-      free(conn->request.body);
-    }
-    if (conn->response.body)
-    {
-      free(conn->response.body);
-    }
-    // The header tables are heap-allocated; carry the pointers across the
-    // reset so they are not leaked by the memset.
-    http_header_t *req_headers = conn->request.headers;
-    http_header_t *resp_headers = conn->response.headers;
-    memset(&conn->request, 0, sizeof(http_request_t));
-    memset(&conn->response, 0, sizeof(http_response_t));
-    conn->request.headers = req_headers;
-    conn->response.headers = resp_headers;
-
-    // Nothing is pending on an idle keep-alive connection, so hand back the
-    // write buffer and header tables until the next request needs them.
-    if (conn->read_buffer_pos == 0)
-    {
-      conn_release_idle(conn);
-    }
-
-    // Re-arm for reads.
-    struct epoll_event event;
-    event.events = EPOLLIN | EPOLLET;
-    event.data.ptr = conn;
-    if (epoll_ctl(worker->epoll_fd, EPOLL_CTL_MOD, conn->socket_fd, &event) < 0)
-    {
-      return -1;
-    }
-
-    // A pipelined request is already sitting in the buffer. The socket is
-    // edge-triggered and those bytes arrived with the request we just answered,
-    // so no further EPOLLIN will announce them -- dispatch it here instead.
-    // handle_client_data re-arms EPOLLOUT for its response, which drives the
-    // next round; the chain is one call deep, not recursive.
-    if (conn->read_buffer_pos > 0)
-    {
-      return handle_client_data(worker, conn);
-    }
-  }
-  else
-  {
-    // Close connection (caller will tear it down).
     return -1;
+  }
+
+  reset_for_next_request(conn);
+
+  if (arm_socket(worker, conn, EPOLLIN | EPOLLET) < 0)
+  {
+    return -1;
+  }
+
+  // A pipelined request is already sitting in the buffer. The socket is
+  // edge-triggered and those bytes arrived with the request we just answered,
+  // so no further EPOLLIN will announce them -- dispatch it here instead.
+  // handle_client_data re-arms EPOLLOUT for its response, which drives the
+  // next round; the chain is one call deep, not recursive.
+  if (conn->read_buffer_pos > 0)
+  {
+    return handle_client_data(worker, conn);
   }
 
   return 0;

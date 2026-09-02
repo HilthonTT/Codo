@@ -51,7 +51,6 @@ void free_connection(http_server_t *server, connection_t *conn)
     while (cnt > 0 &&
            !atomic_compare_exchange_weak(&server->active_connections_count, &cnt, cnt - 1))
     {
-      // retry
     }
   }
   stats_record_connection_closed();

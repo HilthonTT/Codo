@@ -206,13 +206,11 @@ int set_socket_options(int fd)
 {
   int optval = 1;
 
-  // Reuse address
   if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval)) < 0)
   {
     return -1;
   }
 
-  // Disable Nagle's algorithm
   if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval)) < 0)
   {
     return -1;

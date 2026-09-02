@@ -36,4 +36,29 @@ int send_http_response(connection_t *conn, http_response_t *response);
 int send_file_response(connection_t *conn, const char *file_path);
 int send_error_response(connection_t *conn, http_status_t status, const char *message);
 
+// Stage a handler's response: copies `body` (binary-safe) into the response,
+// releasing whatever body was there before, and sets the status, version,
+// keep-alive and Content-Type. Answers 500 itself if the copy cannot be
+// allocated. Returns send_http_response's result.
+int send_body_response(connection_t *conn, http_request_t *request,
+                       http_response_t *response, http_status_t status,
+                       const char *content_type, const char *body,
+                       size_t body_length);
+
+// send_body_response for a NUL-terminated JSON document.
+int send_json_response(connection_t *conn, http_request_t *request,
+                       http_response_t *response, http_status_t status,
+                       const char *json);
+
+// A JSON {"error": "<msg>"} body. A 401 also carries the WWW-Authenticate
+// challenge naming the scheme the client should retry with.
+int send_error_json(connection_t *conn, http_request_t *request,
+                    http_response_t *response, http_status_t status,
+                    const char *msg);
+
+// Write one response header into `slot`, truncating rather than overflowing
+// the fixed-size name/value fields. Does not touch response->header_count.
+void response_set_header(http_response_t *response, int slot, const char *name,
+                         const char *value);
+
 #endif

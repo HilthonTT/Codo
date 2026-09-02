@@ -15,7 +15,6 @@
 
 uint32_t hash_page_id(uint32_t page_id)
 {
-  // Simple hash function
   return page_id % g_storage.hash_table_size;
 }
 
@@ -65,7 +64,6 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
   // creating an entry for the same page, and guarantees no other thread ever
   // observes a half-loaded page in the hash table.
 
-  // Find least recently used unpinned page
   buffer_entry_t *victim = NULL;
   struct timespec oldest_time = {0};
 
@@ -90,7 +88,6 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
     return NULL; // Buffer pool full
   }
 
-  // Evict victim if dirty
   if (victim->dirty && victim->page)
   {
     // Write-ahead invariant: flush the WAL to disk before writing the dirty
@@ -123,7 +120,6 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
     victim->dirty = false;
   }
 
-  // Remove from hash table
   if (victim->page_id != 0)
   {
     uint32_t hash = hash_page_id(victim->page_id);
@@ -152,6 +148,80 @@ buffer_entry_t *allocate_buffer_entry(uint32_t page_id)
   return victim;
 }
 
+// Take the caller's requested page lock. Safe to call without buffer_mutex
+// once the entry is pinned.
+static void acquire_page_lock(buffer_entry_t *entry, lock_type_t lock_type)
+{
+  if (lock_type == LOCK_SHARED)
+  {
+    pthread_rwlock_rdlock(&entry->page_lock);
+  }
+  else if (lock_type == LOCK_EXCLUSIVE)
+  {
+    pthread_rwlock_wrlock(&entry->page_lock);
+  }
+}
+
+// Read page_id into the entry's frame, or initialize a fresh page when the id
+// lies beyond the end of the data file. Returns 0 on success, -1 when the page
+// should already exist but could not be read.
+static int load_page_from_disk(buffer_entry_t *entry, uint32_t page_id)
+{
+  // Cast page_id to off_t before the multiply so the offset is computed in
+  // 64 bits.
+  off_t offset = (off_t)page_id * PAGE_SIZE;
+  ssize_t bytes_read = pread(g_storage.data_fd, entry->page, PAGE_SIZE, offset);
+  if (bytes_read == PAGE_SIZE)
+  {
+    return 0;
+  }
+
+  // Distinguish a legitimately fresh page (beyond the current end of file) from
+  // a read error / short read on a page that should already exist. In the
+  // latter case we must NOT zero-and-keep the page: a later eviction would
+  // pwrite the empty page over real on-disk data. Fail instead and leave the
+  // on-disk data intact.
+  off_t file_size = 0;
+  struct stat st;
+  if (fstat(g_storage.data_fd, &st) == 0)
+  {
+    file_size = st.st_size;
+  }
+  if (bytes_read < 0 || offset < file_size)
+  {
+    return -1;
+  }
+
+  memset(entry->page, 0, PAGE_SIZE);
+  entry->page->header.page_id = page_id;
+  entry->page->header.page_type = PAGE_TYPE_LEAF;
+  entry->page->header.free_space = PAGE_SIZE - sizeof(page_header_t);
+  entry->dirty = true;
+  return 0;
+}
+
+// Verify a freshly-read page against its stored CRC32. A stored value of 0
+// means the page was never checksummed, which is accepted.
+static bool page_checksum_valid(btree_page_t *page, uint32_t page_id)
+{
+  uint32_t stored = page->header.checksum;
+  page->header.checksum = 0;
+  uint32_t calculated = calculate_checksum(page, PAGE_SIZE);
+  page->header.checksum = stored;
+
+  if (stored == 0 || stored == calculated)
+  {
+    return true;
+  }
+
+  fprintf(stderr,
+          "storage: checksum mismatch on page %u (stored %08x, computed "
+          "%08x). The page is corrupt, or the data file predates the "
+          "switch to CRC32 -- an older file must be recreated.\n",
+          page_id, stored, calculated);
+  return false;
+}
+
 btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
 {
   // The whole lookup + pin (hit path) or allocate + load + publish (miss path)
@@ -162,9 +232,7 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
   // page is fully loaded and checksum-verified.
   pthread_mutex_lock(&g_storage.buffer_mutex);
 
-  // Check buffer pool first
   buffer_entry_t *entry = find_buffer_entry(page_id);
-
   if (entry)
   {
     atomic_fetch_add(&entry->ref_count, 1);
@@ -173,16 +241,7 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
 
     pthread_mutex_unlock(&g_storage.buffer_mutex);
 
-    // Acquire page lock (safe without buffer_mutex: the entry is pinned)
-    if (lock_type == LOCK_SHARED)
-    {
-      pthread_rwlock_rdlock(&entry->page_lock);
-    }
-    else if (lock_type == LOCK_EXCLUSIVE)
-    {
-      pthread_rwlock_wrlock(&entry->page_lock);
-    }
-
+    acquire_page_lock(entry, lock_type);
     return entry->page;
   }
 
@@ -201,70 +260,20 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
     entry->page = aligned_alloc(PAGE_SIZE, PAGE_SIZE);
     if (!entry->page)
     {
-      atomic_fetch_sub(&entry->ref_count, 1);
-      pthread_mutex_unlock(&g_storage.buffer_mutex);
-      return NULL;
+      goto fail_pinned;
     }
   }
 
-  // Read page from disk. Cast page_id to off_t before the multiply so the
-  // offset is computed in 64 bits.
-  off_t offset = (off_t)page_id * PAGE_SIZE;
-  ssize_t bytes_read = pread(g_storage.data_fd, entry->page, PAGE_SIZE, offset);
-  if (bytes_read != PAGE_SIZE)
+  if (load_page_from_disk(entry, page_id) != 0)
   {
-    // Distinguish a legitimately fresh page (beyond the current end of file)
-    // from a read error / short read on a page that should already exist. In
-    // the latter case we must NOT zero-and-keep the page: a later eviction
-    // would pwrite the empty page over real on-disk data. Fail instead and
-    // leave the on-disk data intact. The entry is not yet published in the
-    // hash table, so releasing its pin returns the slot to the free pool.
-    off_t file_size = 0;
-    struct stat st;
-    if (fstat(g_storage.data_fd, &st) == 0)
-    {
-      file_size = st.st_size;
-    }
-
-    if (bytes_read < 0 || offset < file_size)
-    {
-      atomic_fetch_sub(&entry->ref_count, 1);
-      pthread_mutex_unlock(&g_storage.buffer_mutex);
-      return NULL;
-    }
-
-    // Page lies beyond the end of file -> initialize a new (fresh) page.
-    memset(entry->page, 0, PAGE_SIZE);
-    entry->page->header.page_id = page_id;
-    entry->page->header.page_type = PAGE_TYPE_LEAF;
-    entry->page->header.free_space = PAGE_SIZE - sizeof(page_header_t);
-    entry->dirty = true;
+    goto fail_pinned;
   }
 
   atomic_fetch_add(&g_storage.stats.pages_read, 1);
 
-  // Verify checksum if enabled
-  if (g_storage.config.enable_checksums)
+  if (g_storage.config.enable_checksums && !page_checksum_valid(entry->page, page_id))
   {
-    uint32_t stored_checksum = entry->page->header.checksum;
-    entry->page->header.checksum = 0;
-    uint32_t calculated_checksum = calculate_checksum(entry->page, PAGE_SIZE);
-    entry->page->header.checksum = stored_checksum;
-
-    if (stored_checksum != 0 && stored_checksum != calculated_checksum)
-    {
-      fprintf(stderr,
-              "storage: checksum mismatch on page %u (stored %08x, computed "
-              "%08x). The page is corrupt, or the data file predates the "
-              "switch to CRC32 -- an older file must be recreated.\n",
-              page_id, stored_checksum, calculated_checksum);
-      // The entry was never linked into the hash table, so a corrupt page is
-      // simply discarded here (ref_count back to 0) and can never be served
-      // from the cache on a later get_page.
-      atomic_fetch_sub(&entry->ref_count, 1);
-      pthread_mutex_unlock(&g_storage.buffer_mutex);
-      return NULL;
-    }
+    goto fail_pinned;
   }
 
   // Publish the fully-loaded entry into the hash table.
@@ -274,17 +283,16 @@ btree_page_t *get_page(uint32_t page_id, lock_type_t lock_type)
 
   pthread_mutex_unlock(&g_storage.buffer_mutex);
 
-  // Acquire page lock
-  if (lock_type == LOCK_SHARED)
-  {
-    pthread_rwlock_rdlock(&entry->page_lock);
-  }
-  else if (lock_type == LOCK_EXCLUSIVE)
-  {
-    pthread_rwlock_wrlock(&entry->page_lock);
-  }
-
+  acquire_page_lock(entry, lock_type);
   return entry->page;
+
+fail_pinned:
+  // The entry was never linked into the hash table, so releasing its pin
+  // returns the slot to the free pool and the page can never be served from
+  // the cache on a later get_page.
+  atomic_fetch_sub(&entry->ref_count, 1);
+  pthread_mutex_unlock(&g_storage.buffer_mutex);
+  return NULL;
 }
 
 void release_page(uint32_t page_id, lock_type_t lock_type)
@@ -319,13 +327,11 @@ void mark_page_dirty(uint32_t page_id)
   {
     entry->dirty = true;
 
-    // Update LSN
     if (g_storage.config.enable_wal)
     {
       entry->page->header.lsn = atomic_load(&g_storage.next_lsn) - 1;
     }
 
-    // Update checksum
     if (g_storage.config.enable_checksums)
     {
       entry->page->header.checksum = 0;
@@ -345,7 +351,6 @@ uint32_t allocate_page(void)
 
   if (g_storage.free_page_count > 0)
   {
-    // Reuse a free page
     page_id = g_storage.free_pages[--g_storage.free_page_count];
   }
   else if (g_storage.next_page_id < MAX_PAGES)
@@ -368,7 +373,6 @@ void deallocate_page(uint32_t page_id)
 {
   pthread_mutex_lock(&g_storage.free_page_mutex);
 
-  // Grow free page array if necessary
   if (g_storage.free_page_count >= g_storage.free_page_capacity)
   {
     size_t new_capacity = g_storage.free_page_capacity * 2;

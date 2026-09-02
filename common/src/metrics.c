@@ -1,4 +1,3 @@
-#include <stdarg.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,30 +60,11 @@ void metrics_record_request(http_method_t method, int status, double duration_se
   atomic_fetch_add(&g_duration_us, (uint64_t)(duration_seconds * 1e6));
 }
 
-// Append with bounds checking; advances *off and returns -1 on overflow.
-static int append(char *buf, size_t size, size_t *off, const char *fmt, ...)
-{
-  if (*off >= size)
-  {
-    return -1;
-  }
-  va_list ap;
-  va_start(ap, fmt);
-  int n = vsnprintf(buf + *off, size - *off, fmt, ap);
-  va_end(ap);
-  if (n < 0 || (size_t)n >= size - *off)
-  {
-    return -1;
-  }
-  *off += (size_t)n;
-  return 0;
-}
-
 int metrics_format_prometheus(char *buf, size_t size)
 {
   size_t off = 0;
 
-  if (append(buf, size, &off,
+  if (buf_appendf(buf, size, &off,
              "# HELP codo_requests_total Total HTTP requests by method and status class.\n"
              "# TYPE codo_requests_total counter\n") != 0)
   {
@@ -100,7 +80,7 @@ int metrics_format_prometheus(char *buf, size_t size)
       {
         continue; // skip empty series to keep the payload compact
       }
-      if (append(buf, size, &off,
+      if (buf_appendf(buf, size, &off,
                  "codo_requests_total{method=\"%s\",status=\"%s\"} %llu\n",
                  http_method_to_string((http_method_t)m), class_label[c],
                  (unsigned long long)v) != 0)
@@ -110,7 +90,7 @@ int metrics_format_prometheus(char *buf, size_t size)
     }
   }
 
-  if (append(buf, size, &off,
+  if (buf_appendf(buf, size, &off,
              "# HELP codo_request_duration_seconds Handler chain latency.\n"
              "# TYPE codo_request_duration_seconds histogram\n") != 0)
   {
@@ -122,7 +102,7 @@ int metrics_format_prometheus(char *buf, size_t size)
   for (int i = 0; i < NUM_BUCKETS; i++)
   {
     cumulative += atomic_load(&g_bucket[i]);
-    if (append(buf, size, &off,
+    if (buf_appendf(buf, size, &off,
                "codo_request_duration_seconds_bucket{le=\"%g\"} %llu\n",
                BUCKET_BOUNDS[i], (unsigned long long)cumulative) != 0)
     {
@@ -131,7 +111,7 @@ int metrics_format_prometheus(char *buf, size_t size)
   }
   uint64_t total = atomic_load(&g_request_count);
   double sum = (double)atomic_load(&g_duration_us) / 1e6;
-  if (append(buf, size, &off,
+  if (buf_appendf(buf, size, &off,
              "codo_request_duration_seconds_bucket{le=\"+Inf\"} %llu\n"
              "codo_request_duration_seconds_sum %.6f\n"
              "codo_request_duration_seconds_count %llu\n",
@@ -142,7 +122,7 @@ int metrics_format_prometheus(char *buf, size_t size)
 
   time_t now = time(NULL);
   long uptime = g_start_time ? (long)(now - g_start_time) : 0;
-  if (append(buf, size, &off,
+  if (buf_appendf(buf, size, &off,
              "# HELP codo_uptime_seconds Seconds since the server started.\n"
              "# TYPE codo_uptime_seconds gauge\n"
              "codo_uptime_seconds %ld\n",

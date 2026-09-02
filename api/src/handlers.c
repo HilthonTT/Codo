@@ -13,19 +13,10 @@
 
 int api_hello_handler(connection_t *conn, http_request_t *request, http_response_t *response)
 {
-  const char *hello_msg = "{\"message\": \"Hello, World!\", \"timestamp\": \"2026-01-01T00:00:00Z\"}";
+  const char *hello_msg =
+      "{\"message\": \"Hello, World!\", \"timestamp\": \"2026-01-01T00:00:00Z\"}";
 
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(hello_msg);
-  response->body_length = strlen(hello_msg);
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  return send_json_response(conn, request, response, HTTP_OK, hello_msg);
 }
 
 int api_echo_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -35,27 +26,10 @@ int api_echo_handler(connection_t *conn, http_request_t *request, http_response_
     return send_error_response(conn, HTTP_METHOD_NOT_ALLOWED, "Method not allowed");
   }
 
-  size_t body_len = request->body_length;
-  const char *src = request->body ? request->body : "";
-
-  response->body = malloc(body_len + 1);
-  if (!response->body)
-  {
-    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
-  }
-  memcpy(response->body, src, body_len);
-  response->body[body_len] = '\0';
-  response->body_length = body_len;
-
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "text/plain");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  // Echoed verbatim, so the copy must be binary-safe rather than string-based.
+  return send_body_response(conn, request, response, HTTP_OK, "text/plain",
+                            request->body ? request->body : "",
+                            request->body_length);
 }
 
 int api_status_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -73,17 +47,7 @@ int api_status_handler(connection_t *conn, http_request_t *request, http_respons
            (unsigned long)atomic_load(&g_server.total_requests),
            (unsigned long)atomic_load(&g_server.active_connections_count));
 
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(status_json);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  return send_json_response(conn, request, response, HTTP_OK, status_json);
 }
 
 int api_stats_handler(connection_t *conn, http_request_t *request, http_response_t *response)
@@ -94,17 +58,7 @@ int api_stats_handler(connection_t *conn, http_request_t *request, http_response
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Stats too large");
   }
 
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(stats_json);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  return send_json_response(conn, request, response, HTTP_OK, stats_json);
 }
 
 // GET /metrics -- Prometheus text exposition. Request counters and the latency
@@ -138,37 +92,17 @@ int api_metrics_handler(connection_t *conn, http_request_t *request, http_respon
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Metrics too large");
   }
 
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(body);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
   // The Prometheus content type; text/plain with the exposition format version.
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value),
-           "text/plain; version=0.0.4; charset=utf-8");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  return send_body_response(conn, request, response, HTTP_OK,
+                            "text/plain; version=0.0.4; charset=utf-8", body,
+                            strlen(body));
 }
 
 // GET /healthz -- liveness. Cheap and inline: if the event loop can answer, the
 // process is alive. Never touches storage.
 int api_healthz_handler(connection_t *conn, http_request_t *request, http_response_t *response)
 {
-  const char *body = "{\"status\":\"ok\"}";
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(body);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  return send_json_response(conn, request, response, HTTP_OK, "{\"status\":\"ok\"}");
 }
 
 // GET /readyz -- readiness. Proves the storage engine can serve a transaction,
@@ -184,18 +118,7 @@ int api_readyz_handler(connection_t *conn, http_request_t *request, http_respons
   commit_transaction(txn);
   free(txn);
 
-  const char *body = "{\"status\":\"ready\"}";
-  response->status = HTTP_OK;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  response->body = strdup(body);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
+  return send_json_response(conn, request, response, HTTP_OK, "{\"status\":\"ready\"}");
 }
 
 int websocket_chat_handler(connection_t *conn, http_request_t *request, http_response_t *response)

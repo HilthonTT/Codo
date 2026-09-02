@@ -14,7 +14,6 @@
 int load_balancer_init(load_balancer_t *lb, int port);
 int add_backend(load_balancer_t *lb, const char *host, int port, int weight);
 
-// High-performance load balancer main loop
 int load_balancer_main_loop(load_balancer_t *lb);
 
 // Accept a client, pick a backend and start proxying.

@@ -133,7 +133,6 @@ static void update_epoll_interest(load_balancer_t *lb, lb_connection_t *conn)
     modify_epoll_events(lb, &conn->backend_ctx, backend_events);
 }
 
-// High-performance load balancer main loop
 int load_balancer_main_loop(load_balancer_t *lb)
 {
     int nfds, i;
@@ -281,7 +280,6 @@ int add_backend(load_balancer_t *lb, const char *host, int port, int weight)
     return 0;
 }
 
-// Handle new client connection
 void lb_handle_new_connection(load_balancer_t *lb)
 {
     struct sockaddr_storage client_addr;
@@ -290,7 +288,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
     backend_t *backend;
     lb_connection_t *conn;
 
-    // Accept client connection
     client_fd = accept(lb->listen_fd, (struct sockaddr *)&client_addr, &client_len);
     if (client_fd == -1)
     {
@@ -298,7 +295,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
         return;
     }
 
-    // Set non-blocking
     if (set_nonblocking(client_fd) == -1)
     {
         perror("set_nonblocking(client_fd)");
@@ -311,7 +307,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
     int one = 1;
     setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    // Select backend using load balancing algorithm
     backend = select_backend(lb, &client_addr);
     if (!backend)
     {
@@ -322,7 +317,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
         return;
     }
 
-    // Connect to backend
     backend_fd = create_backend_connection(backend);
     if (backend_fd == -1)
     {
@@ -334,7 +328,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
     }
     setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
-    // Create connection structure
     conn = malloc(sizeof(lb_connection_t));
     if (!conn)
     {
@@ -350,7 +343,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
     build_proxy_header(conn);
     clock_gettime(CLOCK_MONOTONIC, &conn->start_time);
 
-    // Add to epoll
     if (add_connection_to_epoll(lb, conn) == -1)
     {
         close(client_fd);
@@ -359,7 +351,6 @@ void lb_handle_new_connection(load_balancer_t *lb)
         return;
     }
 
-    // Update backend stats
     pthread_mutex_lock(&lb->backend_mutex);
     backend->current_connections++;
     backend->total_requests++;
@@ -613,7 +604,6 @@ void lb_close_connection(load_balancer_t *lb, lb_connection_t *conn)
         response_time = 0; // clock went backwards; don't poison the EMA
     }
 
-    // Update backend statistics
     pthread_mutex_lock(&lb->backend_mutex);
     conn->backend->current_connections--;
 
@@ -629,7 +619,6 @@ void lb_close_connection(load_balancer_t *lb, lb_connection_t *conn)
     }
     pthread_mutex_unlock(&lb->backend_mutex);
 
-    // Remove from epoll and close sockets
     epoll_ctl(lb->epoll_fd, EPOLL_CTL_DEL, conn->client_fd, NULL);
     epoll_ctl(lb->epoll_fd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
     close(conn->client_fd);

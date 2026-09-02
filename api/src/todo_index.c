@@ -136,8 +136,6 @@ int todo_index_delete(transaction_t *txn, uint64_t user_id, uint64_t todo_id)
   return db_delete(txn, key, (size_t)key_len);
 }
 
-// ---- Lookup -----------------------------------------------------------------
-
 static int id_list_push(todo_id_list_t *list, uint64_t id)
 {
   if (list->count == list->capacity)
@@ -227,8 +225,6 @@ int todo_index_lookup(transaction_t *txn, uint64_t user_id, todo_id_list_t *out)
 
   return 0;
 }
-
-// ---- Reconcile --------------------------------------------------------------
 
 // One (owner, todo) pair. Reconciling is a set difference over these: the pairs
 // the rows call for, against the pairs the index currently holds.
@@ -328,6 +324,98 @@ static int reconcile_scan_cb(const char *key, size_t key_length,
   return 0;
 }
 
+// Tally of what one reconcile pass changed.
+typedef struct
+{
+  size_t inserted;
+  size_t deleted;
+  size_t failed;
+} repair_stats_t;
+
+// Walk the two sorted lists in lockstep: a pair only in `wanted` needs an index
+// entry added, a pair only in `have` is an entry to drop, and a pair in both is
+// already in step. The repair transaction is opened on the first change, so a
+// healthy index costs no write at all.
+static repair_stats_t apply_index_repairs(const reconcile_ctx_t *r)
+{
+  repair_stats_t stats = {0, 0, 0};
+  transaction_t *repair = NULL;
+  size_t i = 0;
+  size_t j = 0;
+
+  while (i < r->wanted.count || j < r->have.count)
+  {
+    int cmp;
+    if (i >= r->wanted.count)
+    {
+      cmp = 1; // Only leftovers in the index: orphans to drop
+    }
+    else if (j >= r->have.count)
+    {
+      cmp = -1; // Only leftovers in the rows: entries to add
+    }
+    else
+    {
+      cmp = pair_compare(&r->wanted.items[i], &r->have.items[j]);
+    }
+
+    if (cmp == 0)
+    {
+      i++;
+      j++;
+      continue; // Already in step
+    }
+
+    if (!repair)
+    {
+      repair = begin_transaction();
+      if (!repair)
+      {
+        stats.failed++;
+        break;
+      }
+    }
+
+    if (cmp < 0)
+    {
+      // A todo with no entry: invisible to an index-backed listing until now.
+      if (todo_index_insert(repair, r->wanted.items[i].user_id,
+                            r->wanted.items[i].todo_id) == 0)
+      {
+        stats.inserted++;
+      }
+      else
+      {
+        stats.failed++;
+      }
+      i++;
+    }
+    else
+    {
+      // An entry whose row is gone, or whose owner changed -- a changed owner
+      // shows up as both an orphan here and a missing entry above.
+      if (todo_index_delete(repair, r->have.items[j].user_id,
+                            r->have.items[j].todo_id) == 0)
+      {
+        stats.deleted++;
+      }
+      else
+      {
+        stats.failed++;
+      }
+      j++;
+    }
+  }
+
+  if (repair)
+  {
+    commit_transaction(repair);
+    free(repair);
+  }
+
+  return stats;
+}
+
 int todo_index_reconcile(uint64_t *max_todo_id_out)
 {
   reconcile_ctx_t r;
@@ -371,95 +459,18 @@ int todo_index_reconcile(uint64_t *max_todo_id_out)
     qsort(r.have.items, r.have.count, sizeof(*r.have.items), pair_compare);
   }
 
-  size_t inserted = 0;
-  size_t deleted = 0;
-  size_t failed = 0;
-
-  // Opened on the first repair, so a healthy index costs no write at all.
-  transaction_t *repair = NULL;
-
-  size_t i = 0;
-  size_t j = 0;
-  while (i < r.wanted.count || j < r.have.count)
-  {
-    int cmp;
-    if (i >= r.wanted.count)
-    {
-      cmp = 1; // Only leftovers in the index: orphans to drop
-    }
-    else if (j >= r.have.count)
-    {
-      cmp = -1; // Only leftovers in the rows: entries to add
-    }
-    else
-    {
-      cmp = pair_compare(&r.wanted.items[i], &r.have.items[j]);
-    }
-
-    if (cmp == 0)
-    {
-      i++;
-      j++;
-      continue; // Already in step
-    }
-
-    if (!repair)
-    {
-      repair = begin_transaction();
-      if (!repair)
-      {
-        failed++;
-        break;
-      }
-    }
-
-    if (cmp < 0)
-    {
-      // A todo with no entry: invisible to an index-backed listing until now.
-      if (todo_index_insert(repair, r.wanted.items[i].user_id,
-                            r.wanted.items[i].todo_id) == 0)
-      {
-        inserted++;
-      }
-      else
-      {
-        failed++;
-      }
-      i++;
-    }
-    else
-    {
-      // An entry whose row is gone, or whose owner changed -- a changed owner
-      // shows up as both an orphan here and a missing entry above.
-      if (todo_index_delete(repair, r.have.items[j].user_id,
-                            r.have.items[j].todo_id) == 0)
-      {
-        deleted++;
-      }
-      else
-      {
-        failed++;
-      }
-      j++;
-    }
-  }
-
-  if (repair)
-  {
-    commit_transaction(repair);
-    free(repair);
-  }
+  repair_stats_t stats = apply_index_repairs(&r);
 
   free(r.wanted.items);
   free(r.have.items);
 
-  if (inserted || deleted)
+  if (stats.inserted || stats.deleted)
   {
-    printf("todo index: reconciled (%zu entries added, %zu dropped)\n",
-           inserted, deleted);
+    printf("todo index: reconciled (%zu entries added, %zu dropped)\n", stats.inserted,
+           stats.deleted);
   }
 
-  if (failed)
+  if (stats.failed)
   {
     // Most plausibly a full page: the index roughly doubles the space a todo
     // takes and a page split is not implemented. Serving listings from a
@@ -467,7 +478,7 @@ int todo_index_reconcile(uint64_t *max_todo_id_out)
     fprintf(stderr,
             "todo index: %zu entries could not be written (page full?) -- "
             "listings fall back to a full scan\n",
-            failed);
+            stats.failed);
     return -1;
   }
 

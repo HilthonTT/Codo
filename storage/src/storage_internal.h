@@ -32,7 +32,6 @@
 // instead of an infinite loop.
 #define BTREE_MAX_DEPTH 32
 
-// Page types
 typedef enum
 {
   PAGE_TYPE_LEAF = 1,
@@ -41,7 +40,6 @@ typedef enum
   PAGE_TYPE_FREE = 4,
 } page_type_t;
 
-// Lock types
 typedef enum
 {
   LOCK_NONE = 0,
@@ -49,7 +47,6 @@ typedef enum
   LOCK_EXCLUSIVE = 2,
 } lock_type_t;
 
-// Transaction states
 typedef enum
 {
   TXN_STATE_ACTIVE,
@@ -57,7 +54,6 @@ typedef enum
   TXN_STATE_ABORTED,
 } transaction_state_t;
 
-// WAL record types
 typedef enum
 {
   WAL_INSERT = 1,
@@ -68,7 +64,6 @@ typedef enum
   WAL_CHECKOUT = 6,
 } wal_record_type_t;
 
-// Page header structure
 typedef struct
 {
   uint32_t page_id;
@@ -102,14 +97,12 @@ typedef struct __attribute__((packed))
   char data[];            // Key followed by value
 } kv_pair_t;
 
-// B-tree page structure
 typedef struct
 {
   page_header_t header;
   char data[PAGE_SIZE - sizeof(page_header_t)];
 } btree_page_t;
 
-// Buffer pool entry
 typedef struct
 {
   btree_page_t *page;
@@ -132,7 +125,6 @@ struct transaction
   time_t start_time;
   time_t commit_time;
 
-  // Statistics
   struct
   {
     uint64_t pages_read;
@@ -145,7 +137,6 @@ struct transaction
   struct transaction *next;
 };
 
-// WAL record
 typedef struct
 {
   uint64_t lsn;
@@ -157,7 +148,6 @@ typedef struct
   char data[];
 } wal_record_t;
 
-// Storage engine context
 typedef struct
 {
   // File management

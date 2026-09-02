@@ -31,7 +31,6 @@ transaction_t *begin_transaction(void)
   txn->start_time = time(NULL);
   txn->start_lsn = atomic_load(&g_storage.next_lsn);
 
-  // Add to active transactions list
   txn->next = g_storage.active_transactions;
   g_storage.active_transactions = txn;
 
@@ -69,7 +68,6 @@ int commit_transaction(transaction_t *txn)
     return -1;
   }
 
-  // Write commit record to WAL
   if (g_storage.config.enable_wal)
   {
     write_wal_record(txn->txn_id, WAL_COMMIT, 0, NULL, 0);

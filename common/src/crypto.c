@@ -78,7 +78,6 @@ static void cleanup_secure_memory_pool(void)
 {
   if (g_crypto.memory_pool != MAP_FAILED)
   {
-    // Clear memory before releasing
     memset(g_crypto.memory_pool, 0, g_crypto.pool_size);
     munlock(g_crypto.memory_pool, g_crypto.pool_size);
     munmap(g_crypto.memory_pool, g_crypto.pool_size);
@@ -162,7 +161,6 @@ void secure_free(void *ptr, size_t size)
     blocks_to_free = 1;
   }
 
-  // Clear the full block-rounded region before freeing
   memset(ptr, 0, blocks_to_free * g_crypto.block_size);
 
   for (size_t i = 0; i < blocks_to_free; i++)
@@ -187,7 +185,6 @@ int secure_random_bytes(uint8_t *buffer, size_t size)
     return 0;
   }
 
-  // Fallback to OpenSSL RAND_bytes
   if (RAND_bytes(buffer, size) == 1)
   {
     pthread_mutex_unlock(&g_crypto.rng_lock);

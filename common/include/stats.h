@@ -4,7 +4,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// Network statistics collection
 typedef struct
 {
     _Atomic(uint64_t) bytes_sent;

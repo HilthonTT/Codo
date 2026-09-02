@@ -192,30 +192,18 @@ int cors_middleware(connection_t *conn, http_request_t *request,
     response->body_length = 0;
     response->keep_alive = request->keep_alive;
 
-    int h = 0;
-    snprintf(response->headers[h].name, sizeof(response->headers[h].name),
-             "Access-Control-Allow-Methods");
-    snprintf(response->headers[h].value, sizeof(response->headers[h].value),
-             "GET, POST, PUT, DELETE, OPTIONS");
-    h++;
+    response_set_header(response, 0, "Access-Control-Allow-Methods",
+                        "GET, POST, PUT, DELETE, OPTIONS");
 
     // Echo the headers the client announced it wants to send, falling back to a
     // sane default. Reflecting the request keeps custom headers working without
     // the server having to enumerate them.
-    const char *req_headers =
-        request_header(request, "Access-Control-Request-Headers");
-    snprintf(response->headers[h].name, sizeof(response->headers[h].name),
-             "Access-Control-Allow-Headers");
-    snprintf(response->headers[h].value, sizeof(response->headers[h].value),
-             "%s", req_headers ? req_headers : "Content-Type");
-    h++;
+    const char *req_headers = request_header(request, "Access-Control-Request-Headers");
+    response_set_header(response, 1, "Access-Control-Allow-Headers",
+                        req_headers ? req_headers : "Content-Type");
 
-    snprintf(response->headers[h].name, sizeof(response->headers[h].name),
-             "Access-Control-Max-Age");
-    snprintf(response->headers[h].value, sizeof(response->headers[h].value),
-             "86400");
-    h++;
-    response->header_count = h;
+    response_set_header(response, 2, "Access-Control-Max-Age", "86400");
+    response->header_count = 3;
 
     // send_http_response appends Access-Control-Allow-Origin from this field.
     if (origin)

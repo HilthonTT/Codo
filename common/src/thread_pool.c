@@ -4,7 +4,6 @@
 
 #include "thread_pool.h"
 
-// Initialize task queue
 int task_queue_init(task_queue_t *queue, int num_priorities)
 {
     queue->queues = calloc(num_priorities, sizeof(task_t *));
@@ -87,7 +86,6 @@ static void task_queue_drain(task_queue_t *queue)
     atomic_store(&queue->size, 0);
 }
 
-// Add task to priority queue
 int task_queue_push(task_queue_t *queue, task_t *task)
 {
     if (task->priority < 0 || task->priority >= queue->num_priorities)
@@ -119,7 +117,6 @@ int task_queue_push(task_queue_t *queue, task_t *task)
     return 0;
 }
 
-// Pop task from highest priority queue
 task_t *task_queue_pop(task_queue_t *queue)
 {
     pthread_mutex_lock(&queue->mutex);
@@ -164,7 +161,6 @@ task_t *task_queue_pop(task_queue_t *queue)
     return task;
 }
 
-// Try to pop task without blocking
 task_t *task_queue_try_pop(task_queue_t *queue)
 {
     if (pthread_mutex_trylock(&queue->mutex) != 0)
@@ -198,17 +194,14 @@ task_t *task_queue_try_pop(task_queue_t *queue)
     return task;
 }
 
-// Worker stealing implementation
 task_t *steal_task(thread_pool_t *pool, int worker_id)
 {
     int num_workers = pool->num_threads;
 
-    // Try to steal from other workers' local queues
     for (int i = 1; i < num_workers; i++)
     {
         int target = (worker_id + i) % num_workers;
 
-        // Try to acquire lock on target queue
         int expected = 0;
         if (atomic_compare_exchange_weak(&pool->queue_locks[target], &expected, 1))
         {
@@ -225,7 +218,6 @@ task_t *steal_task(thread_pool_t *pool, int worker_id)
     return NULL;
 }
 
-// Worker thread function
 void *worker_thread(void *arg)
 {
     thread_pool_t *pool = (thread_pool_t *)arg;
@@ -242,19 +234,16 @@ void *worker_thread(void *arg)
 
         clock_gettime(CLOCK_MONOTONIC, &idle_start);
 
-        // Try local queue first (work stealing)
         if (pool->local_queues)
         {
             task = task_queue_try_pop(&pool->local_queues[worker_id]);
         }
 
-        // Try global queue
         if (!task)
         {
             task = task_queue_pop(&pool->task_queue);
         }
 
-        // Try work stealing
         if (!task && pool->local_queues)
         {
             task = steal_task(pool, worker_id);
@@ -271,17 +260,14 @@ void *worker_thread(void *arg)
 
         clock_gettime(CLOCK_MONOTONIC, &idle_end);
 
-        // Update idle time statistics
         long idle_ns = (idle_end.tv_sec - idle_start.tv_sec) * 1000000000L +
                        (idle_end.tv_nsec - idle_start.tv_nsec);
         atomic_fetch_add(&pool->worker_stats[worker_id].idle_time_ns, idle_ns);
 
-        // Execute task
         clock_gettime(CLOCK_MONOTONIC, &task_start);
         task->function(task->argument);
         clock_gettime(CLOCK_MONOTONIC, &task_end);
 
-        // Update execution statistics
         long exec_ns = (task_end.tv_sec - task_start.tv_sec) * 1000000000L +
                        (task_end.tv_nsec - task_start.tv_nsec);
 
@@ -295,7 +281,6 @@ void *worker_thread(void *arg)
     return NULL;
 }
 
-// Create thread pool
 thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
                                   int num_priorities)
 {
@@ -316,14 +301,12 @@ thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
 
     clock_gettime(CLOCK_MONOTONIC, &pool->start_time);
 
-    // Initialize main task queue
     if (task_queue_init(&pool->task_queue, num_priorities) != 0)
     {
         free(pool);
         return NULL;
     }
 
-    // Initialize work-stealing queues
     if (enable_work_stealing)
     {
         pool->local_queues = calloc(pool->capacity, sizeof(task_queue_t));
@@ -346,7 +329,6 @@ thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
         }
     }
 
-    // Allocate threads and statistics
     pool->threads = calloc(pool->capacity, sizeof(pthread_t));
     pool->worker_stats = calloc(pool->capacity, sizeof(worker_stats_t));
 
@@ -371,7 +353,6 @@ thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
         return NULL;
     }
 
-    // Initialize worker statistics
     for (int i = 0; i < pool->capacity; i++)
     {
         atomic_init(&pool->worker_stats[i].tasks_executed, 0);
@@ -379,7 +360,6 @@ thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
         atomic_init(&pool->worker_stats[i].idle_time_ns, 0);
     }
 
-    // Create worker threads
     int created = 0;
     for (int i = 0; i < num_threads; i++)
     {
@@ -398,7 +378,6 @@ thread_pool_t *thread_pool_create(int num_threads, bool enable_work_stealing,
     return pool;
 }
 
-// Submit task to thread pool
 int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argument, int priority)
 {
     if (atomic_load(&pool->shutdown))
@@ -441,8 +420,6 @@ int thread_pool_submit(thread_pool_t *pool, void (*function)(void *), void *argu
     return -1;
 }
 
-
-// Destroy thraed pool
 void thread_pool_destroy(thread_pool_t *pool)
 {
     if (!pool)
@@ -450,7 +427,6 @@ void thread_pool_destroy(thread_pool_t *pool)
         return;
     }
 
-    // Signal shutdown
     atomic_store(&pool->shutdown, true);
 
     // Flag every queue as shutting down and wake all waiters, so workers parked
@@ -471,7 +447,6 @@ void thread_pool_destroy(thread_pool_t *pool)
         }
     }
 
-    // Wait for threads to finish
     for (int i = 0; i < pool->num_threads; i++)
     {
         pthread_join(pool->threads[i], NULL);
@@ -489,10 +464,8 @@ void thread_pool_destroy(thread_pool_t *pool)
         }
     }
 
-    // Cleanup
     task_queue_destroy(&pool->task_queue);
 
-    // Free local queues
     if (pool->local_queues)
     {
         for (int i = 0; i < pool->capacity; i++)

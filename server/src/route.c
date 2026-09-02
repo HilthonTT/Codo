@@ -109,7 +109,6 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
     return send_error_response(conn, HTTP_BAD_REQUEST, "Malformed request path");
   }
 
-  // Check if path is safe
   if (!is_valid_uri(path))
   {
     free(path);
@@ -132,7 +131,6 @@ int default_file_handler(connection_t *conn, http_request_t *request, http_respo
     return send_error_response(conn, HTTP_NOT_FOUND, "File not found");
   }
 
-  // Check if file exists
   struct stat file_stat;
   if (stat(file_path, &file_stat) < 0)
   {

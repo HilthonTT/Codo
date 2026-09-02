@@ -41,7 +41,6 @@ backend_t *backend_round_robin_select(load_balancer_t *lb)
 
   passive_recovery(lb);
 
-  // Calculate total weight of healthy backends
   for (int i = 0; i < lb->backend_count; i++)
   {
     if (lb->backends[i].health_status == 1)

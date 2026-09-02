@@ -56,69 +56,6 @@ static const char *request_header(const http_request_t *request, const char *nam
   return NULL;
 }
 
-static int send_json(connection_t *conn, http_request_t *request,
-                     http_response_t *response, http_status_t status,
-                     const char *json)
-{
-  response->status = status;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-
-  if (response->body)
-  {
-    free(response->body);
-    response->body = NULL;
-  }
-  response->body = strdup(json ? json : "");
-  if (!response->body)
-  {
-    return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Out of memory");
-  }
-  response->body_length = strlen(response->body);
-  response->keep_alive = request->keep_alive;
-
-  snprintf(response->headers[0].name, sizeof(response->headers[0].name), "Content-Type");
-  snprintf(response->headers[0].value, sizeof(response->headers[0].value), "application/json");
-  response->header_count = 1;
-
-  return send_http_response(conn, response);
-}
-
-static int send_error_json(connection_t *conn, http_request_t *request,
-                           http_response_t *response, http_status_t status,
-                           const char *msg)
-{
-  char body[192];
-  snprintf(body, sizeof(body), "{\"error\":\"%s\"}", msg);
-
-  int rc = 0;
-  response->status = status;
-  snprintf(response->version, sizeof(response->version), "HTTP/1.1");
-  if (response->body)
-  {
-    free(response->body);
-    response->body = NULL;
-  }
-  response->body = strdup(body);
-  response->body_length = response->body ? strlen(response->body) : 0;
-  response->keep_alive = request->keep_alive;
-
-  int h = 0;
-  snprintf(response->headers[h].name, sizeof(response->headers[h].name), "Content-Type");
-  snprintf(response->headers[h].value, sizeof(response->headers[h].value), "application/json");
-  h++;
-  if (status == HTTP_UNAUTHORIZED)
-  {
-    snprintf(response->headers[h].name, sizeof(response->headers[h].name), "WWW-Authenticate");
-    snprintf(response->headers[h].value, sizeof(response->headers[h].value),
-             "Bearer realm=\"codo\", charset=\"UTF-8\"");
-    h++;
-  }
-  response->header_count = h;
-
-  rc = send_http_response(conn, response);
-  return rc;
-}
-
 static void hex_encode(const uint8_t *in, size_t n, char *out)
 {
   static const char digits[] = "0123456789abcdef";
@@ -386,7 +323,7 @@ int user_register_handler(connection_t *conn, http_request_t *request,
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR,
                                "Response too large");
   }
-  return send_json(conn, request, response, HTTP_CREATED, body);
+  return send_json_response(conn, request, response, HTTP_CREATED, body);
 }
 
 int user_login_handler(connection_t *conn, http_request_t *request,
@@ -448,7 +385,7 @@ int user_login_handler(connection_t *conn, http_request_t *request,
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR,
                                "Response too large");
   }
-  return send_json(conn, request, response, HTTP_OK, body);
+  return send_json_response(conn, request, response, HTTP_OK, body);
 }
 
 int user_me_handler(connection_t *conn, http_request_t *request,
@@ -458,7 +395,7 @@ int user_me_handler(connection_t *conn, http_request_t *request,
   char body[128];
   snprintf(body, sizeof(body), "{\"id\":%llu,\"username\":\"%s\"}",
            (unsigned long long)conn->auth_user_id, conn->auth_username);
-  return send_json(conn, request, response, HTTP_OK, body);
+  return send_json_response(conn, request, response, HTTP_OK, body);
 }
 
 // The routes that serve per-user data. /api/auth/register and /api/auth/login

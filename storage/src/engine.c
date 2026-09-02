@@ -19,10 +19,8 @@ int perform_checkpoint(void)
 
   atomic_fetch_add(&g_storage.stats.checkpoints_performed, 1);
 
-  // Flush WAL buffer
   flush_wal_buffer();
 
-  // Write all dirty pages to disk
   pthread_mutex_lock(&g_storage.buffer_mutex);
 
   for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
@@ -42,10 +40,8 @@ int perform_checkpoint(void)
 
   pthread_mutex_unlock(&g_storage.buffer_mutex);
 
-  // Sync data file
   fsync(g_storage.data_fd);
 
-  // Write checkpoint record
   write_wal_record(0, WAL_CHECKOUT, 0, NULL, 0);
   flush_wal_buffer();
 
@@ -56,60 +52,14 @@ int perform_checkpoint(void)
   return 0;
 }
 
-int init_storage_engine(const char *data_file, const char *wal_file)
+// Point every hash bucket at "empty" and give each buffer-pool slot its page
+// lock. Returns 0, or -1 when the hash table cannot be allocated.
+static int init_buffer_pool(void)
 {
-  memset(&g_storage, 0, sizeof(g_storage));
-
-  // Configuration
-  g_storage.config.enable_checksums = true;
-  g_storage.config.enable_wal = true;
-  g_storage.config.checkpoint_interval = 10000;
-  g_storage.config.wal_segment_size = 64 * 1024 * 1024;
-  g_storage.config.buffer_pool_hit_ratio_target = 0.95;
-
-  // Open data file
-  g_storage.data_fd = open(data_file, O_RDWR | O_CREAT, 0644);
-  if (g_storage.data_fd < 0)
-  {
-    perror("open data file");
-    return -1;
-  }
-
-  g_storage.data_filename = strdup(data_file);
-
-  // Open WAL file
-  g_storage.wal_fd = open(wal_file, O_RDWR | O_CREAT | O_APPEND, 0644);
-  if (g_storage.wal_fd < 0)
-  {
-    perror("open WAL file");
-    close(g_storage.data_fd);
-    free(g_storage.data_filename);
-    return -1;
-  }
-
-  g_storage.wal_filename = strdup(wal_file);
-
-  // Initialize WAL buffer
-  g_storage.wal_buffer = malloc(WAL_BUFFER_SIZE);
-  if (!g_storage.wal_buffer)
-  {
-    close(g_storage.data_fd);
-    close(g_storage.wal_fd);
-    free(g_storage.data_filename);
-    free(g_storage.wal_filename);
-    return -1;
-  }
-
-  // Initialize hash table for buffer pool
   g_storage.hash_table_size = BUFFER_POOL_SIZE * 2;
   g_storage.hash_table = malloc(g_storage.hash_table_size * sizeof(uint32_t));
   if (!g_storage.hash_table)
   {
-    close(g_storage.data_fd);
-    close(g_storage.wal_fd);
-    free(g_storage.data_filename);
-    free(g_storage.wal_filename);
-    free(g_storage.wal_buffer);
     return -1;
   }
 
@@ -118,7 +68,6 @@ int init_storage_engine(const char *data_file, const char *wal_file)
     g_storage.hash_table[i] = UINT32_MAX;
   }
 
-  // Initialize buffer pool
   for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
   {
     buffer_entry_t *entry = &g_storage.buffer_pool[i];
@@ -126,37 +75,81 @@ int init_storage_engine(const char *data_file, const char *wal_file)
     entry->hash_next = UINT32_MAX;
   }
 
-  // Initialize mutexes
   pthread_mutex_init(&g_storage.buffer_mutex, NULL);
   pthread_mutex_init(&g_storage.free_page_mutex, NULL);
   pthread_mutex_init(&g_storage.txn_mutex, NULL);
   pthread_mutex_init(&g_storage.wal_mutex, NULL);
   pthread_rwlock_init(&g_storage.tree_lock, NULL);
+  return 0;
+}
 
-  // Initialize counters
-  g_storage.next_txn_id = 1;
-  g_storage.next_lsn = 1;
-  g_storage.root_page_id = 1;
-
-  // Recover the page allocator from the data file's extent. The allocator is
-  // not persisted anywhere, so without this every restart would start handing
-  // out page 1 again -- the root -- and the first split after a restart would
-  // write a new node straight over live data. Rounding up covers a torn final
-  // page: the id it occupies is treated as taken.
-  //
-  // Pages freed by deallocate_page() before the restart are not recovered and
-  // simply leak; reclaiming them needs the free list on disk, which belongs
-  // with the WAL replay work below.
+// Recover the page allocator from the data file's extent and return the number
+// of pages already in the file. The allocator is not persisted anywhere, so
+// without this every restart would start handing out page 1 again -- the root
+// -- and the first split after a restart would write a new node straight over
+// live data. Rounding up covers a torn final page: the id it occupies is
+// treated as taken.
+//
+// Pages freed by deallocate_page() before the restart are not recovered and
+// simply leak; reclaiming them needs the free list on disk, which belongs with
+// the WAL replay work below.
+static uint32_t recover_page_allocator(void)
+{
   struct stat data_st;
   uint32_t pages_in_file = 0;
   if (fstat(g_storage.data_fd, &data_st) == 0 && data_st.st_size > 0)
   {
-    pages_in_file =
-        (uint32_t)(((uint64_t)data_st.st_size + PAGE_SIZE - 1) / PAGE_SIZE);
+    pages_in_file = (uint32_t)(((uint64_t)data_st.st_size + PAGE_SIZE - 1) / PAGE_SIZE);
   }
+
   g_storage.next_page_id = pages_in_file > g_storage.root_page_id
                                ? pages_in_file
                                : g_storage.root_page_id + 1;
+  return pages_in_file;
+}
+
+int init_storage_engine(const char *data_file, const char *wal_file)
+{
+  memset(&g_storage, 0, sizeof(g_storage));
+
+  g_storage.config.enable_checksums = true;
+  g_storage.config.enable_wal = true;
+  g_storage.config.checkpoint_interval = 10000;
+  g_storage.config.wal_segment_size = 64 * 1024 * 1024;
+  g_storage.config.buffer_pool_hit_ratio_target = 0.95;
+
+  g_storage.data_fd = open(data_file, O_RDWR | O_CREAT, 0644);
+  if (g_storage.data_fd < 0)
+  {
+    perror("open data file");
+    return -1;
+  }
+  g_storage.data_filename = strdup(data_file);
+
+  g_storage.wal_fd = open(wal_file, O_RDWR | O_CREAT | O_APPEND, 0644);
+  if (g_storage.wal_fd < 0)
+  {
+    perror("open WAL file");
+    goto fail_data_file;
+  }
+  g_storage.wal_filename = strdup(wal_file);
+
+  g_storage.wal_buffer = malloc(WAL_BUFFER_SIZE);
+  if (!g_storage.wal_buffer)
+  {
+    goto fail_wal_file;
+  }
+
+  if (init_buffer_pool() != 0)
+  {
+    goto fail_wal_buffer;
+  }
+
+  g_storage.next_txn_id = 1;
+  g_storage.next_lsn = 1;
+  g_storage.root_page_id = 1;
+
+  uint32_t pages_in_file = recover_page_allocator();
 
   // TODO(durability): WAL crash-recovery replay is NOT implemented. On restart
   // we do not scan the WAL to redo committed changes / undo uncommitted ones,
@@ -165,7 +158,6 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   // write-ahead ordering (WAL is flushed before dirty pages are written back),
   // but full recovery still needs a replay pass here.
 
-  // Initialize root page if file is empty
   if (pages_in_file == 0)
   {
     btree_page_t *root_page = get_page(g_storage.root_page_id, LOCK_EXCLUSIVE);
@@ -178,19 +170,27 @@ int init_storage_engine(const char *data_file, const char *wal_file)
   }
 
   printf("Storage engine initialized\n");
-  printf("Data file: %s (%u page(s), next page id %u)\n", data_file,
-         pages_in_file, g_storage.next_page_id);
+  printf("Data file: %s (%u page(s), next page id %u)\n", data_file, pages_in_file,
+         g_storage.next_page_id);
   printf("WAL file: %s\n", wal_file);
 
   return 0;
+
+fail_wal_buffer:
+  free(g_storage.wal_buffer);
+fail_wal_file:
+  close(g_storage.wal_fd);
+  free(g_storage.wal_filename);
+fail_data_file:
+  close(g_storage.data_fd);
+  free(g_storage.data_filename);
+  return -1;
 }
 
 void cleanup_storage_engine(void)
 {
-  // Perform final checkpoint
   perform_checkpoint();
 
-  // Close files
   if (g_storage.data_fd >= 0)
   {
     close(g_storage.data_fd);
@@ -201,14 +201,12 @@ void cleanup_storage_engine(void)
     close(g_storage.wal_fd);
   }
 
-  // Free memory
   free(g_storage.data_filename);
   free(g_storage.wal_filename);
   free(g_storage.wal_buffer);
   free(g_storage.hash_table);
   free(g_storage.free_pages);
 
-  // Cleanup buffer pool
   for (size_t i = 0; i < BUFFER_POOL_SIZE; i++)
   {
     buffer_entry_t *entry = &g_storage.buffer_pool[i];

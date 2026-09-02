@@ -179,6 +179,156 @@ static void ws_append_close(connection_t *conn, uint16_t code)
   ws_append_frame(conn, WS_OP_CLOSE, payload, sizeof(payload));
 }
 
+// One decoded client frame: the header fields plus where its payload sits in
+// the read buffer.
+typedef struct
+{
+  bool fin;
+  unsigned char opcode;
+  const unsigned char *mask;
+  size_t payload_off;
+  uint64_t len;
+  size_t frame_end;
+} ws_frame_t;
+
+// Decode the frame header at buf[off]. Returns 1 when a complete frame is
+// present (filling *frame), 0 when more bytes are still needed, and -1 on a
+// protocol violation, with *close_code set to the status to report.
+static int ws_decode_frame(const unsigned char *buf, size_t avail, size_t off,
+                           size_t cap, ws_frame_t *frame, uint16_t *close_code)
+{
+  // Minimum frame header is 2 bytes.
+  if (avail - off < 2)
+  {
+    return 0;
+  }
+
+  unsigned char b0 = buf[off];
+  unsigned char b1 = buf[off + 1];
+  bool masked = (b1 & 0x80) != 0;
+  uint64_t len = b1 & 0x7F;
+  size_t header = 2;
+
+  frame->fin = (b0 & 0x80) != 0;
+  frame->opcode = b0 & 0x0F;
+
+  // We negotiated no extensions, so any reserved bit set is a protocol error.
+  if ((b0 & 0x70) != 0)
+  {
+    *close_code = WS_CLOSE_PROTOCOL_ERROR;
+    return -1;
+  }
+
+  if (len == 126)
+  {
+    if (avail - off < 4)
+    {
+      return 0; // need the 16-bit extended length
+    }
+    len = ((uint64_t)buf[off + 2] << 8) | buf[off + 3];
+    header = 4;
+  }
+  else if (len == 127)
+  {
+    if (avail - off < 10)
+    {
+      return 0; // need the 64-bit extended length
+    }
+    len = 0;
+    for (int i = 0; i < 8; i++)
+    {
+      len = (len << 8) | buf[off + 2 + i];
+    }
+    header = 10;
+  }
+
+  // Client-to-server frames MUST be masked (RFC 6455 section 5.1).
+  if (!masked)
+  {
+    *close_code = WS_CLOSE_PROTOCOL_ERROR;
+    return -1;
+  }
+
+  // A frame whose payload cannot fit in our buffer can never be assembled.
+  if (len > cap)
+  {
+    *close_code = WS_CLOSE_MESSAGE_TOO_BIG;
+    return -1;
+  }
+
+  size_t mask_off = off + header;
+  if (avail - mask_off < 4)
+  {
+    return 0; // masking key not fully received yet
+  }
+  frame->mask = buf + mask_off;
+  frame->payload_off = mask_off + 4;
+  if (avail - frame->payload_off < len)
+  {
+    return 0; // full payload not yet received
+  }
+
+  frame->len = len;
+  frame->frame_end = frame->payload_off + (size_t)len;
+  return 1;
+}
+
+// Act on one decoded frame, staging whatever reply it calls for. Returns true
+// when the connection should shut down once that reply has flushed.
+static bool ws_handle_frame(connection_t *conn, const ws_frame_t *frame,
+                            const unsigned char *payload)
+{
+  switch (frame->opcode)
+  {
+  case WS_OP_TEXT:
+  case WS_OP_BINARY:
+    // This echo server does not reassemble fragmented messages; a data frame
+    // must be self-contained (FIN set). Reject fragmentation cleanly rather
+    // than emit a bogus reply.
+    if (!frame->fin)
+    {
+      ws_append_close(conn, WS_CLOSE_UNSUPPORTED_DATA);
+      return true;
+    }
+    if (ws_append_frame(conn, frame->opcode, payload, (size_t)frame->len) != 0)
+    {
+      ws_append_close(conn, WS_CLOSE_MESSAGE_TOO_BIG);
+      return true;
+    }
+    return false;
+
+  case WS_OP_PING:
+    // Control frames are never fragmented and carry <=125 payload bytes.
+    if (!frame->fin || frame->len > 125)
+    {
+      ws_append_close(conn, WS_CLOSE_PROTOCOL_ERROR);
+      return true;
+    }
+    ws_append_frame(conn, WS_OP_PONG, payload, (size_t)frame->len);
+    return false;
+
+  case WS_OP_PONG:
+    return false; // unsolicited/echoed pong: nothing to do
+
+  case WS_OP_CLOSE:
+  {
+    // Echo the peer's close code (default to normal) and shut down.
+    uint16_t code = WS_CLOSE_NORMAL;
+    if (frame->len >= 2)
+    {
+      code = (uint16_t)((payload[0] << 8) | payload[1]);
+    }
+    ws_append_close(conn, code);
+    return true;
+  }
+
+  default:
+    // Reserved / unknown opcode (including a stray continuation frame).
+    ws_append_close(conn, WS_CLOSE_PROTOCOL_ERROR);
+    return true;
+  }
+}
+
 int ws_process_frames(connection_t *conn, bool *should_close)
 {
   *should_close = false;
@@ -189,148 +339,36 @@ int ws_process_frames(connection_t *conn, bool *should_close)
 
   while (off < avail)
   {
-    // Minimum frame header is 2 bytes.
-    if (avail - off < 2)
+    ws_frame_t frame;
+    uint16_t close_code = 0;
+    int decoded =
+        ws_decode_frame(buf, avail, off, conn->read_buffer_cap, &frame, &close_code);
+    if (decoded == 0)
     {
-      break;
+      break; // frame still arriving
     }
-
-    unsigned char b0 = buf[off];
-    unsigned char b1 = buf[off + 1];
-    bool fin = (b0 & 0x80) != 0;
-    unsigned char rsv = b0 & 0x70;
-    unsigned char opcode = b0 & 0x0F;
-    bool masked = (b1 & 0x80) != 0;
-    uint64_t len = b1 & 0x7F;
-    size_t header = 2;
-
-    // We negotiated no extensions, so any reserved bit set is a protocol error.
-    if (rsv != 0)
+    if (decoded < 0)
     {
-      ws_append_close(conn, WS_CLOSE_PROTOCOL_ERROR);
+      // The header is unusable, so its bytes stay put rather than being
+      // consumed -- the connection goes down with the staged Close either way.
+      ws_append_close(conn, close_code);
       *should_close = true;
       break;
-    }
-
-    if (len == 126)
-    {
-      if (avail - off < 4)
-      {
-        break; // need the 16-bit extended length
-      }
-      len = ((uint64_t)buf[off + 2] << 8) | buf[off + 3];
-      header = 4;
-    }
-    else if (len == 127)
-    {
-      if (avail - off < 10)
-      {
-        break; // need the 64-bit extended length
-      }
-      len = 0;
-      for (int i = 0; i < 8; i++)
-      {
-        len = (len << 8) | buf[off + 2 + i];
-      }
-      header = 10;
-    }
-
-    // Client-to-server frames MUST be masked (RFC 6455 section 5.1).
-    if (!masked)
-    {
-      ws_append_close(conn, WS_CLOSE_PROTOCOL_ERROR);
-      *should_close = true;
-      break;
-    }
-
-    // A frame whose payload cannot fit in our buffer can never be assembled.
-    if (len > conn->read_buffer_cap)
-    {
-      ws_append_close(conn, WS_CLOSE_MESSAGE_TOO_BIG);
-      *should_close = true;
-      break;
-    }
-
-    size_t mask_off = off + header;
-    if (avail - mask_off < 4)
-    {
-      break; // masking key not fully received yet
-    }
-    const unsigned char *mask = buf + mask_off;
-    size_t payload_off = mask_off + 4;
-    if (avail - payload_off < len)
-    {
-      break; // full payload not yet received
     }
 
     // Unmask the payload in place; we own these bytes until we consume them.
-    unsigned char *payload = buf + payload_off;
-    for (uint64_t i = 0; i < len; i++)
+    unsigned char *payload = buf + frame.payload_off;
+    for (uint64_t i = 0; i < frame.len; i++)
     {
-      payload[i] ^= mask[i % 4];
+      payload[i] ^= frame.mask[i % 4];
     }
 
-    size_t frame_end = payload_off + (size_t)len;
-
-    if (opcode == WS_OP_TEXT || opcode == WS_OP_BINARY)
+    *should_close = ws_handle_frame(conn, &frame, payload);
+    off = frame.frame_end;
+    if (*should_close)
     {
-      // This echo server does not reassemble fragmented messages; a data frame
-      // must be self-contained (FIN set). Reject fragmentation cleanly rather
-      // than emit a bogus reply.
-      if (!fin)
-      {
-        ws_append_close(conn, WS_CLOSE_UNSUPPORTED_DATA);
-        *should_close = true;
-        off = frame_end;
-        break;
-      }
-      if (ws_append_frame(conn, opcode, payload, (size_t)len) != 0)
-      {
-        ws_append_close(conn, WS_CLOSE_MESSAGE_TOO_BIG);
-        *should_close = true;
-        off = frame_end;
-        break;
-      }
-    }
-    else if (opcode == WS_OP_PING)
-    {
-      // Control frames are never fragmented and carry <=125 payload bytes.
-      if (!fin || len > 125)
-      {
-        ws_append_close(conn, WS_CLOSE_PROTOCOL_ERROR);
-        *should_close = true;
-        off = frame_end;
-        break;
-      }
-      ws_append_frame(conn, WS_OP_PONG, payload, (size_t)len);
-    }
-    else if (opcode == WS_OP_PONG)
-    {
-      // Unsolicited/echoed pong: nothing to do.
-    }
-    else if (opcode == WS_OP_CLOSE)
-    {
-      // Echo the peer's close code (default to normal) and shut down.
-      uint16_t code = WS_CLOSE_NORMAL;
-      if (len >= 2)
-      {
-        code = (uint16_t)((payload[0] << 8) | payload[1]);
-      }
-      ws_append_close(conn, code);
-      *should_close = true;
-      off = frame_end;
       break;
     }
-    else
-    {
-      // Reserved / unknown opcode (including a stray continuation frame).
-      ws_append_close(conn, WS_CLOSE_PROTOCOL_ERROR);
-      *should_close = true;
-      off = frame_end;
-      break;
-    }
-
-    off = frame_end;
   }
 
   // Drop the consumed frames, keeping any trailing partial frame at the front.

@@ -22,4 +22,10 @@ void format_http_date(time_t t, char *buf, size_t buf_size);
 // (time_t)-1 when the value doesn't parse.
 time_t parse_http_date(const char *value);
 
+// Append a formatted fragment at buf[*off], advancing *off past it. Returns 0
+// on success and -1 when the result would not fit, leaving *off unchanged so
+// the caller can abandon a partially-built buffer.
+int buf_appendf(char *buf, size_t size, size_t *off, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
 #endif

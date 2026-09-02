@@ -54,7 +54,6 @@ int balancer_add_backends(load_balancer_t *lb, const char *spec)
   for (char *tok = strtok_r(buf, ",", &saveptr); tok != NULL;
        tok = strtok_r(NULL, ",", &saveptr))
   {
-    // Trim leading whitespace.
     while (*tok == ' ' || *tok == '\t')
     {
       tok++;

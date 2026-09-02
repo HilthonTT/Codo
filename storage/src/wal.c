@@ -35,7 +35,6 @@ int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, 
     return -1;
   }
 
-  // Check if we need to flush the buffer
   if (g_storage.wal_buffer_pos + record_size > WAL_BUFFER_SIZE)
   {
     // Write buffer to disk with EINTR/partial-write retry. On failure we must
