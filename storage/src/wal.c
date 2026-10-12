@@ -85,8 +85,10 @@ int write_wal_record(uint64_t txn_id, wal_record_type_t type, uint32_t page_id, 
   }
 
   // Checksum the real content only (padding excluded), matching what a reader
-  // would recompute over header+payload.
-  record->checksum = calculate_checksum(record, content_size - sizeof(record->checksum));
+  // would recompute over header+payload with the checksum field zeroed (the
+  // same convention as page checksums).
+  record->checksum = 0;
+  record->checksum = calculate_checksum(record, content_size);
 
   g_storage.wal_buffer_pos += record_size;
   atomic_fetch_add(&g_storage.stats.wal_records_written, 1);

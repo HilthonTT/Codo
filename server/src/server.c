@@ -139,7 +139,6 @@ int http_server_start(http_server_t *server)
     {
       // Only count connections that were actually handed off successfully.
       atomic_fetch_add(&server->total_connections, 1);
-      atomic_fetch_add(&server->active_connections_count, 1);
     }
 
     worker_index = (worker_index + 1) % server->worker_count;

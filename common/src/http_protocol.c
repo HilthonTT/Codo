@@ -32,9 +32,10 @@ int http_parse_content_length(const char *value, size_t *out)
   {
     value++;
   }
-  // Content-Length must be a bare digit string. Reject empty and any explicit
-  // sign -- a leading '-' would otherwise be silently wrapped by strtoul.
-  if (*value == '\0' || *value == '-' || *value == '+')
+  // Content-Length must be a bare digit string. Reject empty, any explicit sign
+  // and any other leading byte -- strtoul would skip further whitespace (\v, \f,
+  // \r, \n) and then accept a sign, silently wrapping "-1" to ULONG_MAX.
+  if (*value < '0' || *value > '9')
   {
     return -1;
   }
@@ -656,8 +657,11 @@ int send_http_response(connection_t *conn, http_response_t *response)
   // Copy headers (and, unless a file is being streamed, the body) to the write
   // buffer. For a streamed file only the headers are staged here; the body bytes
   // are pumped from the fd by the write path, so they don't count toward the
-  // in-memory response cap.
-  size_t body_in_buffer = (streaming_file || no_body) ? 0 : out_body_len;
+  // in-memory response cap. A HEAD response carries the headers (Content-Length
+  // included) a GET would, but never the body: those bytes would otherwise be
+  // read by the client as the start of the next response.
+  bool head = (conn->request.method == HTTP_HEAD);
+  size_t body_in_buffer = (streaming_file || no_body || head) ? 0 : out_body_len;
   size_t total_size = (size_t)header_len + body_in_buffer;
   if (!conn_reserve_write(conn, total_size))
   {
@@ -671,6 +675,16 @@ int send_http_response(connection_t *conn, http_response_t *response)
     memcpy(conn->write_buffer + header_len, out_body, body_in_buffer);
   }
   free(gzip_buf);
+
+  // HEAD: the queued file's length is already in Content-Length; release the fd
+  // so the write path does not sendfile() the body after the headers.
+  if (streaming_file && head)
+  {
+    close(conn->file_fd);
+    conn->file_fd = -1;
+    conn->file_offset = 0;
+    conn->file_size = 0;
+  }
 
   conn->write_buffer_pos = 0;
   conn->write_buffer_size = total_size;

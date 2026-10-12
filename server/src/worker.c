@@ -138,8 +138,10 @@ static void conn_consume_read(connection_t *conn, size_t len)
 }
 
 // Re-arm this connection's socket in its worker's epoll set. An `events` mask
-// of 0 parks the connection, which is how it is hidden from the event loop
-// while a pool thread owns it.
+// of just EPOLLET parks the connection, which is how it is hidden from the
+// event loop while a pool thread owns it. (A bare 0 would not do: the kernel
+// always adds EPOLLERR|EPOLLHUP, and without EPOLLET those are level-triggered,
+// so a peer reset during an offloaded handler would spin the worker.)
 static int arm_socket(worker_thread_t *worker, connection_t *conn, uint32_t events)
 {
   struct epoll_event ev;
@@ -595,19 +597,36 @@ static int check_request_frame(connection_t *conn, size_t max_body,
   // Scan by length, not with strstr: a NUL byte anywhere in the request would
   // otherwise hide the header terminator from every later read, leaving the
   // connection to sit until the keep-alive reaper collects it.
-  size_t term_len = 4;
-  const char *hdr_end = memmem(buf, avail, "\r\n\r\n", 4);
-  if (!hdr_end)
+  //
+  // The headers end at the FIRST blank line, CRLF or bare LF, exactly as the
+  // parser's next_line() sees it. Searching for "\r\n\r\n" anywhere before
+  // falling back to "\n\n" would, for a bare-LF request followed by a
+  // pipelined CRLF one, frame both as a single request.
+  const char *hdr_end = NULL; // the '\n' ending the last header line
+  size_t header_len = 0;
+  for (const char *p = buf; p < buf + avail; p++)
   {
-    hdr_end = memmem(buf, avail, "\n\n", 2);
-    term_len = 2;
+    p = memchr(p, '\n', (size_t)(buf + avail - p));
+    if (!p)
+    {
+      break;
+    }
+    const char *q = p + 1;
+    if (q < buf + avail && *q == '\r')
+    {
+      q++;
+    }
+    if (q < buf + avail && *q == '\n')
+    {
+      hdr_end = p;
+      header_len = (size_t)(q - buf) + 1;
+      break;
+    }
   }
   if (!hdr_end)
   {
     return 0; // header terminator not seen yet
   }
-
-  size_t header_len = (size_t)(hdr_end - buf) + term_len;
 
   // A NUL cannot appear in a request line or header field. Rejecting it
   // outright stops a header from being truncated at the NUL by the
@@ -831,11 +850,13 @@ static int handle_websocket_data(worker_thread_t *worker, connection_t *conn)
 // Drain everything currently readable on the socket into the read buffer.
 // Edge-triggered epoll, so we must keep reading until it would block. Sets
 // *buffer_full when the configured request ceiling was reached with bytes
-// still pending. Returns 0 to carry on, -1 to tear the connection down.
+// still pending, and *peer_closed when the peer half-closed after sending
+// what is buffered. Returns 0 to carry on, -1 to tear the connection down.
 static int drain_socket_reads(worker_thread_t *worker, connection_t *conn,
-                              bool *buffer_full)
+                              bool *buffer_full, bool *peer_closed)
 {
   *buffer_full = false;
+  *peer_closed = false;
 
   for (;;)
   {
@@ -862,6 +883,14 @@ static int drain_socket_reads(worker_thread_t *worker, connection_t *conn,
                               &bytes_read);
     if (r == IO_WOULD_BLOCK)
     {
+      return 0;
+    }
+    if (r == IO_CLOSED && conn->read_buffer_pos > 0)
+    {
+      // The peer sent its request and then shut down its write side (FIN in
+      // the same burst, e.g. `printf ... | nc -N`). Still answer what is
+      // buffered; the next read after the response sees EOF and tears down.
+      *peer_closed = true;
       return 0;
     }
     if (r != IO_OK)
@@ -911,7 +940,7 @@ static bool dispatch_offloaded(worker_thread_t *worker, connection_t *conn,
   // owns it) and flag it so the event loop and timeout sweep leave it alone.
   // Set before submit so the pool's re-arm is the only clear.
   atomic_store(&conn->offloaded, true);
-  arm_socket(worker, conn, 0);
+  arm_socket(worker, conn, EPOLLET);
 
   if (thread_pool_submit(g_server.pool, run_offloaded_handler, task,
                          request_priority(&conn->request)) == 0)
@@ -947,7 +976,8 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
   }
 
   bool buffer_full = false;
-  if (drain_socket_reads(worker, conn, &buffer_full) != 0)
+  bool peer_closed = false;
+  if (drain_socket_reads(worker, conn, &buffer_full, &peer_closed) != 0)
   {
     return -1;
   }
@@ -964,7 +994,7 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
     }
     if (pr == 0)
     {
-      return 0; // header still arriving
+      return peer_closed ? -1 : 0; // header still arriving
     }
     conn->proxy_header_done = true;
   }
@@ -982,6 +1012,10 @@ int handle_client_data(worker_thread_t *worker, connection_t *conn)
       // Nothing complete and nowhere left to put more: the request genuinely
       // does not fit.
       return reject_request(worker, conn, HTTP_PAYLOAD_TOO_LARGE, "Request too large");
+    }
+    if (peer_closed)
+    {
+      return -1; // the rest of the request can never arrive
     }
     // Headers complete but the body still in flight: honor Expect:
     // 100-continue (once) so a waiting client releases the body.
@@ -1085,6 +1119,9 @@ static int flush_write_buffer(worker_thread_t *worker, connection_t *conn)
     }
 
     conn->write_buffer_pos += written;
+    // Count write progress as activity, or the idle reaper kills a large
+    // response mid-transfer to a slow reader.
+    conn->last_activity = time(NULL);
     worker->bytes_sent += (uint64_t)written;
     stats_record_bytes_sent((uint64_t)written);
   }
@@ -1116,8 +1153,11 @@ static int stream_queued_file(worker_thread_t *worker, connection_t *conn)
     }
     if (sent == 0)
     {
-      break; // file shrank under us; stop rather than spin
+      // File shrank under us. Content-Length already promised the full size,
+      // so keeping the connection would desync the next response; drop it.
+      return -1;
     }
+    conn->last_activity = time(NULL);
     worker->bytes_sent += (uint64_t)sent;
     stats_record_bytes_sent((uint64_t)sent);
   }
@@ -1201,7 +1241,11 @@ int handle_client_write(worker_thread_t *worker, connection_t *conn)
     return arm_socket(worker, conn, EPOLLIN | EPOLLET) < 0 ? -1 : 0;
   }
 
-  if (!conn->request.keep_alive || !g_server.enable_keepalive)
+  // Honor a "Connection: close" the response announced (every
+  // send_error_response does, including reject_request's) as well as the
+  // client's own preference.
+  if (!conn->request.keep_alive || !conn->response.keep_alive ||
+      !g_server.enable_keepalive)
   {
     return -1;
   }

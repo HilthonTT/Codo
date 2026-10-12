@@ -1,3 +1,4 @@
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -41,6 +42,14 @@ static _Atomic uint64_t g_next_todo_id = 1;
 // near-permanent miss; its individual rows are read through the transaction
 // rather than this cache, so one listing is a consistent snapshot.
 static lru_cache_t *g_todo_cache = NULL;
+
+// Serializes update and delete of existing todos. A transaction gives no
+// isolation (storage/src/txn.c), so without this two writers on one id can
+// interleave: an update's delete+insert racing a delete re-creates the row
+// after its index entry is gone (hidden from listings), and two updates can
+// reach lru_put in the opposite order to their storage writes, leaving the
+// cache serving a value that is no longer stored.
+static pthread_mutex_t g_todo_write_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static const char TODO_COLLECTION[] = "/api/todos";
 static const char TODO_ITEM_PREFIX[] = "/api/todos/";
@@ -427,9 +436,9 @@ int todo_list_handler(connection_t *conn, http_request_t *request, http_response
       list.error = true;
     }
   }
-  else
+  else if (db_scan(txn, list_scan_cb, &list) != 0)
   {
-    db_scan(txn, list_scan_cb, &list);
+    list.error = true;
   }
 
   commit_transaction(txn);
@@ -628,9 +637,12 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
     return send_error_response(conn, HTTP_PAYLOAD_TOO_LARGE, "Todo too large");
   }
 
+  pthread_mutex_lock(&g_todo_write_lock);
+
   transaction_t *txn = begin_transaction();
   if (!txn)
   {
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
   }
 
@@ -641,6 +653,7 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   {
     commit_transaction(txn);
     free(txn);
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
   if (existing_len > MAX_VALUE_SIZE)
@@ -651,6 +664,7 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   {
     commit_transaction(txn);
     free(txn);
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
 
@@ -661,23 +675,28 @@ int todo_update_handler(connection_t *conn, http_request_t *request, http_respon
   if (rc == 0)
   {
     rc = db_insert(txn, key, key_len, value, (size_t)value_len);
+    if (rc != 0 && db_insert(txn, key, key_len, existing, existing_len) != 0)
+    {
+      // The abort path has no undo, so the deleted row has to be put back by
+      // hand. If even that failed the row is gone, and so must the cache be.
+      lru_invalidate(g_todo_cache, key);
+    }
   }
 
   if (rc != 0)
   {
-    // Either the delete or the insert failed; roll back so a committed delete
-    // can never leave the todo lost while we return an error.
     abort_transaction(txn);
     free(txn);
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Update failed");
   }
 
   commit_transaction(txn);
   free(txn);
 
-  // The write is durable, so the cache can now be moved to the new value. (The
-  // abort path above leaves storage untouched, and with it the cached entry.)
+  // The write is durable, so the cache can now be moved to the new value.
   lru_put(g_todo_cache, key, value, (size_t)value_len);
+  pthread_mutex_unlock(&g_todo_write_lock);
 
   return send_json_response(conn, request, response, HTTP_OK, value);
 }
@@ -693,9 +712,12 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
 
   size_t key_len = strlen(key);
 
+  pthread_mutex_lock(&g_todo_write_lock);
+
   transaction_t *txn = begin_transaction();
   if (!txn)
   {
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_INTERNAL_SERVER_ERROR, "Transaction failed");
   }
 
@@ -705,6 +727,7 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
   {
     commit_transaction(txn);
     free(txn);
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
   if (existing_len > MAX_VALUE_SIZE)
@@ -715,6 +738,7 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
   {
     commit_transaction(txn);
     free(txn);
+    pthread_mutex_unlock(&g_todo_write_lock);
     return send_error_response(conn, HTTP_NOT_FOUND, "Todo not found");
   }
 
@@ -734,6 +758,7 @@ int todo_delete_handler(connection_t *conn, http_request_t *request, http_respon
   free(txn);
 
   lru_invalidate(g_todo_cache, key);
+  pthread_mutex_unlock(&g_todo_write_lock);
 
   return send_json_response(conn, request, response, HTTP_NO_CONTENT, "");
 }

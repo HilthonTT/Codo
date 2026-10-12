@@ -72,7 +72,7 @@ static void send_503(int client_fd)
     static const char body[] =
         "HTTP/1.1 503 Service Unavailable\r\n"
         "Content-Type: text/plain\r\n"
-        "Content-Length: 19\r\n"
+        "Content-Length: 20\r\n"
         "Connection: close\r\n"
         "\r\n"
         "No backend available";
@@ -110,7 +110,7 @@ static void update_epoll_interest(load_balancer_t *lb, lb_connection_t *conn)
     bool b2c_pending = conn->backend_buffer_len > conn->backend_buffer_sent;
 
     // only read a fresh chunk from a side once its outbound buffer is drained.
-    if (!c2b_pending)
+    if (!c2b_pending && !conn->client_eof)
     {
         client_events |= EPOLLIN; // willing to read from client
     }
@@ -164,9 +164,18 @@ int load_balancer_main_loop(load_balancer_t *lb)
 
             lb_connection_t *conn = ctx->conn;
 
-            // Hangup / error tears the whole connection down regardless of the
-            // other reported events, so handle it first and move on.
-            if (event->events & (EPOLLHUP | EPOLLERR))
+            // An earlier event in this batch already closed this connection;
+            // its fds are gone (and may even be reused by a new connection).
+            if (conn->closed)
+            {
+                continue;
+            }
+
+            // Hangup / error tears the whole connection down. If data is still
+            // readable alongside it (a backend that answered, e.g. 413, then
+            // reset the connection), read it first: the read handler forwards
+            // it and closes once the read reports the error / EOF.
+            if ((event->events & (EPOLLHUP | EPOLLERR)) && !(event->events & EPOLLIN))
             {
                 lb_handle_connection_error(lb, conn);
                 continue;
@@ -196,6 +205,15 @@ int load_balancer_main_loop(load_balancer_t *lb)
                     lb_handle_backend_write(lb, conn);
                 }
             }
+        }
+
+        // Every event of the batch has been dispatched; nothing references
+        // the connections closed during it any more.
+        while (lb->closed_list)
+        {
+            lb_connection_t *dead = lb->closed_list;
+            lb->closed_list = dead->next_closed;
+            free(dead);
         }
     }
 
@@ -382,7 +400,15 @@ void lb_handle_client_data(load_balancer_t *lb, lb_connection_t *conn)
     bytes_read = read(conn->client_fd, conn->client_buffer, LB_BUFFER_SIZE);
     if (bytes_read <= 0)
     {
-        if (bytes_read == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        if (bytes_read == 0)
+        {
+            // Half-close: the client is done sending (e.g. shutdown(SHUT_WR)
+            // after the request) but still wants the response. Stop reading
+            // it and keep relaying until the backend closes.
+            conn->client_eof = true;
+            update_epoll_interest(lb, conn);
+        }
+        else if (errno != EAGAIN && errno != EWOULDBLOCK)
         {
             lb_close_connection(lb, conn);
         }
@@ -588,6 +614,11 @@ void lb_close_connection(load_balancer_t *lb, lb_connection_t *conn)
     struct timespec end_time;
     long long response_time;
 
+    if (conn->closed)
+    {
+        return;
+    }
+
     // Calculate response time in ms. Normalize the nsec borrow so we don't
     // produce a negative contribution when end.tv_nsec < start.tv_nsec.
     clock_gettime(CLOCK_MONOTONIC, &end_time);
@@ -623,7 +654,12 @@ void lb_close_connection(load_balancer_t *lb, lb_connection_t *conn)
     epoll_ctl(lb->epoll_fd, EPOLL_CTL_DEL, conn->backend_fd, NULL);
     close(conn->client_fd);
     close(conn->backend_fd);
-    free(conn);
+
+    // Deferred free: later events in the current epoll_wait batch may still
+    // point at this connection's io_ctx_t. The main loop frees it afterwards.
+    conn->closed = true;
+    conn->next_closed = lb->closed_list;
+    lb->closed_list = conn;
 }
 
 int set_nonblocking(int fd)

@@ -25,6 +25,11 @@ connection_t *allocate_connection(http_server_t *server)
   conn->socket_fd = -1;
   conn->file_fd = -1;
   atomic_fetch_add(&server->active_connections, 1);
+  // Counted here, paired with the decrement in free_connection. Bumping it in
+  // the accept loop after hand-off raced a worker that frees the connection
+  // first (the saturating decrement is lost, leaving the count one high), and
+  // a failed hand-off decremented a count that was never incremented.
+  atomic_fetch_add(&server->active_connections_count, 1);
   stats_record_connection_accepted();
   return conn;
 }

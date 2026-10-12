@@ -249,8 +249,11 @@ static int ws_decode_frame(const unsigned char *buf, size_t avail, size_t off,
     return -1;
   }
 
-  // A frame whose payload cannot fit in our buffer can never be assembled.
-  if (len > cap)
+  // A frame that cannot fit in our buffer can never be assembled. The whole
+  // frame (header, mask key, payload) must fit in cap - 1 usable bytes; checking
+  // the payload alone let a frame just under cap wedge the buffer and the
+  // connection drop without the 1009 Close.
+  if (cap < header + 4 + 1 || len > cap - 1 - header - 4)
   {
     *close_code = WS_CLOSE_MESSAGE_TOO_BIG;
     return -1;

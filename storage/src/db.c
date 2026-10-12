@@ -487,17 +487,19 @@ static int db_delete_locked(transaction_t *txn, const char *key, size_t key_leng
     write_wal_record(txn->txn_id, WAL_DELETE, page_id, wal_data, wal_size);
   }
 
+  int rc = -1;
   if (delete_kv_pair(page, pos) == 0)
   {
     mark_page_dirty(page_id);
     txn->stats.rows_deleted++;
+    rc = 0;
 
     printf("Deleted key in transaction %lu\n", txn->txn_id);
   }
 
   release_page(page_id, LOCK_EXCLUSIVE);
 
-  return 0;
+  return rc;
 }
 
 // Shared implementation of db_scan / db_scan_prefix: visit every pair whose key
@@ -572,6 +574,12 @@ static int scan_range(transaction_t *txn, const char *prefix, size_t prefix_leng
 
     page_id = next_page_id;
     page = get_page(page_id, LOCK_SHARED);
+    if (!page)
+    {
+      // A leaf we cannot load must not read as the end of the range: callers
+      // (the index reconcile in particular) treat a clean return as complete.
+      return -1;
+    }
     start = 0; // Only the first leaf starts mid-page
   }
 

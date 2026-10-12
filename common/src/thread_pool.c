@@ -28,6 +28,7 @@ int task_queue_init(task_queue_t *queue, int num_priorities)
 
     if (pthread_mutex_init(&queue->mutex, NULL) != 0)
     {
+        free(queue->tails);
         free(queue->queues);
         return -1;
     }

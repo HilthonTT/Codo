@@ -8,6 +8,7 @@
 
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <stddef.h>
 #include <sys/epoll.h>
@@ -71,6 +72,10 @@ typedef struct
   pthread_mutex_t backend_mutex;
   struct epoll_event events[LB_MAX_EVENTS];
   lb_strategy_t strategy;
+  // Connections closed during the current epoll_wait batch. Their memory (and
+  // the io_ctx_t inside it) may still be referenced by later events in the
+  // same batch, so they are freed only once the batch has been dispatched.
+  struct lb_connection *closed_list;
 } load_balancer_t;
 
 typedef struct lb_connection
@@ -97,6 +102,13 @@ typedef struct lb_connection
   size_t backend_buffer_len;
   size_t backend_buffer_sent;
   struct timespec start_time;
+  // The client half-closed its write side; stop reading it but keep relaying
+  // the backend's response until the backend closes.
+  bool client_eof;
+  // Set by lb_close_connection; the fds are gone and the struct is waiting on
+  // lb->closed_list to be freed at the end of the batch.
+  bool closed;
+  struct lb_connection *next_closed;
 } lb_connection_t;
 
 #endif

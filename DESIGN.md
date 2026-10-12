@@ -204,9 +204,8 @@ rows at startup, in the same pass that seeds the id counter: missing entries are
 added, entries whose row is gone or whose owner changed are dropped, and the
 repair is logged.
 
-If that repair cannot finish — most plausibly because the page filled up, since
-the index roughly doubles what a todo costs and page splits are not implemented
-— the index is marked unavailable and listings **fall back to the full scan**
+If that repair cannot finish — an I/O error, a corrupt page, or an exhausted
+buffer pool — the index is marked unavailable and listings **fall back to the full scan**
 rather than answering from a partial index that would silently hide todos.
 
 Because the engine's abort path has no undo, writers compensate by hand: a todo
@@ -349,10 +348,6 @@ These are real, and deliberately documented rather than hidden.
   portability layer.
 - **No test suite.** Correctness is covered only by the CI smoke tests and the
   sanitizer build.
-- **No B-tree page split.** A leaf's capacity is one page, so the whole database
-  is bounded by a single page's worth of rows, and a full page fails the insert.
-  The owner index roughly doubles what one todo costs — which is why a reconcile
-  that cannot finish degrades to a full scan.
 - **No WAL crash recovery.** The WAL is written and flushed, but not replayed at
   startup: a hard kill between a commit and a checkpoint can lose committed
   writes.

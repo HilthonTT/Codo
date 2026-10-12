@@ -55,8 +55,10 @@ backend_t *backend_round_robin_select(load_balancer_t *lb)
     return NULL;
   }
 
-  // Smooth weighted round-robin selection (nginx-style).
-  int best_weight = -1;
+  // Smooth weighted round-robin selection (nginx-style). current_weight can
+  // be well below zero (e.g. a light backend left negative after a heavy peer
+  // went unhealthy), so the first healthy candidate always seeds the search.
+  int best_weight = 0;
 
   for (int i = 0; i < lb->backend_count; i++)
   {
@@ -69,7 +71,7 @@ backend_t *backend_round_robin_select(load_balancer_t *lb)
 
     backend->current_weight += backend->weight;
 
-    if (backend->current_weight > best_weight)
+    if (!selected || backend->current_weight > best_weight)
     {
       best_weight = backend->current_weight;
       selected = backend;
@@ -112,14 +114,10 @@ backend_t *least_connection_select(load_balancer_t *lb)
     }
   }
 
-  // Reserve the connection while still holding the lock so concurrent
-  // callers don't all pick the same "least" backend (thundering herd).
-  // NOTE: if the caller already increments current_connections after
-  // dispatch, DELETE this block to avoid double-counting.
-  if (least_conn_backend)
-  {
-    least_conn_backend->current_connections++;
-  }
+  // No reservation here: lb_handle_new_connection increments
+  // current_connections once the connection is actually established, and
+  // lb_close_connection decrements it. Incrementing here as well counted every
+  // connection twice and leaked one count on each failed dispatch.
 
   pthread_mutex_unlock(&lb->backend_mutex);
 

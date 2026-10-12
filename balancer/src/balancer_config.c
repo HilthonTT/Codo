@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -5,6 +6,24 @@
 #include "balancer.h"
 #include "balancer_config.h"
 #include "env.h"
+
+// Largest accepted backend weight. Keeps the smooth-WRR sum of weights across
+// MAX_BACKENDS backends far from int overflow.
+#define MAX_BACKEND_WEIGHT 10000
+
+// Parse a decimal integer in [min, max] that spans the whole string.
+static int parse_bounded_int(const char *s, long min, long max, int *out)
+{
+  char *end = NULL;
+  errno = 0;
+  long v = strtol(s, &end, 10);
+  if (errno != 0 || end == s || *end != '\0' || v < min || v > max)
+  {
+    return -1;
+  }
+  *out = (int)v;
+  return 0;
+}
 
 int balancer_config_load(balancer_config_t *config, int argc, char *argv[])
 {
@@ -45,9 +64,14 @@ int balancer_config_load(balancer_config_t *config, int argc, char *argv[])
 
 int balancer_add_backends(load_balancer_t *lb, const char *spec)
 {
-  char buf[1024];
-  strncpy(buf, spec, sizeof(buf) - 1);
-  buf[sizeof(buf) - 1] = '\0';
+  // Copied whole: a fixed buffer would silently cut a long list mid-entry and
+  // register a truncated (wrong) port for the last backend.
+  char *buf = strdup(spec);
+  if (!buf)
+  {
+    perror("strdup");
+    return 0;
+  }
 
   int added = 0;
   char *saveptr = NULL;
@@ -59,14 +83,32 @@ int balancer_add_backends(load_balancer_t *lb, const char *spec)
       tok++;
     }
 
-    char *colon = strchr(tok, ':');
+    // An IPv6 literal contains colons itself, so it must be bracketed:
+    // "[::1]:8080:2".
+    const char *host = tok;
+    char *colon = NULL;
+    if (*tok == '[')
+    {
+      char *rbracket = strchr(tok, ']');
+      if (!rbracket || rbracket[1] != ':')
+      {
+        fprintf(stderr, "skipping backend \"%s\": expected [ipv6]:port\n", tok);
+        continue;
+      }
+      *rbracket = '\0';
+      host = tok + 1;
+      colon = rbracket + 1;
+    }
+    else
+    {
+      colon = strchr(tok, ':');
+    }
     if (!colon)
     {
       fprintf(stderr, "skipping backend \"%s\": expected host:port\n", tok);
       continue;
     }
     *colon = '\0';
-    const char *host = tok;
     char *port_str = colon + 1;
 
     // Optional ":weight" suffix.
@@ -75,11 +117,16 @@ int balancer_add_backends(load_balancer_t *lb, const char *spec)
     if (colon2)
     {
       *colon2 = '\0';
-      weight = atoi(colon2 + 1);
+      if (parse_bounded_int(colon2 + 1, 0, MAX_BACKEND_WEIGHT, &weight) != 0)
+      {
+        fprintf(stderr, "skipping backend \"%s\": invalid weight %s (0-%d)\n", host,
+                colon2 + 1, MAX_BACKEND_WEIGHT);
+        continue;
+      }
     }
 
-    int port = atoi(port_str);
-    if (port <= 0 || port > 65535)
+    int port = 0;
+    if (parse_bounded_int(port_str, 1, 65535, &port) != 0)
     {
       fprintf(stderr, "skipping backend \"%s\": invalid port %s\n", host, port_str);
       continue;
@@ -92,5 +139,6 @@ int balancer_add_backends(load_balancer_t *lb, const char *spec)
     }
   }
 
+  free(buf);
   return added;
 }
